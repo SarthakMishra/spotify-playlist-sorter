@@ -1,5 +1,5 @@
 [project]
-name = "playlist-sorter"
+name = "spotify-playlist-sorter"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
