@@ -5,7 +5,7 @@ A Python tool that sorts your Spotify playlists based on musical key compatibili
 ## Features
 
 - Loads playlist data directly from Spotify
-- Analyzes tracks using Spotify's audio features API
+- Analyzes tracks using songdata.io
 - Sorts tracks based on:
   - Harmonic mixing (Camelot wheel)
   - BPM (tempo) similarity
