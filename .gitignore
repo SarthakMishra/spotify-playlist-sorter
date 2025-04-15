@@ -1,4 +1,10 @@
+.venv
 venv
+build/
 .env
 .ipynb_checkpoints
 *.csv
+.spotify_cache
+*.egg-info
+__pycache__
+audio_files/
