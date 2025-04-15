@@ -17,7 +17,7 @@ A Python tool that sorts your Spotify playlists based on musical key compatibili
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/playlist-sorter.git
+git clone https://github.com/SarthakMishra/spotify-playlist-sorter.git
 cd playlist-sorter
 ```
 
