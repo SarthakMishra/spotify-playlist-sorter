@@ -15,19 +15,27 @@ A Python tool that sorts your Spotify playlists based on musical key compatibili
 
 ## Setup
 
-1. Install required packages:
+1. Clone the repository:
 ```bash
-pip install spotipy python-dotenv pandas numpy jupyter flask
+git clone https://github.com/yourusername/playlist-sorter.git
+cd playlist-sorter
 ```
 
-2. Create a Spotify Developer Application:
+2. Set up the virtual environment:
+```bash
+uv venv
+source .venv/bin/activate  # On Windows, use: .venv\Scripts\activate
+uv sync
+```
+
+3. Create a Spotify Developer Application:
    - Go to [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
    - Create a new application
    - Get your Client ID and Client Secret
    - Add `http://127.0.0.1:8888/callback` to your app's Redirect URIs in the settings
      - Note: Using `localhost` is deprecated, use the loopback IP address `127.0.0.1` instead
 
-3. Configure environment variables:
+4. Configure environment variables:
    - Copy `.env.template` to `.env`
    - Fill in your Spotify API credentials in `.env`
 
@@ -59,4 +67,5 @@ The sorter uses several factors to create optimal transitions:
 - Always make a backup of important playlists before sorting
 - Rate limits apply to Spotify API calls
 - The authentication process requires a web browser and will open a new window
-- Make sure no other application is using port 8888 when running the authentication notebook 
+- Make sure no other application is using port 8888 when running the authentication notebook
+- **Important Note**: This project scrapes track attributes (BPM, key, energy) from songdata.io as the Spotify Web API's "Get Track's Audio Features" endpoint has been deprecated. Due to the nature of web scraping, this project might not work if the structure of songdata.io changes. If you encounter any issues due to website structure changes, please feel free to open a Pull Request with the necessary updates. 
