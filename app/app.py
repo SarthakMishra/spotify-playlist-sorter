@@ -259,31 +259,6 @@ def main() -> None:
                 clear_auth_state()
                 st.rerun()
 
-        # Add advanced option for custom redirect URI
-        with st.expander("Advanced: Custom Redirect URI", expanded=False):
-            st.markdown("""
-            If you're having trouble with authentication, you can try setting a custom redirect URI.
-            This must match **exactly** with what you've configured in your Spotify Developer Dashboard.
-            """)
-
-            default_uri = get_redirect_uri()
-            custom_uri = st.text_input(
-                "Custom Redirect URI", value=st.session_state.get("custom_redirect_uri", ""), placeholder=default_uri
-            )
-
-            if custom_uri != st.session_state.get("custom_redirect_uri", ""):
-                st.session_state.custom_redirect_uri = custom_uri if custom_uri else ""
-                # Clear auth state if redirect URI changes
-                if "token_info" in st.session_state:
-                    clear_auth_state()
-                    st.rerun()
-
-            if st.button("Reset to Default URI"):
-                st.session_state.custom_redirect_uri = ""
-                if "token_info" in st.session_state:
-                    clear_auth_state()
-                st.rerun()
-
         # Credential input fields
         if st.session_state.credentials_locked:
             # Display locked credentials with masked values
