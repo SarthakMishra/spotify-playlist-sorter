@@ -59,21 +59,6 @@ streamlit run app/app.py
    - Review the transition analysis
    - Update your playlist with the optimized order
 
-### Jupyter Notebooks (Alternative)
-
-The original Jupyter notebooks are still available in the `notebooks` directory:
-
-1. First, run `notebooks/spotify_auth.ipynb` to:
-   - Start a local authentication server
-   - Automatically open your browser for Spotify authorization
-   - View a list of your playlists and their IDs
-   - Note: For notebooks, add `http://127.0.0.1:8888/callback` to your Spotify app's Redirect URIs
-
-2. Then, run `notebooks/spotify_playlist_sorter.ipynb`:
-   - Enter your chosen playlist ID
-   - Review the transition analysis
-   - Update your playlist with the optimized order
-
 ## How it Works
 
 The sorter uses several factors to create optimal transitions:
