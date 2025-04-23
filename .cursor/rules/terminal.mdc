@@ -1,0 +1,18 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Terminal/Commandline use Guidelines
+- Always use `uv` as the package manager, do not use pip
+    - virtual enviranment is located in `.venv`
+    - Activate venv using `source .venv/bin/activate`
+    - To add new packahe `uv add [package_name]`
+    - To remove/uninstall package `uv remove [package_name]`
+    - Check `pyproject.toml` [pyproject.toml](mdc:pyproject.toml) to check dependencies
+
+- Use task runner when necessary
+    - We are using `Taskfile.yml` please check [Taskfile.yml](mdc:Taskfile.yml) for all tasks
+    - Important tasks
+        - `task lint` fixes lint issues with ruff, runs pylint and pyright after that
+        - `task run` starts the streamlit app
