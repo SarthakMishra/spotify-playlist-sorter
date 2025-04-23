@@ -1,0 +1,44 @@
+version: "3"
+
+tasks:
+  default:
+    desc: List all available tasks
+    cmds:
+      - task -l
+
+  lint:
+    desc: Run all linting checks
+    cmds:
+      - task: lint:fix-unsafe
+      - task: lint:pylint
+      - task: lint:pyright
+
+  lint:check:
+    desc: Run ruff linter
+    cmds:
+      - uv run ruff check app
+
+  lint:fix:
+    desc: Run ruff linter with auto-fix
+    cmds:
+      - uv run ruff check --fix app
+
+  lint:fix-unsafe:
+    desc: Run ruff linter with unsafe auto-fixes
+    cmds:
+      - uv run ruff check --fix --unsafe-fixes app
+
+  lint:pylint:
+    desc: Run pylint
+    cmds:
+      - uv run pylint app
+
+  lint:pyright:
+    desc: Run pyright type checker
+    cmds:
+      - uv run pyright app
+
+  run:
+    desc: Run streamlit app
+    cmds:
+      - uv run streamlit run app/app.py
