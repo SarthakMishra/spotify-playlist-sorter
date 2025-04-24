@@ -7,5 +7,5 @@ font = "sans serif"
 
 [server]
 enableCORS = false
-enableXsrfProtection = true
+enableXsrfProtection = false
 headless = true
