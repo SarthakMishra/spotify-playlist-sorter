@@ -9,3 +9,8 @@ font = "sans serif"
 enableCORS = true
 enableXsrfProtection = true
 headless = true
+
+[browser]
+serverAddress = "spotify-playlist-sorter.streamlit.app"
+serverPort = 443
+gatherUsageStats = false
