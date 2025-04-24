@@ -428,9 +428,25 @@ def main() -> None:
                         unsafe_allow_html=True,
                     )
 
+                    # Add authentication instructions
+                    st.markdown(
+                        """
+                        <div class='info-box' style='background-color: #fff8e1; border-left: 5px solid #ffb300;'>
+                        <strong>Authentication Instructions:</strong>
+                        <ol>
+                            <li>Click the button below to open Spotify authentication in a new tab</li>
+                            <li>Log in to your Spotify account and authorize the app</li>
+                            <li>After authorization, you'll be redirected back to this app</li>
+                            <li>If the redirect doesn't work automatically, copy the URL from the Spotify auth page and paste it in this browser window</li>
+                        </ol>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
                     # Create button that automatically redirects to Spotify auth
                     st.markdown(
-                        f'<a href="{auth_url}" target="_self">'
+                        f'<a href="{auth_url}" target="_blank">'
                         f'<button style="width:100%;padding:0.5em;background-color:#1DB954;color:white;'
                         f'border:none;border-radius:4px;cursor:pointer;font-weight:bold;">'
                         f"Connect Spotify Account</button></a>",
