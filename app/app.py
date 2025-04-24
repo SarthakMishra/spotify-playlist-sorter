@@ -249,7 +249,25 @@ def main() -> None:
 
         # Environment selection
         if "is_local_environment" not in st.session_state:
-            st.session_state.is_local_environment = True
+            # Try to detect if we're running in Streamlit Cloud
+            try:
+                # Check if we're running in a Streamlit environment
+                from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+                # Check for cloud deployment by looking at the URL
+                ctx = get_script_run_ctx()
+                if ctx is not None and ctx.session_id:
+                    # If we're on streamlit cloud, the URL won't be localhost
+                    is_cloud = "localhost" not in st.get_option(
+                        "server.baseUrlPath"
+                    ) and "127.0.0.1" not in st.get_option("server.baseUrlPath")
+                    st.session_state.is_local_environment = not is_cloud
+                else:
+                    # Default to True if we can't determine
+                    st.session_state.is_local_environment = True
+            except (ImportError, ModuleNotFoundError, AttributeError):
+                # If specific errors occur (import missing, module not found, attribute not available)
+                st.session_state.is_local_environment = True
 
         is_local = st.checkbox("I'm running this app locally", value=st.session_state.is_local_environment)
         if is_local != st.session_state.is_local_environment:
