@@ -412,6 +412,8 @@ class SpotifyPlaylistSorter:
                     "no_warnings": True,
                     "noplaylist": True,
                     "noprogress": True,
+                    "retries": 3,
+                    "socket_timeout": 30,
                     "postprocessors": [
                         {
                             "key": "FFmpegExtractAudio",
