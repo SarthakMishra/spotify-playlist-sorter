@@ -3,64 +3,27 @@ name = "spotify-playlist-sorter"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
-    "beautifulsoup4==4.13.3",
-    "bs4>=0.0.2",
-    "numpy==2.2.4",
-    "pandas==2.2.3",
+    "librosa>=0.10",
+    "numpy>=2.2.4",
+    "pandas>=2.2.3",
     "plotly>=6.0.1",
-    "python-dotenv==1.1.0",
-    "requests==2.32.3",
-    "spotipy==2.25.1",
+    "python-dotenv>=1.1.0",
+    "spotipy>=2.25.1",
     "streamlit>=1.31.0",
+    "yt-dlp>=2026.3.17",
 ]
 
 [dependency-groups]
-dev = [
-    "pylint>=3.3.6",
-    "ruff>=0.11.6",
-    "pyright>=1.1.399",
-    "deptry>=0.23.0",
-]
+dev = ["ruff>=0.11.6", "ty>=0.0.0a1", "deptry>=0.23.0"]
 
-[tool.pyright]
-# Define included and excluded directories
-include = ["app"]
-exclude = [
-    "**/__pycache__",
-    ".venv"
-]
-ignore = [
-    "app/playlist_sorter.py"
-]
-# Basic type checking mode - more lenient than strict
-typeCheckingMode = "standard"
-# Analyze unannotated functions
-analyzeUnannotatedFunctions = true
-# Configuration to enable good type checking but not be too strict
-reportMissingImports = "error"
-reportMissingTypeStubs = "none"
-reportUnusedImport = "warning"
-reportUnusedVariable = "warning"
-reportGeneralTypeIssues = "none"
-reportAttributeAccessIssue = "none"
-reportArgumentType = "none"
-reportOperatorIssue = "none"
-reportCallIssue = "none"
-# Useful for catching common errors
-reportOptionalSubscript = "error"
-reportOptionalMemberAccess = "error"
-reportOptionalCall = "error"
-# Enable Python 3.12 features
-pythonVersion = "3.12"
-# Use library code for types when type stubs are missing
-useLibraryCodeForTypes = true
-# Virtual environment configuration
-venvPath = "."
-venv = ".venv"
+[tool.ty.environment]
+python-version = "3.13"
+extra-paths = ["app"]
+
 
 [tool.ruff]
 line-length = 120
-target-version = "py38"
+target-version = "py313"
 
 # Exclude files/directories
 exclude = [
@@ -71,7 +34,7 @@ exclude = [
     "__pycache__",
     "build",
     "dist",
-    "vendor"
+    "vendor",
 ]
 
 [tool.ruff.lint]
@@ -79,25 +42,24 @@ exclude = [
 select = ["ALL"]
 ignore = [
     # Rules that conflict with other tools/preferences
-    "D203",  # one-blank-line-before-class
-    "D212",  # multi-line-summary-first-line
+    "D203",    # one-blank-line-before-class
+    "D212",    # multi-line-summary-first-line
     "FBT001",  # Boolean positional arg in function definition (required for typer)
     "FBT002",  # Boolean default value in function definition (required for typer)
-    "C901",  # function too complex
-    "PLR0911",  # too many return statements
-    "PLR0912",  # too many branches
-    "PLR0913",  # too many arguments in function definition
-    "PLR0915",  # too many statements
+    "C901",    # function too complex
+    "PLR0911", # too many return statements
+    "PLR0912", # too many branches
+    "PLR0913", # too many arguments in function definition
+    "PLR0915", # too many statements
     "TRY300",  # Consider moving this statement to an `else` block
     "COM812",  # Use a constant for the message in a raise statement
-    "TC001",  # Move application import into a type-checking block
-    "E501",  # Line too long
+    "TC001",   # Move application import into a type-checking block
+    "E501",    # Line too long
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "tests/*" = ["S101", "PLR2004", "ANN002", "ANN003"]
-"src/codemap/cli/main.py" = ["ARG001"]  # Allow unused arguments in CLI functions (for API compatibility)
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
@@ -106,6 +68,11 @@ max-complexity = 10
 max-args = 5
 max-branches = 12
 max-statements = 50
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

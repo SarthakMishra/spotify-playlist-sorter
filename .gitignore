@@ -3,9 +3,12 @@ venv
 build/
 .env
 .ipynb_checkpoints
+.analysis_cache.json
 *.csv
 .spotify_cache
 *.egg-info
 __pycache__
 audio_files/
 .ruff_cache
+.cache
+.spotify_credentials
