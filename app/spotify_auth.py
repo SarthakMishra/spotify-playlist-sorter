@@ -13,12 +13,8 @@ from spotipy.oauth2 import SpotifyOAuth
 
 # Configure logging
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 # Constants
-# These are not passwords but API endpoints
-AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
-HTTP_STATUS_UNAUTHORIZED = 401
 SPOTIFY_SCOPE = "playlist-modify-public playlist-modify-private playlist-read-private playlist-read-collaborative"
 
 # Valid redirect URIs - one of these must be configured in your Spotify Developer Dashboard

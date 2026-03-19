@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import tempfile
 import time
-from typing import TYPE_CHECKING, Any, Optional, TypeVar, cast
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
+import librosa
+import librosa.feature.rhythm
 import numpy as np
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup, Tag
+import spotipy
+import yt_dlp
 
 # Import constants from local constants module
 from constants import (
@@ -19,25 +27,122 @@ from constants import (
     BPM_MEDIUM_THRESHOLD,
     CAMELOT_MAX_NUMBER,
     CAMELOT_MIN_NUMBER,
-    DATA_ROW_THRESHOLD,
     ENERGY_MODERATE_INCREASE_MAX,
     ENERGY_SCALING_FACTOR,
     ENERGY_SMALL_DECREASE_MIN,
     ENERGY_SMALL_INCREASE_MAX,
-    HTTP_TIMEOUT,
 )
 
+# Mapping from (pitch_class, mode) -> Camelot key
+# pitch_class: 0=C, 1=C#, 2=D, ... 11=B  |  mode: 0=minor, 1=major
+_CAMELOT_MAP: dict[tuple[int, int], str] = {
+    (0, 1): "8B",
+    (1, 1): "3B",
+    (2, 1): "10B",
+    (3, 1): "5B",
+    (4, 1): "12B",
+    (5, 1): "7B",
+    (6, 1): "2B",
+    (7, 1): "9B",
+    (8, 1): "4B",
+    (9, 1): "11B",
+    (10, 1): "6B",
+    (11, 1): "1B",
+    (0, 0): "5A",
+    (1, 0): "12A",
+    (2, 0): "7A",
+    (3, 0): "2A",
+    (4, 0): "9A",
+    (5, 0): "4A",
+    (6, 0): "11A",
+    (7, 0): "6A",
+    (8, 0): "1A",
+    (9, 0): "8A",
+    (10, 0): "3A",
+    (11, 0): "10A",
+}
+
+# Krumhansl-Kessler key profiles (C, C#, D, … B) for key detection
+_KK_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+_KK_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
 if TYPE_CHECKING:
-    import spotipy
+    from collections.abc import Callable
 
 # Configure logger
 logger = logging.getLogger(__name__)
 
-# Type variable for numpy array or pd.Series operations
-T = TypeVar("T")
-
 # Constants for transition analysis
 MIN_TRANSITION_COUNT = 2
+
+# Maximum acceptable duration difference (seconds) between Spotify and YouTube tracks.
+# Set generously — YouTube versions often have intros/outros that differ slightly.
+
+# Patterns to strip from track names before YouTube search
+# Removes: (feat. ...), [Remastered ...], (Deluxe ...), etc.
+_TRACK_NOISE_KEYWORDS = {
+    "feat",
+    "ft",
+    "with",
+    "prod",
+    "remaster",
+    "deluxe",
+    "bonus",
+    "demo",
+    "version",
+    "edit",
+    "radio",
+}
+_BRACKETED_RE = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]")
+
+# Variant keywords — if present in the YouTube title but NOT in the Spotify track
+# (or vice versa), the result is likely the wrong version of the song.
+_VARIANT_KEYWORDS = {
+    "remix", "remixed", "slowed", "reverb", "reverbed", "sped up", "speed up",
+    "bass boosted", "8d audio", "8d", "lofi", "lo-fi", "lo fi",
+    "instrumental", "cover", "mashup", "mash up",
+    "live", "concert", "acoustic", "unplugged",
+    "radio edit", "extended", "club mix",
+}
+
+# Keywords that indicate a clean audio source — give these a slight boost
+_PREFERRED_KEYWORDS = {"lyrics", "lyric", "lyrical", "karaoke", "official audio", "full song", "full video"}
+
+# Default parallel workers — network I/O bound, so more workers help
+_DEFAULT_MAX_WORKERS = min(12, (os.cpu_count() or 4) + 4)
+
+# Audio analysis cache — persists results across runs so we skip yt-dlp + librosa
+# for tracks we've already analyzed.
+_CACHE_FILE = Path(__file__).resolve().parent.parent / ".analysis_cache.json"
+
+
+def _load_cache() -> dict[str, dict]:
+    """Load the analysis cache from disk."""
+    if _CACHE_FILE.exists():
+        try:
+            return json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            logger.warning("Corrupted analysis cache, starting fresh.")
+    return {}
+
+
+def _save_cache(cache: dict[str, dict]) -> None:
+    """Persist the analysis cache to disk."""
+    _CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+
+
+def _clean_track_name(name: str) -> str:
+    """Remove parenthetical/bracketed noise from a track name for better YouTube search.
+
+    Strips sections like ``(feat. X)``, ``[Remastered 2024]``, ``(Deluxe Edition)``
+    that pollute search results without adding value.
+    """
+
+    def _is_noise(match: re.Match[str]) -> str:
+        text = match.group(0).lower()
+        return "" if any(kw in text for kw in _TRACK_NOISE_KEYWORDS) else match.group(0)
+
+    return _BRACKETED_RE.sub(_is_noise, name).strip()
 
 
 class SpotifyPlaylistSorter:
@@ -85,213 +190,387 @@ class SpotifyPlaylistSorter:
 
         return camelot_map
 
-    def _scrape_songdata_io(self) -> pd.DataFrame | None:
-        """Scrape track data from songdata.io for the playlist."""
-        url = f"https://songdata.io/playlist/{self.playlist_id}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-        logger.info("Attempting to scrape data from: %s", url)
-
-        try:
-            response = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
-            response.raise_for_status()
-        except requests.exceptions.RequestException:
-            logger.exception("Failed to fetch data from songdata.io")
-            return None
-
-        soup = BeautifulSoup(response.content, "html.parser")
-
-        # Find the table - adjust selector if songdata.io changes structure
-        # Cast to Tag type to satisfy type checker when table is found
-        table = cast("Optional[Tag]", soup.find("table", {"id": "table_chart"}))
-        if not table:
-            logger.error("Could not find the track table (id='table_chart') on the page.")
-            logger.error("The website structure might have changed.")
-            # Try finding by class as a fallback
-            table = cast("Optional[Tag]", soup.find("table", {"class": "table"}))
-            if not table:
-                logger.error("Could not find the track table by class either.")
-                return None
-            logger.warning("Found table using class='table' as fallback.")
-
-        table_body = cast("Optional[Tag]", table.find("tbody", {"id": "table_body"}))
-        if not table_body:
-            # Fallback if tbody doesn't have the specific ID
-            table_body = cast("Optional[Tag]", table.find("tbody"))
-            if not table_body:
-                logger.error("Could not find the table body (tbody) within the table.")
-                return None
-            logger.warning("Found tbody without specific ID.")
-
+    def _fetch_tracks_from_spotify(self) -> list[dict]:
+        """Fetch all tracks in the playlist from Spotify API."""
         tracks = []
-        rows = table_body.find_all("tr", {"class": "table_object"})
-
-        if not rows:
-            logger.error("Found table body, but no rows with class='table_object'.")
-            return None
-
-        logger.info("Found %s potential track rows in the table.", len(rows))
-
-        for row in rows:
-            row_tag = cast("Tag", row)
-            try:
-                # Extract data based on common class names
-                track_name_tag = cast("Optional[Tag]", row_tag.find("td", {"class": "table_name"}))
-                track_name = None
-                if track_name_tag and track_name_tag.find("a"):
-                    name_a_tag = cast("Tag", track_name_tag.find("a"))
-                    track_name = name_a_tag.text.strip()
-
-                artist_tag = cast("Optional[Tag]", row_tag.find("td", {"class": "table_artist"}))
-                artist = artist_tag.text.strip() if artist_tag else None
-
-                key_tag = cast("Optional[Tag]", row_tag.find("td", {"class": "table_key"}))
-                key = key_tag.text.strip() if key_tag else None
-
-                camelot_tag = cast("Optional[Tag]", row_tag.find("td", {"class": "table_camelot"}))
-                camelot = camelot_tag.text.strip() if camelot_tag else None
-
-                bpm_tag = cast("Optional[Tag]", row_tag.find("td", {"class": "table_bpm"}))
-                bpm = bpm_tag.text.strip() if bpm_tag else None
-
-                energy_tag = cast("Optional[Tag]", row_tag.find("td", {"class": "table_energy"}))
-                energy = energy_tag.text.strip() if energy_tag else None
-
-                # Popularity is often in 'table_data' but might need specific identification
-                all_data_tags = row_tag.find_all("td", {"class": "table_data"})
-                popularity = None
-                if len(all_data_tags) > DATA_ROW_THRESHOLD:
-                    # Use a pattern matching approach instead of a lambda function
-                    date_pattern = re.compile(r"[-/]")
-                    release_date_tag = cast(
-                        "Optional[Tag]",
-                        row_tag.find(
-                            "td",
-                            {"class": "table_data"},
-                            string=date_pattern,
-                        ),
-                    )
-                    if release_date_tag:
-                        prev_sibling = cast(
-                            "Optional[Tag]", release_date_tag.find_previous_sibling("td", {"class": "table_data"})
-                        )
-                        if prev_sibling:
-                            popularity = prev_sibling.text.strip()
-
-                # Spotify ID is usually in a data-src attribute
-                spotify_link_cell = cast("Optional[Tag]", row_tag.find("td", {"id": "spotify_obj"}))
-                spotify_id = None
-                if spotify_link_cell and "data-src" in spotify_link_cell.attrs:
-                    spotify_id = str(spotify_link_cell["data-src"])
-
-                if not all([track_name, artist, camelot, bpm, energy, spotify_id]):
-                    logger.warning(
-                        "Skipping row due to missing essential data (Name, Artist, Camelot, BPM, Energy, ID): %s, %s",
-                        track_name,
-                        artist,
-                    )
+        results = self.sp.playlist_tracks(
+            self.playlist_id,
+            fields="items(track(id,name,artists,popularity,duration_ms,album(release_date))),next",
+        )
+        while results:
+            for item in results["items"]:
+                track = item.get("track")
+                if not track or not track.get("id"):
                     continue
-
+                artist_names = ", ".join(a["name"] for a in track.get("artists", []))
+                release_date = (track.get("album") or {}).get("release_date", "")
                 tracks.append(
                     {
-                        "id": spotify_id,
-                        "Track": track_name,
-                        "Artist": artist,
-                        "Key": key,
-                        "Camelot": camelot,
-                        "BPM": bpm,
-                        "Energy": energy,
-                        "Popularity": popularity,
+                        "id": track["id"],
+                        "Track": track["name"],
+                        "Artist": artist_names,
+                        "Popularity": track.get("popularity"),
+                        "duration_ms": track.get("duration_ms"),
+                        "release_year": release_date[:4] if release_date else "",
                     }
                 )
-            except (AttributeError, IndexError, KeyError) as e:
-                logger.warning("Error parsing a row: %s. Row content: %s...", e, str(row_tag)[:100])
-                continue
+            results = self.sp.next(results) if results.get("next") else None
+        logger.info("Fetched %d tracks from Spotify playlist.", len(tracks))
+        return tracks
 
-        if not tracks:
-            logger.error("No tracks successfully parsed from the table.")
+    @staticmethod
+    def _detect_key_mode(chroma_mean: np.ndarray) -> tuple[int, int]:
+        """Detect musical key and mode via Krumhansl-Kessler profile correlation.
+
+        Returns (pitch_class 0-11, mode 0=minor/1=major).
+        """
+        best_key, best_mode, best_corr = 0, 1, -float("inf")
+        for pitch in range(12):
+            for mode_idx, profile in enumerate([_KK_MINOR, _KK_MAJOR]):
+                rotated = np.roll(profile, pitch)
+                corr = float(np.corrcoef(chroma_mean, rotated)[0, 1])
+                if corr > best_corr:
+                    best_corr = corr
+                    best_key = pitch
+                    best_mode = mode_idx
+        return best_key, best_mode
+
+    @staticmethod
+    def _analyze_track(
+        sp_id: str,
+        track_name: str,
+        artist_name: str,
+        duration_ms: int | None = None,
+        release_year: str = "",
+    ) -> dict | None:
+        """Search YouTube via yt-dlp and analyze the first 30 s of audio with librosa.
+
+        Args:
+            sp_id: Spotify track ID (for logging).
+            track_name: Track name from Spotify.
+            artist_name: Comma-separated artist names from Spotify.
+            duration_ms: Expected track duration from Spotify (milliseconds).
+                Used to validate the YouTube result actually matches the track.
+            release_year: Album release year (e.g. "2019") for search refinement.
+        """
+        clean_name = _clean_track_name(track_name)
+        # Use all artists (space-separated) for a more specific search
+        artists = " ".join(a.strip() for a in artist_name.split(","))
+        year_part = f" {release_year}" if release_year else ""
+        query = f"ytsearch10:{clean_name}{year_part} {artists}"
+        expected_secs = duration_ms / 1000 if duration_ms else None
+
+        result = SpotifyPlaylistSorter._download_and_load(query, track_name, sp_id, expected_secs)
+        if result is None:
+            return None
+        y, sr = result
+
+        # BPM
+        tempo_arr = librosa.feature.rhythm.tempo(y=y, sr=sr)
+        bpm = float(tempo_arr[0])
+
+        # Key + mode via Krumhansl-Kessler
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+        pitch_class, mode = SpotifyPlaylistSorter._detect_key_mode(chroma.mean(axis=1))
+        camelot = _CAMELOT_MAP.get((pitch_class, mode))
+        if camelot is None:
+            logger.warning("Unknown key/mode (%d, %d) for '%s'", pitch_class, mode, track_name)
             return None
 
-        track_df = pd.DataFrame(tracks)
+        # Raw RMS energy (normalized across playlist later)
+        rms_mean = float(librosa.feature.rms(y=y).mean())
 
-        # --- Data Cleaning and Type Conversion ---
+        return {"tempo": bpm, "energy": rms_mean, "key": pitch_class, "mode": mode, "camelot": camelot}
+
+    @staticmethod
+    def _download_and_load(
+        query: str, track_name: str, sp_id: str, expected_secs: float | None
+    ) -> tuple[np.ndarray, int | float] | None:
+        """Search YouTube for candidates, pick the best duration match, download, and load with librosa.
+
+        Searches for multiple results and selects the one whose duration is
+        closest to the Spotify track.  This guarantees at least one match as
+        long as YouTube returns any result.
+
+        Returns ``None`` only when the search/download itself fails.
+        """
         try:
-            # Convert relevant columns to numeric, coercing errors to NaN
-            track_df["BPM"] = pd.to_numeric(track_df["BPM"], errors="coerce")
-            # Energy from songdata.io might be 1-10 scale or 0-1. Let's assume 0-1 for now.
-            raw_energy = pd.to_numeric(track_df["Energy"], errors="coerce")
-            if raw_energy.max() > 1.0:
-                logger.warning("Detected Energy values > 1. Assuming 1-10 scale and normalizing to 0-1.")
-                track_df["Energy"] = raw_energy / 10.0
+            # --- Phase 1: search without downloading ---
+            search_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "noprogress": True,
+                "skip_download": True,
+                "ignoreerrors": True,
+            }
+            with yt_dlp.YoutubeDL(search_opts) as ydl:
+                info = ydl.extract_info(query, download=False)
+            if not info:
+                logger.warning("yt-dlp returned no results for '%s'", track_name)
+                return None
+
+            entries = info.get("entries") or [info]
+            entries = [e for e in entries if e]
+            if not entries:
+                logger.warning("yt-dlp returned no results for '%s'", track_name)
+                return None
+
+            # --- Phase 2: pick best candidate by title + duration, views as tiebreaker ---
+            clean_expected = _clean_track_name(track_name).lower()
+            sp_lower = track_name.lower()
+            sp_variants = {kw for kw in _VARIANT_KEYWORDS if kw in sp_lower}
+
+            if len(entries) > 1:
+
+                def _title_sim(entry: dict) -> float:
+                    yt_title = _clean_track_name(entry.get("title") or "").lower()
+                    return SequenceMatcher(None, clean_expected, yt_title).ratio()
+
+                def _variant_penalty(entry: dict) -> float:
+                    """Penalize when YouTube title has variant keywords the Spotify track doesn't (or vice versa)."""
+                    yt_lower = (entry.get("title") or "").lower()
+                    yt_variants = {kw for kw in _VARIANT_KEYWORDS if kw in yt_lower}
+                    # Symmetric difference: keywords in one but not the other
+                    mismatched = sp_variants ^ yt_variants
+                    # Each mismatch adds a heavy penalty (capped at 1.0)
+                    return min(len(mismatched) * 0.5, 1.0)
+
+                def _dur_penalty(entry: dict) -> float:
+                    if not expected_secs:
+                        return 0.0
+                    yt_dur = entry.get("duration") or 0
+                    return min(abs(yt_dur - expected_secs) / max(expected_secs, 1), 1.0)
+
+                def _preferred_bonus(entry: dict) -> float:
+                    """Small bonus (negative penalty) for lyrical/official audio sources.
+
+                    Only applies when the entry has NO variant mismatch — a "Remix Lyrics"
+                    video should not benefit from the lyrics keyword.
+                    """
+                    yt_lower = (entry.get("title") or "").lower()
+                    yt_variants = {kw for kw in _VARIANT_KEYWORDS if kw in yt_lower}
+                    if (sp_variants ^ yt_variants):
+                        return 0.0
+                    return -0.05 if any(kw in yt_lower for kw in _PREFERRED_KEYWORDS) else 0.0
+
+                # Score: 40% title, 30% variant mismatch, 30% duration, with preferred bonus
+                scored = [
+                    (
+                        e,
+                        0.4 * (1.0 - _title_sim(e))
+                        + 0.3 * _variant_penalty(e)
+                        + 0.3 * _dur_penalty(e)
+                        + _preferred_bonus(e),
+                    )
+                    for e in entries
+                ]
+                scored.sort(key=lambda x: x[1])
+
+                # If the top candidates are close (within 0.05), use views to break the tie
+                best_score = scored[0][1]
+                _TIE_THRESHOLD = 0.05  # noqa: N806
+                contenders = [(e, s) for e, s in scored if s - best_score <= _TIE_THRESHOLD]
+
+                if len(contenders) > 1:
+                    # Among near-ties, pick the one with the most views
+                    contenders.sort(key=lambda x: x[0].get("view_count") or 0, reverse=True)
+                    best_entry = contenders[0][0]
+                    logger.info(
+                        "YouTube match for '%s': '%s' (views=%s, score=%.2f, %d tied of %d)",
+                        track_name,
+                        best_entry.get("title", "?"),
+                        f"{(best_entry.get('view_count') or 0):,}",
+                        best_score,
+                        len(contenders),
+                        len(entries),
+                    )
+                else:
+                    best_entry = scored[0][0]
+                    logger.info(
+                        "YouTube match for '%s': '%s' (views=%s, score=%.2f, %d candidates)",
+                        track_name,
+                        best_entry.get("title", "?"),
+                        f"{(best_entry.get('view_count') or 0):,}",
+                        best_score,
+                        len(entries),
+                    )
             else:
-                track_df["Energy"] = raw_energy
+                best_entry = entries[0]
 
-            track_df["Popularity"] = pd.to_numeric(track_df["Popularity"], errors="coerce")
+            video_url = best_entry.get("webpage_url") or best_entry.get("url")
+            if not video_url:
+                logger.warning("No URL found for best YouTube match for '%s'", track_name)
+                return None
 
-            # Validate Camelot format (e.g., '1A', '12B')
-            track_df["Camelot"] = track_df["Camelot"].str.upper()
-            valid_camelot_mask = track_df["Camelot"].str.match(r"^[1-9]A$|^1[0-2]A$|^[1-9]B$|^1[0-2]B$", na=False)
-            invalid_camelot = track_df[~valid_camelot_mask]["Camelot"].unique()
-            if len(invalid_camelot) > 0:
-                logger.warning("Found potentially invalid Camelot keys: %s. Replacing with NaN.", invalid_camelot)
-                track_df.loc[~valid_camelot_mask, "Camelot"] = np.nan
+            # --- Phase 3: download the chosen video ---
+            with tempfile.TemporaryDirectory() as tmpdir:
+                dl_opts = {
+                    "format": "bestaudio/best",
+                    "outtmpl": str(Path(tmpdir) / "%(id)s.%(ext)s"),
+                    "quiet": True,
+                    "no_warnings": True,
+                    "noplaylist": True,
+                    "noprogress": True,
+                    "postprocessors": [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "wav",
+                            "preferredquality": "0",
+                        },
+                    ],
+                }
+                with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                    ydl.extract_info(video_url, download=True)
 
-        except Exception:
-            logger.exception("Error during data type conversion")
+                # Locate the downloaded file
+                files = list(Path(tmpdir).iterdir())
+                if not files:
+                    logger.warning("yt-dlp downloaded nothing for '%s'", track_name)
+                    return None
+                filepath = str(files[0])
 
-        logger.info("Successfully scraped and parsed %s tracks.", len(track_df))
-        return track_df
+                return librosa.load(filepath, sr=22050, mono=True, duration=30.0)
+        except Exception:  # noqa: BLE001 — yt-dlp/librosa raise many different error types
+            logger.warning("Audio analysis failed for '%s' (%s)", track_name, sp_id, exc_info=True)
+            return None
 
-    def load_playlist(self) -> pd.DataFrame | None:
-        """Load playlist name from Spotify and track data by scraping songdata.io."""
+    def _fetch_audio_features_local(
+        self, tracks: list[dict], progress_callback: Callable[[int, int], None] | None = None
+    ) -> dict[str, dict]:
+        """Analyze audio features for every track via yt-dlp + librosa.
+
+        Args:
+            tracks: Track dicts (must include ``Track`` and ``Artist`` keys).
+            progress_callback: Optional callable ``(completed: int, total: int)``
+                called after each track finishes analysis.
+        """
+        cache = _load_cache()
+        features: dict[str, dict] = {}
+        total = len(tracks)
+        completed = 0
+
+        # Separate cached vs uncached tracks
+        uncached: list[dict] = []
+        for track in tracks:
+            sp_id = track["id"]
+            if sp_id in cache:
+                features[sp_id] = cache[sp_id]
+                completed += 1
+                if progress_callback is not None:
+                    progress_callback(completed, total)
+            else:
+                uncached.append(track)
+
+        if uncached:
+            logger.info("Cache hit for %d/%d tracks, analyzing %d.", len(tracks) - len(uncached), total, len(uncached))
+
+            def analyze_one(track: dict) -> tuple[str, dict | None]:
+                return track["id"], self._analyze_track(
+                    track["id"], track["Track"], track["Artist"],
+                    track.get("duration_ms"), track.get("release_year", ""),
+                )
+
+            with ThreadPoolExecutor(max_workers=_DEFAULT_MAX_WORKERS) as executor:
+                futures = {executor.submit(analyze_one, t): t for t in uncached}
+                for future in as_completed(futures):
+                    sp_id, result = future.result()
+                    if result is not None:
+                        features[sp_id] = result
+                        cache[sp_id] = result
+                    completed += 1
+                    if progress_callback is not None:
+                        progress_callback(completed, total)
+
+            _save_cache(cache)
+        else:
+            logger.info("All %d tracks found in cache, skipping analysis.", total)
+
+        # Normalize energy 0-1 relative to the loudest track in this playlist
+        if features:
+            max_rms = max(v["energy"] for v in features.values())
+            if max_rms > 0:
+                for v in features.values():
+                    v["energy"] = v["energy"] / max_rms
+
+        logger.info("Locally analyzed %d/%d tracks.", len(features), len(tracks))
+        return features
+
+    def load_playlist(self, progress_callback: Callable[[int, int], None] | None = None) -> pd.DataFrame | None:
+        """Load playlist name and track data using Spotify API + local audio analysis.
+
+        Args:
+            progress_callback: Optional callable ``(completed: int, total: int)``
+                forwarded to the local audio-feature analysis step.
+        """
         logger.info("Loading playlist metadata for: %s", self.playlist_id)
         try:
-            # Get playlist name from Spotify (more reliable than scraping)
             playlist_info = self.sp.playlist(self.playlist_id, fields="name")
             self.playlist_name = playlist_info["name"]
             logger.info("Playlist Name (from Spotify): '%s'", self.playlist_name)
-        except (requests.RequestException, KeyError, ValueError) as e:
+        except (spotipy.SpotifyException, KeyError, ValueError) as e:
             logger.warning("Failed to get playlist name from Spotify: %s. Will proceed without it.", e)
             self.playlist_name = f"Playlist {self.playlist_id}"
 
-        # Scrape track data from songdata.io
-        scraped_data = self._scrape_songdata_io()
-
-        if scraped_data is None or scraped_data.empty:
-            logger.error("Failed to scrape data from songdata.io. Cannot proceed.")
+        # Get track list from Spotify
+        spotify_tracks = self._fetch_tracks_from_spotify()
+        if not spotify_tracks:
+            logger.error("No tracks returned from Spotify. Cannot proceed.")
             self.tracks_data = pd.DataFrame()
             self.original_track_order = []
             return None
-        self.tracks_data = scraped_data
-        # Store original order based on scraped table
-        self.original_track_order = self.tracks_data["id"].tolist()
-        logger.info(
-            "Using original track order based on songdata.io table (%s tracks).", len(self.original_track_order)
-        )
 
-        # Ensure required columns exist even if scraping missed some
-        for col in ["id", "Camelot", "BPM", "Energy"]:
-            if col not in self.tracks_data.columns:
-                logger.error("Required column '%s' not found in scraped data.", col)
-                self.tracks_data[col] = np.nan
+        # Analyze audio features locally via yt-dlp + librosa
+        audio_features = self._fetch_audio_features_local(spotify_tracks, progress_callback=progress_callback)
 
-        # Remove rows with missing essential data
-        initial_count = len(self.tracks_data)
-        self.tracks_data = self.tracks_data.dropna(subset=["id", "Camelot", "BPM", "Energy"])
-
-        dropped_count = initial_count - len(self.tracks_data)
-        if dropped_count > 0:
-            logger.warning(
-                "Dropped %s tracks due to missing essential data (ID, Camelot, BPM, or Energy) after scraping.",
-                dropped_count,
-            )
-
-        if self.tracks_data.empty:
-            logger.error("No tracks remaining after dropping those with missing essential data.")
+        if not audio_features:
+            logger.error("Local audio analysis returned no features. Cannot proceed.")
+            self.tracks_data = pd.DataFrame()
+            self.original_track_order = []
             return None
 
+        # Merge track info with audio features
+        rows = []
+        for track in spotify_tracks:
+            sp_id = track["id"]
+            features = audio_features.get(sp_id)
+            if features is None:
+                logger.warning("No audio features for track '%s' (%s) — skipping.", track["Track"], sp_id)
+                continue
+            rows.append(
+                {
+                    "id": sp_id,
+                    "Track": track["Track"],
+                    "Artist": track["Artist"],
+                    "Popularity": track.get("Popularity"),
+                    "BPM": features.get("tempo"),
+                    "Energy": features.get("energy"),
+                    "Camelot": features.get("camelot"),
+                    "Key": features.get("key"),
+                }
+            )
+
+        if not rows:
+            logger.error("No tracks had audio features available. Cannot proceed.")
+            self.tracks_data = pd.DataFrame()
+            self.original_track_order = []
+            return None
+
+        self.tracks_data = pd.DataFrame(rows)
+        self.original_track_order = [t["id"] for t in spotify_tracks if t["id"] in self.tracks_data["id"].to_numpy()]
+
+        # Drop rows missing essential fields
+        initial_count = len(self.tracks_data)
+        self.tracks_data = self.tracks_data.dropna(subset=["id", "Camelot", "BPM", "Energy"])
+        dropped = initial_count - len(self.tracks_data)
+        if dropped > 0:
+            logger.warning("Dropped %d tracks due to missing Camelot/BPM/Energy.", dropped)
+
+        if self.tracks_data.empty:
+            logger.error("No valid tracks remaining after filtering.")
+            return None
+
+        logger.info("Loaded %d tracks with audio features.", len(self.tracks_data))
         return self.tracks_data
 
     def calculate_transition_score(self, track1: pd.Series, track2: pd.Series) -> float:
@@ -445,7 +724,7 @@ class SpotifyPlaylistSorter:
             missing_tracks_ordered = [tid for tid in self.original_track_order if tid in missing_from_sort]
             logger.info("Appending %s tracks that were not placed during sorting.", len(missing_tracks_ordered))
             sorted_ids.extend(missing_tracks_ordered)
-        elif len(sorted_ids) < len(initial_sortable_ids):
+        elif len(sorted_ids) < len(initial_sortable_ids) + 1:
             logger.warning(
                 "Sorting ended with %s tracks, but started with %s sortable tracks.",
                 len(sorted_ids),
@@ -591,21 +870,40 @@ class SpotifyPlaylistSorter:
     def _get_track_uris(self, track_ids: list[str]) -> dict[str, str]:
         """Get Spotify URIs for track IDs, using the API to ensure accuracy."""
         uri_map = {}
+        max_retries = 3
 
         # Process in batches of 50 to avoid hitting API rate limits
         for i in range(0, len(track_ids), API_BATCH_SIZE):
             batch_ids = track_ids[i : i + API_BATCH_SIZE]
-            try:
-                # Fetch full track details to ensure we have correct URIs
-                tracks_details = self.sp.tracks(batch_ids)["tracks"]
-
-                for track in tracks_details:
-                    if track and "id" in track and "uri" in track:
-                        uri_map[track["id"]] = track["uri"]
-                    elif track and track["id"]:
-                        logger.warning("Could not find URI for track ID: %s", track["id"])
-            except Exception:
-                logger.exception("Failed to fetch track details batch (starting index %s)", i)
+            last_exc: Exception | None = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    tracks_details = self.sp.tracks(batch_ids)["tracks"]
+                    for track in tracks_details:
+                        if track and "id" in track and "uri" in track:
+                            uri_map[track["id"]] = track["uri"]
+                        elif track and track.get("id"):
+                            logger.warning("Could not find URI for track ID: %s", track["id"])
+                    last_exc = None
+                    break  # success
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    wait = 2**attempt
+                    logger.warning(
+                        "Batch starting index %s failed (attempt %s/%s), retrying in %ss: %s",
+                        i,
+                        attempt,
+                        max_retries,
+                        wait,
+                        exc,
+                    )
+                    time.sleep(wait)
+            if last_exc is not None:
+                logger.error(
+                    "Permanently failed to fetch track details batch (starting index %s) after %s attempts.",
+                    i,
+                    max_retries,
+                )
             time.sleep(0.5)
 
         return uri_map
@@ -629,11 +927,13 @@ class SpotifyPlaylistSorter:
             return False, "No valid track URIs could be fetched"
 
         if len(track_uris) != len(sorted_ids):
-            logger.warning(
-                "Could only find URIs for %s out of %s tracks. Playlist will be updated with available tracks.",
-                len(track_uris),
-                len(sorted_ids),
+            missing = len(sorted_ids) - len(track_uris)
+            msg = (
+                f"Could only resolve URIs for {len(track_uris)}/{len(sorted_ids)} tracks "
+                f"({missing} missing). Aborting playlist update to prevent data loss."
             )
+            logger.error(msg)
+            return False, msg
 
         logger.info("Updating Spotify playlist '%s' with %s tracks.", self.playlist_name, len(track_uris))
 
@@ -653,5 +953,5 @@ class SpotifyPlaylistSorter:
         except Exception as e:
             error_msg = str(e)
             logger.exception("Failed to update Spotify playlist: %s", error_msg)
-            logger.exception("Check API permissions (scope), rate limits, and playlist ownership.")
+            logger.info("Check API permissions (scope), rate limits, and playlist ownership.")
             return False, f"Failed to update playlist: {error_msg}"
