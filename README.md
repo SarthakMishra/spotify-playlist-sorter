@@ -1,85 +1,44 @@
 # Spotify Playlist Sorter
 
-A Streamlit app that sorts your Spotify playlists based on musical key compatibility (Camelot wheel), BPM (tempo), and energy levels to create smooth transitions between tracks.
+Sort your Spotify playlists for smooth DJ-style transitions using harmonic mixing (Camelot wheel), BPM matching, and energy flow.
 
-## Features
+Audio analysis runs entirely locally via **yt-dlp** + **librosa** — no third-party audio API required.
 
-- Loads playlist data directly from Spotify
-- Analyzes tracks using songdata.io
-- Sorts tracks based on:
-  - Harmonic mixing (Camelot wheel)
-  - BPM (tempo) similarity
-  - Energy level transitions
-- Updates playlist order on Spotify
-- Provides detailed transition analysis
-- User-friendly Streamlit interface
+**[Live Demo](https://spotify-playlist-sorter.streamlit.app)**
 
-## Live Demo
+## Setup
 
-Try the app at: [https://spotify-playlist-sorter.streamlit.app](https://spotify-playlist-sorter.streamlit.app)
+**Prerequisites:** Python 3.13+, [ffmpeg](https://ffmpeg.org/), a [Spotify Developer App](https://developer.spotify.com/dashboard) with redirect URI `http://127.0.0.1:8501`
 
-## Local Setup
-
-1. Clone the repository:
 ```bash
 git clone https://github.com/SarthakMishra/spotify-playlist-sorter.git
 cd spotify-playlist-sorter
+uv sync          # or: pip install -r requirements.txt
+task run         # or: uv run streamlit run app/app.py
 ```
 
-2. Install dependencies:
+Enter your Spotify Client ID and Secret in the app UI, authenticate, pick a playlist, and sort.
+
+## How It Works
+
+For each track, yt-dlp downloads 30 seconds of audio from YouTube, then librosa extracts:
+
+- **Key & mode** — Krumhansl-Kessler chromagram correlation, mapped to Camelot notation
+- **BPM** — `librosa.feature.rhythm.tempo`
+- **Energy** — RMS energy, normalized across the playlist
+
+A greedy algorithm orders tracks starting from a user-chosen anchor, maximizing a weighted transition score (50% key compatibility, 30% BPM similarity, 20% energy flow).
+
+## Development
+
 ```bash
-pip install -r requirements.txt
+task fix         # auto-fix, format, and type-check
+task lint        # ruff check + ty
+task lint:format # ruff format
 ```
 
-3. Create a Spotify Developer Application:
-   - Go to [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
-   - Create a new application
-   - Get your Client ID and Client Secret
-   - Add `http://localhost:8501/callback` to your app's Redirect URIs in the settings
+**Toolchain:** [ruff](https://docs.astral.sh/ruff/) (linter + formatter) · [ty](https://github.com/astral-sh/ty) (type checker) · [uv](https://docs.astral.sh/uv/) (package manager)
 
-4. Configure environment variables:
-   - Copy `.env.template` to `.env`
-   - Fill in your Spotify API credentials in `.env`
+## License
 
-## Usage
-
-### Streamlit App (Recommended)
-
-1. Run the Streamlit app:
-```bash
-streamlit run app/app.py
-```
-
-2. Open your browser at `http://localhost:8501`
-
-3. Follow the instructions in the app:
-   - Authenticate with Spotify
-   - Select a playlist to sort
-   - Choose an anchor track
-   - Review the transition analysis
-   - Update your playlist with the optimized order
-
-## How it Works
-
-The sorter uses several factors to create optimal transitions:
-
-1. **Camelot Wheel**: Ensures harmonic compatibility between tracks
-2. **BPM Matching**: Minimizes tempo changes between tracks
-3. **Energy Flow**: Creates smooth energy level transitions
-4. **Opening Track**: Selects a high-energy, popular track to start the playlist
-
-## Deployment
-
-This app is designed to be deployed to Streamlit Cloud. To deploy your own version:
-
-1. Fork this repository
-2. Connect your GitHub account to Streamlit Cloud
-3. Deploy the app, pointing to `app/app.py`
-4. Add your Spotify API credentials to the Streamlit Cloud secrets
-
-## Notes
-
-- The app requires Spotify API access and will modify your playlists
-- Always make a backup of important playlists before sorting
-- Rate limits apply to Spotify API calls
-- **Important Note**: This project scrapes track attributes (BPM, key, energy) from songdata.io as the Spotify Web API's "Get Track's Audio Features" endpoint has been deprecated. Due to the nature of web scraping, this project might not work if the structure of songdata.io changes. If you encounter any issues due to website structure changes, please feel free to open a Pull Request with the necessary updates.
+[MIT](LICENSE)

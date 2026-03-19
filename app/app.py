@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 import plotly.express as px
@@ -21,27 +22,29 @@ from spotify_auth import (
     load_credentials as load_spotify_credentials,
 )
 
+if TYPE_CHECKING:
+    import spotipy
+
 # Configure logging
-logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
-# Constants
-# Path for saving credentials
-CREDENTIALS_FILE = Path("./.spotify_credentials")
+# Path for saving credentials (relative to this file's directory)
+CREDENTIALS_FILE = Path(__file__).parent.parent / ".spotify_credentials"
 
-# Constants for score thresholds
-SCORE_HIGH_THRESHOLD = 0.7
-SCORE_MEDIUM_THRESHOLD = 0.4
-BPM_GOOD_THRESHOLD = 5
-BPM_MEDIUM_THRESHOLD = 10
+# Number of expected lines in credentials file (client_id and client_secret)
+EXPECTED_CREDENTIALS_LINES = 2
+
+# Minimum number of tracks needed for a meaningful chart
+MIN_TRACKS_FOR_CHART = 2
 
 
-# Function to save credentials to file
+# --- Credential helpers ---
+
+
 def save_credentials(client_id: str, client_secret: str) -> bool:
     """Save credentials to a local file."""
     try:
-        # Simple encoding - not fully secure but better than plaintext
-        # In a production app, you'd use a proper secure storage
         with CREDENTIALS_FILE.open("w") as f:
             f.write(f"{client_id}\n{client_secret}")
         logger.info("Credentials saved successfully")
@@ -51,12 +54,8 @@ def save_credentials(client_id: str, client_secret: str) -> bool:
         return False
 
 
-# Function to load credentials from file
 def load_credentials() -> tuple[str | None, str | None]:
     """Load credentials from a local file."""
-    # Number of expected lines in credentials file (client_id and client_secret)
-    EXPECTED_CREDENTIALS_LINES = 2  # noqa: N806
-
     try:
         if not CREDENTIALS_FILE.exists():
             return None, None
@@ -75,762 +74,377 @@ def load_credentials() -> tuple[str | None, str | None]:
         return None, None
 
 
-# Set page config
-st.set_page_config(
-    page_title="Spotify Playlist Sorter",
-    page_icon="🎵",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# Custom CSS
-st.markdown(
-    """
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        color: #1DB954;
-        margin-bottom: 1rem;
-    }
-    .sub-header {
-        font-size: 1.5rem;
-        margin-top: 2rem;
-        margin-bottom: 1rem;
-        color: #1DB954;
-    }
-    .info-text {
-        font-size: 1rem;
-        color: #777777;
-    }
-    .success-box {
-        padding: 1rem;
-        background-color: rgba(29, 185, 84, 0.1);
-        border-left: 5px solid #1DB954;
-        margin-bottom: 1rem;
-    }
-    .warning-box {
-        padding: 1rem;
-        background-color: rgba(255, 173, 51, 0.1);
-        border-left: 5px solid #FFAD33;
-        margin-bottom: 1rem;
-    }
-    .error-box {
-        padding: 1rem;
-        background-color: rgba(255, 82, 82, 0.1);
-        border-left: 5px solid #FF5252;
-        margin-bottom: 1rem;
-    }
-    .info-box {
-        padding: 1rem;
-        background-color: rgba(0, 123, 255, 0.1);
-        border-left: 5px solid #007BFF;
-        margin-bottom: 1rem;
-    }
-    .transition-card {
-        padding: 1rem;
-        background-color: #f9f9f9;
-        border-radius: 5px;
-        margin-bottom: 1rem;
-        border: 1px solid #ddd;
-    }
-    .key-compatible {
-        color: #1DB954;
-        font-weight: bold;
-    }
-    .key-incompatible {
-        color: #FF5252;
-        font-weight: bold;
-    }
-    .perfect-match {
-        color: #1DB954;
-        font-weight: bold;
-    }
-    .bpm-good {
-        color: #1DB954;
-    }
-    .bpm-medium {
-        color: #FFAD33;
-    }
-    .bpm-bad {
-        color: #FF5252;
-    }
-    .score-high {
-        color: #1DB954;
-        font-weight: bold;
-    }
-    .score-medium {
-        color: #FFAD33;
-        font-weight: bold;
-    }
-    .score-low {
-        color: #FF5252;
-        font-weight: bold;
-    }
-    .footer {
-        margin-top: 3rem;
-        text-align: center;
-        color: #777777;
-        font-size: 0.8rem;
-    }
-    .documentation-link {
-        color: #1DB954;
-        text-decoration: underline;
-    }
-</style>
-""",
-    unsafe_allow_html=True,
-)
+# --- Session state helpers ---
 
 
-def main() -> None:
-    """Main application function that handles the Streamlit UI and app flow."""
-    # Header
-    st.markdown("<h1 class='main-header'>Spotify Playlist Sorter</h1>", unsafe_allow_html=True)
+def _init_session_state() -> None:
+    """Initialize all session state variables with defaults."""
+    defaults: dict[str, Any] = {
+        "authenticated": False,
+        "playlists": None,
+        "playlist_id": None,
+        "tracks_data": None,
+        "sorter": None,
+        "sorted_ids": None,
+        "anchor_track_id": None,
+        "original_df": None,
+        "sorted_df": None,
+        "transitions": None,
+        "auth_flow_started": False,
+        "auth_error": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-    # Initialize session state variables if they don't exist
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-    if "playlists" not in st.session_state:
-        st.session_state.playlists = None
-    if "playlist_id" not in st.session_state:
-        st.session_state.playlist_id = None
-    if "tracks_data" not in st.session_state:
-        st.session_state.tracks_data = None
-    if "sorter" not in st.session_state:
-        st.session_state.sorter = None
-    if "sorted_ids" not in st.session_state:
-        st.session_state.sorted_ids = None
-    if "anchor_track_id" not in st.session_state:
-        st.session_state.anchor_track_id = None
-    if "original_df" not in st.session_state:
-        st.session_state.original_df = None
-    if "sorted_df" not in st.session_state:
-        st.session_state.sorted_df = None
-    if "transitions" not in st.session_state:
-        st.session_state.transitions = None
     if "custom_client_id" not in st.session_state:
-        # Try to load from file first
         client_id, client_secret = load_spotify_credentials()
         st.session_state.custom_client_id = client_id or ""
         st.session_state.custom_client_secret = client_secret or ""
+
     if "credentials_locked" not in st.session_state:
-        # Auto-lock credentials if they were loaded from file
         st.session_state.credentials_locked = bool(
             st.session_state.custom_client_id and st.session_state.custom_client_secret
         )
-    if "auth_flow_started" not in st.session_state:
-        st.session_state.auth_flow_started = False
-    if "auth_error" not in st.session_state:
-        st.session_state.auth_error = None
 
-    # Function to clear auth state
-    def clear_auth_state() -> None:
-        st.session_state.authenticated = False
-        st.session_state.token_info = None
-        st.session_state.playlists = None
-        st.session_state.auth_flow_started = False
-        st.session_state.auth_error = None
 
-    # Sidebar for authentication and playlist selection
-    with st.sidebar:
-        st.markdown("<h2 class='sub-header'>Authentication</h2>", unsafe_allow_html=True)
+def _clear_auth_state() -> None:
+    """Reset authentication-related session state."""
+    st.session_state.authenticated = False
+    st.session_state.token_info = None
+    st.session_state.playlists = None
+    st.session_state.auth_flow_started = False
+    st.session_state.auth_error = None
 
-        # Custom API credentials input
-        st.markdown(
-            """
-            <div class='info-box'>
-            To use this app, you need to provide your own
-            <a href="https://developer.spotify.com/documentation/web-api/concepts/apps" target="_blank" class="documentation-link">
-            Spotify API credentials.</a>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
 
-        # Environment selection
-        if "is_local_environment" not in st.session_state:
-            # Try to detect if we're running in Streamlit Cloud
-            try:
-                # Check if we're running in a Streamlit environment
-                from streamlit.runtime.scriptrunner import get_script_run_ctx
+def _clear_playlist_state() -> None:
+    """Reset playlist-related session state when switching playlists."""
+    st.session_state.tracks_data = None
+    st.session_state.sorter = None
+    st.session_state.sorted_ids = None
+    st.session_state.anchor_track_id = None
+    st.session_state.original_df = None
+    st.session_state.sorted_df = None
+    st.session_state.transitions = None
 
-                # Check for cloud deployment by looking at the URL
-                ctx = get_script_run_ctx()
-                if ctx is not None and ctx.session_id:
-                    # If we're on streamlit cloud, the URL won't be localhost
-                    is_cloud = "localhost" not in st.get_option(
-                        "server.baseUrlPath"
-                    ) and "127.0.0.1" not in st.get_option("server.baseUrlPath")
-                    st.session_state.is_local_environment = not is_cloud
-                else:
-                    # Default to True if we can't determine
-                    st.session_state.is_local_environment = True
-            except (ImportError, ModuleNotFoundError, AttributeError):
-                # If specific errors occur (import missing, module not found, attribute not available)
-                st.session_state.is_local_environment = True
 
-        is_local = st.checkbox("I'm running this app locally", value=st.session_state.is_local_environment)
-        if is_local != st.session_state.is_local_environment:
-            st.session_state.is_local_environment = is_local
-            # Clear auth state if environment changes
-            if "token_info" in st.session_state:
-                clear_auth_state()
-                st.rerun()
+# --- Sidebar rendering ---
 
-        # Credential input fields
-        if st.session_state.credentials_locked:
-            # Display locked credentials with masked values
-            st.text_input("Client ID", value="*" * 10, disabled=True)
-            st.text_input("Client Secret", value="*" * 10, disabled=True)
 
-            # Reset credentials button
-            if st.button("Reset Credentials", type="primary", use_container_width=True):
-                st.session_state.custom_client_id = ""
-                st.session_state.custom_client_secret = ""
-                st.session_state.credentials_locked = False
-                clear_auth_state()
-                # Delete the credentials file
-                if CREDENTIALS_FILE.exists():
-                    try:
-                        CREDENTIALS_FILE.unlink()
-                        logger.info("Credentials file deleted")
-                    except Exception:
-                        logger.exception("Failed to delete credentials file")
-                st.rerun()
-        else:
-            # Editable credential fields
-            custom_client_id = st.text_input("Client ID", value=st.session_state.custom_client_id, type="password")
-            custom_client_secret = st.text_input(
-                "Client Secret", value=st.session_state.custom_client_secret, type="password"
-            )
+def _render_credential_inputs() -> None:
+    """Render the credential input section in the sidebar."""
+    # Environment selection
+    if "is_local_environment" not in st.session_state:
+        is_cloud = bool(os.getenv("STREAMLIT_SHARING_MODE") or os.getenv("STCLOUD"))
+        st.session_state.is_local_environment = not is_cloud
 
-            # Save credentials button
-            if st.button("Save Credentials", type="primary", use_container_width=True):
-                if custom_client_id and custom_client_secret:
-                    st.session_state.custom_client_id = custom_client_id
-                    st.session_state.custom_client_secret = custom_client_secret
-
-                    # Save to file for persistence
-                    if save_credentials(custom_client_id, custom_client_secret):
-                        st.session_state.credentials_locked = True
-                        # Reset authentication when credentials change
-                        clear_auth_state()
-                        st.rerun()
-                    else:
-                        st.error("Failed to save credentials. Please try again.")
-                else:
-                    st.error("Please enter both Client ID and Client Secret")
-
-        # Authentication status
-        if st.session_state.authenticated:
-            st.markdown("<div class='success-box'>✓ Authenticated with Spotify</div>", unsafe_allow_html=True)
-        else:
-            st.markdown("<div class='warning-box'>⚠️ Not authenticated with Spotify</div>", unsafe_allow_html=True)
-
-        # Reset authentication if needed
-        if st.session_state.authenticated and st.button("Sign Out"):
-            clear_auth_state()
+    is_local = st.checkbox("Running locally", value=st.session_state.is_local_environment)
+    if is_local != st.session_state.is_local_environment:
+        st.session_state.is_local_environment = is_local
+        if "token_info" in st.session_state:
+            _clear_auth_state()
             st.rerun()
 
-        # Debug info section (collapsible)
-        with st.expander("Debug Information", expanded=False):
-            st.write(
-                "Authentication State:", "Authenticated" if st.session_state.authenticated else "Not Authenticated"
-            )
-            st.write(
-                "Token Present:", "Yes" if "token_info" in st.session_state and st.session_state.token_info else "No"
-            )
-            if "query_params" in st.session_state:
-                st.write("Query Parameters:", st.session_state.query_params)
-            if st.button("Clear All Session State"):
+    if st.session_state.credentials_locked:
+        st.text_input("Client ID", value="*" * 10, disabled=True)
+        st.text_input("Client Secret", value="*" * 10, disabled=True)
+
+        if st.button("Reset Credentials", width="stretch"):
+            st.session_state.custom_client_id = ""
+            st.session_state.custom_client_secret = ""
+            st.session_state.credentials_locked = False
+            _clear_auth_state()
+            if CREDENTIALS_FILE.exists():
+                try:
+                    CREDENTIALS_FILE.unlink()
+                except Exception:
+                    logger.exception("Failed to delete credentials file")
+            st.rerun()
+    else:
+        st.caption("Need credentials? [Create a Spotify app](https://developer.spotify.com/dashboard)")
+        custom_client_id = st.text_input("Client ID", value=st.session_state.custom_client_id, type="password")
+        custom_client_secret = st.text_input(
+            "Client Secret", value=st.session_state.custom_client_secret, type="password"
+        )
+
+        if st.button("Save Credentials", type="primary", width="stretch"):
+            if custom_client_id and custom_client_secret:
+                st.session_state.custom_client_id = custom_client_id
+                st.session_state.custom_client_secret = custom_client_secret
+                if save_credentials(custom_client_id, custom_client_secret):
+                    st.session_state.credentials_locked = True
+                    _clear_auth_state()
+                    st.rerun()
+                else:
+                    st.error("Failed to save credentials.")
+            else:
+                st.error("Both Client ID and Client Secret are required.")
+
+
+def _render_auth_flow() -> None:
+    """Render the Spotify OAuth authentication flow UI."""
+    auth_url = get_auth_url()
+
+    if not auth_url:
+        st.error("Enter valid Spotify API credentials to continue.")
+        return
+
+    st.link_button("Connect Spotify Account", auth_url, width="stretch")
+
+    if st.session_state.auth_error:
+        st.error(st.session_state.auth_error)
+
+    if "code" in st.query_params:
+        st.info("Authorization code received. Processing...")
+        with st.expander("Troubleshooting"):
+            st.write(f"Redirect URI: `{get_redirect_uri()}`")
+            st.write("Make sure your Spotify app's redirect URI matches exactly.")
+            if st.button("Retry Authentication"):
+                _clear_auth_state()
+                st.rerun()
+
+
+def _render_playlist_selector(sp: spotipy.Spotify) -> None:
+    """Render playlist loading and selection UI."""
+    if st.button("Refresh Playlists"):
+        with st.spinner("Loading playlists..."):
+            st.session_state.playlists = get_all_playlists(sp)
+
+    if st.session_state.playlists is None:
+        with st.spinner("Loading playlists..."):
+            st.session_state.playlists = get_all_playlists(sp)
+
+    if not st.session_state.playlists:
+        st.info("No playlists found.")
+        return
+
+    playlist_options = {f"{p['name']} ({p['tracks']['total']} tracks)": p["id"] for p in st.session_state.playlists}
+    selected_playlist = st.selectbox("Playlist", options=list(playlist_options.keys()), label_visibility="collapsed")
+
+    if not selected_playlist:
+        return
+
+    playlist_id = playlist_options[selected_playlist]
+
+    if st.session_state.playlist_id != playlist_id:
+        st.session_state.playlist_id = playlist_id
+        _clear_playlist_state()
+
+    if st.button("Load Playlist", width="stretch"):
+        progress_bar = st.progress(0, text="Fetching tracks...")
+        status_text = st.empty()
+
+        def on_progress(done: int, total: int) -> None:
+            pct = done / total if total else 1.0
+            progress_bar.progress(pct, text=f"Analyzing audio... {done}/{total}")
+            status_text.caption(f"{done}/{total} tracks analyzed")
+
+        sorter = SpotifyPlaylistSorter(playlist_id, sp)
+        tracks_data = sorter.load_playlist(progress_callback=on_progress)
+        progress_bar.empty()
+        status_text.empty()
+
+        if tracks_data is not None and not tracks_data.empty:
+            st.session_state.tracks_data = tracks_data
+            st.session_state.sorter = sorter
+            st.success(f"Loaded {len(tracks_data)} tracks")
+        else:
+            st.error("Failed to load playlist data.")
+
+
+def _render_sidebar() -> None:
+    """Render the full sidebar with auth and playlist selection."""
+    with st.sidebar:
+        st.header("Spotify Playlist Sorter")
+        _render_credential_inputs()
+
+        if not (st.session_state.custom_client_id and st.session_state.custom_client_secret):
+            return
+
+        # Set credentials for the OAuth flow
+        os.environ["SPOTIFY_CLIENT_ID"] = st.session_state.custom_client_id
+        os.environ["SPOTIFY_CLIENT_SECRET"] = st.session_state.custom_client_secret
+
+        st.divider()
+
+        if not st.session_state.authenticated:
+            sp = get_spotify_client()
+            if sp:
+                st.session_state.authenticated = True
+                st.session_state.auth_error = None
+                st.rerun()
+        else:
+            sp = get_spotify_client()
+            if not sp:
+                st.session_state.authenticated = False
+                st.session_state.auth_error = "Token expired or invalid"
+                st.rerun()
+
+        if st.session_state.authenticated and sp:
+            st.success("Connected to Spotify", icon="✅")
+            _render_playlist_selector(sp)
+            if st.button("Sign Out"):
+                _clear_auth_state()
+                st.rerun()
+        else:
+            _render_auth_flow()
+
+        with st.expander("Debug"):
+            st.caption(f"Auth: {'Yes' if st.session_state.authenticated else 'No'}")
+            st.caption(f"Token: {'Yes' if st.session_state.get('token_info') else 'No'}")
+            if st.button("Clear Session"):
                 for key in list(st.session_state.keys()):
                     del st.session_state[key]
                 st.rerun()
 
-        # Get Spotify client with custom credentials
-        if st.session_state.custom_client_id and st.session_state.custom_client_secret:
-            # Temporarily set the credentials for OAuth flow
-            os.environ["SPOTIFY_CLIENT_ID"] = st.session_state.custom_client_id
-            os.environ["SPOTIFY_CLIENT_SECRET"] = st.session_state.custom_client_secret
 
-            # Check if we're already authenticated
-            if not st.session_state.authenticated:
-                sp = get_spotify_client()
-                if sp:
-                    st.session_state.authenticated = True
-                    st.session_state.auth_error = None
-                    st.rerun()
+# --- Main content rendering ---
+
+
+def _render_sorting_controls() -> None:
+    """Render anchor track selection and sort button."""
+    playlist_name = st.session_state.sorter.playlist_name
+    st.subheader(f"{playlist_name}")
+    st.caption(f"{len(st.session_state.tracks_data)} tracks with audio data")
+
+    track_options = {
+        f"{row['Track']} - {row['Artist']}": row["id"] for _, row in st.session_state.tracks_data.iterrows()
+    }
+    selected_anchor = st.selectbox("Anchor track (playlist will start here)", options=list(track_options.keys()))
+
+    if not selected_anchor:
+        return
+
+    anchor_track_id = track_options[selected_anchor]
+    st.session_state.anchor_track_id = anchor_track_id
+
+    button_label = "Re-sort" if st.session_state.get("sorted_ids") else "Sort Playlist"
+    if st.button(button_label, type="primary"):
+        with st.spinner("Sorting..."):
+            sorted_ids = st.session_state.sorter.sort_playlist(anchor_track_id)
+            if sorted_ids:
+                st.session_state.sorted_ids = sorted_ids
+                original_df, sorted_df = st.session_state.sorter.compare_playlists(sorted_ids)
+                st.session_state.original_df = original_df
+                st.session_state.sorted_df = sorted_df
+                st.session_state.transitions = st.session_state.sorter.get_transition_analysis(sorted_ids)
             else:
-                sp = get_spotify_client()
+                st.error("Sorting failed.")
 
-                if not sp:
-                    st.session_state.authenticated = False
-                    st.session_state.auth_error = "Authentication token expired or invalid"
-                    st.error("Authentication token expired or invalid. Please try again.")
-                    st.rerun()
 
-            # If authenticated, load playlists
-            if st.session_state.authenticated and sp:
-                if st.button("Refresh Playlists"):
-                    with st.spinner("Loading your playlists..."):
-                        st.session_state.playlists = get_all_playlists(sp)
-                    st.success(f"Loaded {len(st.session_state.playlists)} playlists")
+def _render_sorted_results() -> None:
+    """Render the sorted playlist comparison and transition analysis."""
+    if not (
+        st.session_state.sorted_ids
+        and st.session_state.original_df is not None
+        and st.session_state.sorted_df is not None
+    ):
+        return
 
-                # Load playlists if not already loaded
-                if st.session_state.playlists is None:
-                    with st.spinner("Loading your playlists..."):
-                        st.session_state.playlists = get_all_playlists(sp)
+    display_columns = ["Track", "Artist", "Camelot", "BPM", "Energy"]
 
-                # Playlist selection
-                st.markdown("<h2 class='sub-header'>Select Playlist</h2>", unsafe_allow_html=True)
+    tab_sorted, tab_original = st.tabs(["Sorted Order", "Original Order"])
 
-                if st.session_state.playlists:
-                    playlist_options = {
-                        f"{p['name']} ({p['tracks']['total']} tracks)": p["id"] for p in st.session_state.playlists
-                    }
-                    selected_playlist = st.selectbox(
-                        "Choose a playlist to sort:", options=list(playlist_options.keys())
-                    )
+    with tab_sorted:
+        st.dataframe(st.session_state.sorted_df[display_columns], hide_index=True, width="stretch")
 
-                    if selected_playlist:
-                        playlist_id = playlist_options[selected_playlist]
+    with tab_original:
+        st.dataframe(st.session_state.original_df[display_columns], hide_index=True, width="stretch")
 
-                        if st.session_state.playlist_id != playlist_id:
-                            st.session_state.playlist_id = playlist_id
-                            st.session_state.tracks_data = None
-                            st.session_state.sorter = None
-                            st.session_state.sorted_ids = None
-                            st.session_state.anchor_track_id = None
-                            st.session_state.original_df = None
-                            st.session_state.sorted_df = None
-                            st.session_state.transitions = None
+    if st.session_state.transitions:
+        _render_transition_analysis(st.session_state.transitions)
 
-                        if st.button("Load Playlist Data"):
-                            with st.spinner("Loading playlist data from Spotify and songdata.io..."):
-                                sorter = SpotifyPlaylistSorter(playlist_id, sp)
-                                tracks_data = sorter.load_playlist()
+    st.divider()
 
-                                if tracks_data is not None and not tracks_data.empty:
-                                    st.session_state.tracks_data = tracks_data
-                                    st.session_state.sorter = sorter
-                                    st.success(f"Loaded {len(tracks_data)} tracks with key, BPM, and energy data")
-                                else:
-                                    st.error("Failed to load playlist data. Please check the logs for details.")
-                else:
-                    st.info("No playlists found. Please refresh your playlists.")
+    if st.button("Apply to Spotify", type="primary"):
+        with st.spinner("Updating playlist on Spotify..."):
+            success, message = st.session_state.sorter.update_spotify_playlist(st.session_state.sorted_ids)
+            if success:
+                st.success(message)
             else:
-                # Authentication flow using SpotifyOAuth
-                auth_url = get_auth_url()
+                st.error(message)
 
-                if auth_url:
-                    st.markdown(
-                        "<div class='info-box'>Connect to Spotify to access your playlists.</div>",
-                        unsafe_allow_html=True,
-                    )
 
-                    # Add authentication instructions
-                    st.markdown(
-                        """
-                        <div class='info-box' style='background-color: #fff8e1; border-left: 5px solid #ffb300;'>
-                        <strong>Authentication Instructions:</strong>
-                        <ol>
-                            <li>Click the button below to open Spotify authentication in a new tab</li>
-                            <li>Log in to your Spotify account and authorize the app</li>
-                            <li>After authorization, you'll be redirected back to this app</li>
-                            <li>If the redirect doesn't work automatically, copy the URL from the Spotify auth page and paste it in this browser window</li>
-                        </ol>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+def _render_transition_analysis(all_transitions: list[dict[str, Any]]) -> None:
+    """Render the transition analysis table and chart."""
+    transitions = [t for t in all_transitions if not t.get("summary", False)]
 
-                    # Create button that automatically redirects to Spotify auth
-                    st.markdown(
-                        f'<a href="{auth_url}" target="_blank">'
-                        f'<button style="width:100%;padding:0.5em;background-color:#1DB954;color:white;'
-                        f'border:none;border-radius:4px;cursor:pointer;font-weight:bold;">'
-                        f"Connect Spotify Account</button></a>",
-                        unsafe_allow_html=True,
-                    )
+    # Build compact transition rows
+    transition_data = []
+    for transition in transitions:
+        if "score" not in transition:
+            continue
+        transition_data.append(_build_transition_row(transition))
 
-                    # Show any auth errors
-                    if st.session_state.auth_error:
-                        st.error(f"Authentication error: {st.session_state.auth_error}")
+    if not transition_data:
+        return
 
-                    # Handle auth flow debug info
-                    if "code" in st.query_params:
-                        st.info("Authorization code received. Processing...")
-                        st.write("**Debug Information:**")
-                        st.write(f"Code parameter length: {len(st.query_params['code'])}")
-                        st.write(f"Redirect URI being used: {get_redirect_uri()}")
-                        st.write("If authentication keeps failing, try these steps:")
-                        st.write("1. Verify your Spotify app's redirect URI exactly matches the one above")
-                        st.write("2. Check that your Client ID and Secret are correct")
-                        st.write("3. Try clearing your session state and browser cookies")
+    with st.expander("Transition Details", expanded=False):
+        st.dataframe(pd.DataFrame(transition_data), hide_index=True, width="stretch")
 
-                        if st.button("Retry Authentication"):
-                            clear_auth_state()
-                            st.rerun()
-                else:
-                    st.error("Please enter valid Spotify API credentials above to continue.")
-        else:
-            st.warning("Please enter your Spotify API credentials to continue.")
+    with st.expander("Visual Analysis", expanded=False):
+        try:
+            fig = create_transition_chart(transitions)
+            st.plotly_chart(fig, use_container_width=True)
+        except (ValueError, TypeError, KeyError):
+            st.caption("Not enough data to render chart.")
 
-    # Main content area
-    if st.session_state.authenticated:
-        if st.session_state.tracks_data is not None and st.session_state.sorter is not None:
-            # Display playlist info
-            playlist_name = st.session_state.sorter.playlist_name
-            st.markdown(
-                f"**Playlist:** {playlist_name} &nbsp; |  &nbsp;  **Tracks with complete data:** {len(st.session_state.tracks_data)}"
-            )
 
-            st.divider()
+def _build_transition_row(transition: dict[str, Any]) -> dict[str, Any]:
+    """Build a compact transition row for the analysis table."""
+    bpm_diff = transition.get("bpm_diff")
+    energy_diff = transition.get("energy_diff")
 
-            # Select anchor track
-            st.markdown("<h2 class='sub-header'>Select Anchor Track</h2>", unsafe_allow_html=True)
-            st.markdown(
-                "Choose the first track for your sorted playlist. This track will be the starting point, "
-                "and all other tracks will be arranged based on optimal transitions from this track."
-            )
+    row: dict[str, Any] = {
+        "#": transition["index"],
+        "From": transition["track1_name"],
+        "To": transition["track2_name"],
+        "Key": f"{transition['key1']} → {transition['key2']}",
+        "BPM Diff": f"{bpm_diff:.0f}" if bpm_diff is not None else "-",
+        "Energy Diff": f"{energy_diff:+.2f}" if energy_diff is not None else "-",
+        "Score": f"{transition['score']:.2f}",
+    }
 
-            # Add note about preview vs actual sorting
-            st.warning(
-                "This will not sort your Spotify playlist but it'll generate a preview of the sorted playlist. "
-                "To sort your Spotify playlist please scroll to the bottom and click on Sort Playlist."
-            )
+    return row
 
-            # Create a dataframe for display with track name, artist, key, BPM, energy
-            display_df = st.session_state.tracks_data[["Track", "Artist", "Camelot", "BPM", "Energy"]].copy()
-            display_df["BPM"] = display_df["BPM"].round().astype("Int64")
-            display_df["Energy"] = (display_df["Energy"] * 10).round() / 10
 
-            # Add a select button column
-            track_options = {
-                f"{row['Track']} - {row['Artist']}": row["id"] for _, row in st.session_state.tracks_data.iterrows()
-            }
-            selected_anchor = st.selectbox("Choose your anchor track:", options=list(track_options.keys()))
-
-            if selected_anchor:
-                anchor_track_id = track_options[selected_anchor]
-                st.session_state.anchor_track_id = anchor_track_id
-
-                # Sort button
-                button_label = "Re-sort Playlist" if st.session_state.get("sorted_ids") else "Sort Playlist"
-                if st.button(button_label):
-                    with st.spinner("Sorting playlist based on optimal transitions..."):
-                        sorted_ids = st.session_state.sorter.sort_playlist(anchor_track_id)
-
-                        if sorted_ids:
-                            st.session_state.sorted_ids = sorted_ids
-
-                            # Compare playlists
-                            original_df, sorted_df = st.session_state.sorter.compare_playlists(sorted_ids)
-                            st.session_state.original_df = original_df
-                            st.session_state.sorted_df = sorted_df
-
-                            # Get transition analysis
-                            transitions = st.session_state.sorter.get_transition_analysis(sorted_ids)
-                            st.session_state.transitions = transitions
-
-                            st.success("Playlist sorted successfully!")
-                        else:
-                            st.error("Failed to sort playlist. Please check the logs for details.")
-
-            st.divider()
-
-            # Display sorted results if available
-            if (
-                st.session_state.sorted_ids
-                and st.session_state.original_df is not None
-                and st.session_state.sorted_df is not None
-            ):
-                st.markdown("<h2 class='sub-header'>Sorted Playlist</h2>", unsafe_allow_html=True)
-
-                # Display comparison
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    st.markdown("**Original Order**")
-                    st.dataframe(
-                        st.session_state.original_df[["Track", "Artist", "Camelot", "BPM", "Energy"]],
-                        hide_index=True,
-                    )
-
-                with col2:
-                    st.markdown("**Sorted Order**")
-                    st.dataframe(
-                        st.session_state.sorted_df[
-                            [
-                                "Track",
-                                "Artist",
-                                "Camelot",
-                                "BPM",
-                                "Energy",
-                            ]
-                        ],
-                        hide_index=True,
-                    )
-
-                st.divider()
-
-                # Transition analysis
-                if st.session_state.transitions:
-                    st.markdown("<h2 class='sub-header'>Transition Analysis</h2>", unsafe_allow_html=True)
-
-                    # Filter out summary
-                    transitions = [t for t in st.session_state.transitions if not t.get("summary", False)]
-                    summary = next((t for t in st.session_state.transitions if t.get("summary", False)), None)
-
-                    # Display summary if available
-                    if summary:
-                        if "average_score" in summary:
-                            score_class = (
-                                "score-high"
-                                if summary["average_score"] > SCORE_HIGH_THRESHOLD
-                                else "score-medium"
-                                if summary["average_score"] > SCORE_MEDIUM_THRESHOLD
-                                else "score-low"
-                            )
-                            st.markdown(
-                                f"<div class='success-box'>"
-                                f"Average Transition Score: <span class='{score_class}'>{summary['average_score']:.2f}</span> "
-                                f"({summary['valid_transitions']} of {summary['total_transitions']} transitions scored)"
-                                f"</div>",
-                                unsafe_allow_html=True,
-                            )
-                        elif "message" in summary:
-                            st.markdown(f"<div class='warning-box'>{summary['message']}</div>", unsafe_allow_html=True)
-
-                    # Create a DataFrame for transitions
-                    transition_data = []
-                    for transition in transitions:
-                        if "message" in transition and "score" not in transition:
-                            st.markdown(
-                                f"<div class='warning-box'>{transition['message']}</div>", unsafe_allow_html=True
-                            )
-                            continue
-
-                        transition_row = {
-                            "Index": transition["index"],
-                            "From Track": transition["track1_name"],
-                            "To Track": transition["track2_name"],
-                            "From Artist": transition["track1_artist"],
-                            "To Artist": transition["track2_artist"],
-                            "From Key": transition["key1"],
-                            "To Key": transition["key2"],
-                            "From BPM": transition["bpm1"],
-                            "To BPM": transition["bpm2"],
-                        }
-
-                        if "bpm_diff" in transition:
-                            transition_row["BPM Diff"] = (
-                                transition["bpm_diff"] if transition["bpm_diff"] is not None else "N/A"
-                            )
-
-                        if "energy1" in transition and "energy2" in transition:
-                            transition_row["From Energy"] = f"{transition['energy1']:.1f}"
-                            transition_row["To Energy"] = f"{transition['energy2']:.1f}"
-
-                        if "energy_diff" in transition:
-                            transition_row["Energy Diff"] = f"{transition['energy_diff']:.1f}"
-
-                        if "score" in transition:
-                            transition_row["Score"] = f"{transition['score']:.2f}"
-                            transition_row["Key Compatible"] = "Yes" if transition["key_compatible"] else "No"
-                            transition_row["Perfect Key Match"] = (
-                                "Yes" if transition.get("perfect_key_match", False) else "No"
-                            )
-
-                        transition_data.append(transition_row)
-
-                    # Display transitions as a dataframe
-                    if transition_data:
-                        st.dataframe(pd.DataFrame(transition_data), hide_index=True, use_container_width=True)
-
-                    st.divider()
-
-                    # Add visual transition analysis with chart
-                    st.markdown("### Visual Transition Analysis")
-                    st.markdown("""
-                    This scatter plot visualizes your playlist's transitions:
-                    - Each point represents a track in your playlist with its track number
-                    - **X-axis**: Tempo (BPM) - tracks with similar BPM are easier to mix
-                    - **Y-axis**: Musical key (Camelot notation) - tracks with compatible keys are closer vertically
-                    - **Color**: Represents energy level - brighter colors indicate higher energy
-                    - **Lines**: Connect consecutive tracks, showing your playlist's progression
-
-                    This visualization helps you see patterns in your playlist flow and identify any potentially jarring transitions.
-                    """)
-
-                    # Create and display the transition chart
-                    try:
-                        transition_chart = create_transition_chart(transitions)
-                        st.plotly_chart(transition_chart, use_container_width=True)
-                    except (ValueError, TypeError, KeyError) as e:
-                        st.error(f"Failed to create transition chart: {e}")
-                        st.warning("Visual chart could not be displayed due to missing or invalid data.")
-
-                # Update playlist button
-                st.markdown("<h2 class='sub-header'>Update Spotify Playlist</h2>", unsafe_allow_html=True)
-                st.warning(
-                    "⚠️ This will replace the current order of your playlist on Spotify. "
-                    "Make sure you're happy with the sorted order before proceeding."
-                )
-
-                if st.button("Update Playlist on Spotify", type="primary"):
-                    with st.spinner("Updating playlist on Spotify..."):
-                        success, message = st.session_state.sorter.update_spotify_playlist(st.session_state.sorted_ids)
-
-                        if success:
-                            st.markdown(f"<div class='success-box'>✅ {message}</div>", unsafe_allow_html=True)
-                        else:
-                            st.markdown(f"<div class='error-box'>❌ {message}</div>", unsafe_allow_html=True)
-        else:
-            # Instructions when no playlist is loaded
-            st.markdown("<h2 class='sub-header'>How It Works</h2>", unsafe_allow_html=True)
-            st.markdown(
-                """
-                This app helps you sort your Spotify playlists for optimal transitions between tracks.
-
-                **Features:**
-                - Loads playlist data directly from Spotify
-                - Analyzes tracks using songdata.io
-                - Sorts tracks based on:
-                  - Harmonic mixing (Camelot wheel)
-                  - BPM (tempo) similarity
-                  - Energy level transitions
-                - Updates playlist order on Spotify
-                - Provides detailed transition analysis
-
-                **To get started:**
-                1. Enter your Spotify API credentials in the sidebar
-                2. Authenticate with Spotify
-                3. Select a playlist to sort
-                4. Choose an anchor track (the first track in your sorted playlist)
-                5. Review the transition analysis
-                6. Update your playlist with the optimized order
-                """
-            )
-
-            st.markdown(
-                "<div class='warning-box'>⚠️ Please provide your Spotify API credentials in the sidebar and select a playlist to continue.</div>",
-                unsafe_allow_html=True,
-            )
-    else:
-        # Not authenticated
-        col1, col2 = st.columns(spec=[1, 1], gap="medium")
-
-        with col1:
-            st.markdown(
-                """
-                <div class='info-box' style='margin-bottom: 20px;'>
-                This app helps you create the perfect playlist flow by sorting your tracks based on:
-
-                • <strong>Harmonic Compatibility</strong> (Camelot wheel)
-                • <strong>BPM Matching</strong> (tempo transitions)
-                • <strong>Energy Flow</strong> (smooth energy level progression)
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            st.markdown(
-                """
-                <div class='info-box' style='background-color: rgba(29, 185, 84, 0.1); border-left: 5px solid #1DB954;'>
-                <h3 style='color: #1DB954; margin-top: 0;'>Getting Spotify API Credentials</h3>
-
-                <ol style='padding-left: 20px; margin-bottom: 0;'>
-                    <li>Go to the <a href="https://developer.spotify.com/dashboard" target="_blank" style="color: #1DB954; text-decoration: underline;">Spotify Developer Dashboard</a></li>
-                    <li>Log in with your Spotify account</li>
-                    <li>Click "Create an App"</li>
-                    <li>Fill in the app name and description</li>
-                    <li>Set the Redirect URI based on your environment:<br>
-                    <code style="background-color: #f0f0f0; padding: 2px 5px; border-radius: 3px;">"""
-                + (
-                    """http://127.0.0.1:8501"""
-                    if st.session_state.is_local_environment
-                    else """https://spotify-playlist-sorter.streamlit.app"""
-                )
-                + """</code></li>
-                    <li>Copy the Client ID and Client Secret to use in this app</li>
-                </ol>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        with col2:
-            # How it works
-            st.markdown(
-                """
-                <div class='transition-card' style='background-color: #f8f9fa; border-radius: 8px; padding: 15px; margin-bottom: 15px; border-left: 5px solid #1DB954;'>
-                    <h4 style='color: #1DB954; margin-top: 0;'>1. Camelot Wheel</h4>
-                    <p style='margin-bottom: 0;'>Tracks are arranged based on musical key compatibility using the Camelot wheel system.
-                    Compatible keys create harmonic transitions between tracks.</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            st.markdown(
-                """
-                <div class='transition-card' style='background-color: #f8f9fa; border-radius: 8px; padding: 15px; margin-bottom: 15px; border-left: 5px solid #1DB954;'>
-                    <h4 style='color: #1DB954; margin-top: 0;'>2. BPM Matching</h4>
-                    <p style='margin-bottom: 0;'>Tracks with similar tempos are placed together to create smooth transitions.
-                    Gradual BPM changes prevent jarring tempo shifts.</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            st.markdown(
-                """
-                <div class='transition-card' style='background-color: #f8f9fa; border-radius: 8px; padding: 15px; margin-bottom: 15px; border-left: 5px solid #1DB954;'>
-                    <h4 style='color: #1DB954; margin-top: 0;'>3. Energy Flow</h4>
-                    <p style='margin-bottom: 0;'>The algorithm considers energy levels to create a natural flow.
-                    This prevents sudden drops or spikes in energy throughout your playlist.</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-    # Footer
-    st.markdown("---")
-    st.markdown("Created with ❤️ by [@MishraMishry](https://x.com/MishraMishry)")
+def _render_landing_page() -> None:
+    """Render the unauthenticated landing page."""
     st.markdown(
-        "Psst! This app is open source. Check out the [GitHub repo](https://github.com/SarthakMishra/spotify-playlist-sorter) if you're into that sort of thing. 😉"
+        "Sort your Spotify playlists for smooth transitions using "
+        "**harmonic mixing** (Camelot wheel), **BPM matching**, and **energy flow**."
+    )
+
+    redirect_uri = (
+        "`http://127.0.0.1:8501`"
+        if st.session_state.get("is_local_environment", True)
+        else "`https://spotify-playlist-sorter.streamlit.app`"
+    )
+
+    st.info(
+        f"**Setup:** Create a [Spotify app](https://developer.spotify.com/dashboard), "
+        f"set redirect URI to {redirect_uri}, then enter your credentials in the sidebar.",
+        icon="👈",
     )
 
 
-def create_transition_chart(transitions: list[dict]) -> go.Figure:
-    """Create a scatter plot visualization of track transitions.
+# --- Chart creation ---
 
-    Args:
-        transitions: List of transition dictionaries with track and transition data
 
-    Returns:
-        A plotly figure object representing transitions
-    """
-    # Constants
-    MIN_TRACKS_FOR_CHART = 2  # Minimum number of tracks needed for a meaningful chart  # noqa: N806
-
-    # Prepare data for the chart
+def create_transition_chart(transitions: list[dict[str, Any]]) -> go.Figure:
+    """Create a scatter plot of track transitions (BPM vs Key, colored by Energy)."""
     chart_data = []
 
-    # For each transition, create data points for the tracks
     for i, transition in enumerate(transitions):
         if "score" not in transition:
             continue
 
         try:
-            # Convert BPM and Energy values safely
             bpm1 = float(transition["bpm1"]) if transition["bpm1"] is not None else 0
             bpm2 = float(transition["bpm2"]) if transition["bpm2"] is not None else 0
             energy1 = float(transition["energy1"]) if transition["energy1"] is not None else 0
             energy2 = float(transition["energy2"]) if transition["energy2"] is not None else 0
 
-            # Extract data for the first track
             track1 = {
                 "Track": f"{transition['track1_name']} - {transition['track1_artist']}",
                 "Key": transition["key1"],
@@ -839,8 +453,6 @@ def create_transition_chart(transitions: list[dict]) -> go.Figure:
                 "Position": i,
                 "TrackNum": i + 1,
             }
-
-            # Extract data for the second track (if it's not already in the list as a previous track)
             track2 = {
                 "Track": f"{transition['track2_name']} - {transition['track2_artist']}",
                 "Key": transition["key2"],
@@ -850,53 +462,76 @@ def create_transition_chart(transitions: list[dict]) -> go.Figure:
                 "TrackNum": i + 2,
             }
 
-            # Only add track1 if it's the first track or different from previous track2
             if i == 0 or chart_data[-1]["Track"] != track1["Track"]:
                 chart_data.append(track1)
             chart_data.append(track2)
         except (ValueError, TypeError, KeyError):
-            # Skip this transition if data conversion fails
             continue
 
-    # If we don't have enough data, raise an error
     if len(chart_data) < MIN_TRACKS_FOR_CHART:
         msg = "Not enough valid transition data to create chart"
         raise ValueError(msg)
 
-    # Create a DataFrame for the scatter plot
-    df = pd.DataFrame(chart_data)  # noqa: PD901
+    chart_df = pd.DataFrame(chart_data)
 
-    # Create a scatter plot with Plotly Express
     fig = px.scatter(
-        df,
+        chart_df,
         x="BPM",
         y="Key",
         color="Energy",
-        size="Energy",  # Varying sizes based on energy level
+        size="Energy",
         color_continuous_scale="Viridis",
         hover_name="Track",
         text="TrackNum",
-        range_color=[0, 1],  # Energy is 0-1
-        title="Playlist Flow: BPM vs Key (color shows Energy)",
+        range_color=[0, 1],
     )
 
-    # Improve the layout
     fig.update_layout(
-        height=800,
-        xaxis_title="Tempo (BPM)",
-        yaxis_title="Musical Key (Camelot)",
-        margin={"l": 60, "r": 40, "t": 60, "b": 60},
+        height=500,
+        xaxis_title="BPM",
+        yaxis_title="Key (Camelot)",
+        margin={"l": 40, "r": 20, "t": 20, "b": 40},
     )
 
-    # Configure text display on points
     fig.update_traces(
         textposition="top center",
-        textfont={"size": 10, "color": "gray"},
+        textfont={"size": 9, "color": "gray"},
         marker={"line": {"width": 1, "color": "darkgray"}},
         selector={"mode": "markers+text"},
     )
 
     return fig
+
+
+# --- Page setup & entry point ---
+
+
+st.set_page_config(
+    page_title="Spotify Playlist Sorter",
+    page_icon="🎵",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+def main() -> None:
+    """Main application entry point."""
+    _init_session_state()
+    _render_sidebar()
+
+    if st.session_state.authenticated:
+        if st.session_state.tracks_data is not None and st.session_state.sorter is not None:
+            _render_sorting_controls()
+            _render_sorted_results()
+        else:
+            st.caption("Select a playlist from the sidebar to get started.")
+    else:
+        _render_landing_page()
+
+    st.caption(
+        "[@MishraMishry](https://x.com/MishraMishry) · "
+        "[Source](https://github.com/SarthakMishra/spotify-playlist-sorter)"
+    )
 
 
 if __name__ == "__main__":
