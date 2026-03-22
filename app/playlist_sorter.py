@@ -14,9 +14,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import soundfile as sf
-from scipy.signal import resample
 import pandas as pd
+import soundfile as sf
 import spotipy
 import yt_dlp
 
@@ -127,23 +126,33 @@ def _load_audio(filepath: str, sr: int = _TARGET_SR, duration: float = 30.0) -> 
     max_samples = int(duration * orig_sr)
     if len(y) > max_samples:
         y = y[:max_samples]
-    # Resample
+    # Resample using FFT-based method (replaces scipy.signal.resample)
     if orig_sr != sr:
         num_samples = int(len(y) * sr / orig_sr)
-        y = resample(y, num_samples).astype(np.float32)
+        y_freq = np.fft.rfft(y)
+        new_freq = np.zeros(num_samples // 2 + 1, dtype=np.complex64)
+        n_copy = min(len(y_freq), len(new_freq))
+        new_freq[:n_copy] = y_freq[:n_copy]
+        y = np.fft.irfft(new_freq, n=num_samples).astype(np.float32)
+        y *= num_samples / len(data)
     return y, sr
+
+
+def _find_peaks(x: np.ndarray) -> np.ndarray:
+    """Find local maxima in a 1-D array (replaces scipy.signal.find_peaks)."""
+    if len(x) < 3:  # noqa: PLR2004
+        return np.array([], dtype=int)
+    return np.where((x[1:-1] > x[:-2]) & (x[1:-1] > x[2:]))[0] + 1
 
 
 def _estimate_tempo(y: np.ndarray, sr: int) -> float:
     """Estimate BPM using onset-strength autocorrelation (similar to librosa)."""
-    from scipy.signal import find_peaks  # noqa: PLC0415
-
     # Compute a simple spectral flux onset strength envelope
     hop = 512
     n_fft = 2048
     # STFT magnitude
     n_frames = 1 + (len(y) - n_fft) // hop
-    if n_frames < 2:
+    if n_frames < 2:  # noqa: PLR2004
         return 120.0  # fallback
     onset_env = np.zeros(n_frames, dtype=np.float32)
     window = np.hanning(n_fft).astype(np.float32)
@@ -166,7 +175,7 @@ def _estimate_tempo(y: np.ndarray, sr: int) -> float:
     if min_lag >= max_lag:
         return 120.0
     corr_slice = corr[min_lag : max_lag + 1]
-    peaks, _ = find_peaks(corr_slice)
+    peaks = _find_peaks(corr_slice)
     if len(peaks) == 0:
         best_lag = min_lag + int(np.argmax(corr_slice))
     else:
