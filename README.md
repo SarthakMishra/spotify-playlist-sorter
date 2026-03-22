@@ -28,7 +28,7 @@ docker compose up
 The app will be available at `http://localhost:8501`. Pass your Spotify credentials via environment variables or the app UI:
 
 ```bash
-SPOTIPY_CLIENT_ID=your_id SPOTIPY_CLIENT_SECRET=your_secret docker compose up
+SPOTIFY_CLIENT_ID=your_id SPOTIFY_CLIENT_SECRET=your_secret docker compose up
 ```
 
 ## How It Works

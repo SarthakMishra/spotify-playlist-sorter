@@ -49,7 +49,7 @@ def load_credentials() -> tuple[str | None, str | None]:
         try:
             client_id = st.secrets.get("SPOTIFY_CLIENT_ID", client_id)
             client_secret = st.secrets.get("SPOTIFY_CLIENT_SECRET", client_secret)
-        except (KeyError, AttributeError) as e:
+        except (KeyError, AttributeError, FileNotFoundError) as e:
             logger.warning("Could not load from Streamlit secrets: %s", e)
 
     return client_id, client_secret
@@ -62,15 +62,19 @@ def get_redirect_uri() -> str:
         logger.info("Using custom redirect URI: %s", st.session_state.custom_redirect_uri)
         return st.session_state.custom_redirect_uri
 
-    # Use the environment value from session state (set by checkbox in app.py)
-    is_local = st.session_state.get("is_local_environment", True)
+    # Check environment variable
+    env_redirect = os.getenv("SPOTIFY_REDIRECT_URI")
+    if env_redirect:
+        logger.info("Using SPOTIFY_REDIRECT_URI from environment: %s", env_redirect)
+        return env_redirect
+
+    # Fall back based on local/cloud toggle
+    is_local = st.session_state.get("is_local_environment", False)
 
     if is_local:
-        # Use the first local redirect URI by default
         redirect_uri = LOCAL_REDIRECT_URIS[0]
         logger.info("Using local environment redirect URI: %s", redirect_uri)
     else:
-        # Use the first cloud redirect URI by default
         redirect_uri = CLOUD_REDIRECT_URIS[0]
         logger.info("Using cloud environment redirect URI: %s", redirect_uri)
 

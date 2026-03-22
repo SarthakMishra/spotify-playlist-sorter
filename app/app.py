@@ -135,8 +135,7 @@ def _render_credential_inputs() -> None:
     """Render the credential input section in the sidebar."""
     # Environment selection
     if "is_local_environment" not in st.session_state:
-        is_cloud = bool(os.getenv("STREAMLIT_SHARING_MODE") or os.getenv("STCLOUD"))
-        st.session_state.is_local_environment = not is_cloud
+        st.session_state.is_local_environment = False
 
     is_local = st.checkbox("Running locally", value=st.session_state.is_local_environment)
     if is_local != st.session_state.is_local_environment:
@@ -415,15 +414,11 @@ def _render_landing_page() -> None:
         "**harmonic mixing** (Camelot wheel), **BPM matching**, and **energy flow**."
     )
 
-    redirect_uri = (
-        "`http://127.0.0.1:8501`"
-        if st.session_state.get("is_local_environment", True)
-        else "`https://spotify-playlist-sorter.streamlit.app`"
-    )
+    redirect_uri = get_redirect_uri()
 
     st.info(
         f"**Setup:** Create a [Spotify app](https://developer.spotify.com/dashboard), "
-        f"set redirect URI to {redirect_uri}, then enter your credentials in the sidebar.",
+        f"set redirect URI to `{redirect_uri}`, then enter your credentials in the sidebar.",
         icon="👈",
     )
 
