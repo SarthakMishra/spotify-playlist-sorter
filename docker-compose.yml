@@ -1,6 +1,6 @@
 services:
   app:
-    build: .
+    image: ghcr.io/sarthakmishra/spotify-playlist-sorter:latest
     ports:
       - "8501:8501"
     environment:
