@@ -1,0 +1,16 @@
+.venv
+venv
+__pycache__
+*.pyc
+.git
+.ruff_cache
+.cache
+.env
+.spotify_cache
+.spotify_credentials
+.analysis_cache.json
+audio_files/
+*.csv
+*.egg-info
+build/
+dist/
