@@ -3,11 +3,12 @@ name = "spotify-playlist-sorter"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
-    "librosa>=0.10",
     "numpy>=2.2.4",
     "pandas>=2.2.3",
     "plotly>=6.0.1",
     "python-dotenv>=1.1.0",
+    "scipy>=1.15.0",
+    "soundfile>=0.13.0",
     "spotipy>=2.25.1",
     "streamlit>=1.31.0",
     "yt-dlp>=2026.3.17",

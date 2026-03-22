@@ -13,9 +13,9 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import librosa
-import librosa.feature.rhythm
 import numpy as np
+import soundfile as sf
+from scipy.signal import resample
 import pandas as pd
 import spotipy
 import yt_dlp
@@ -111,9 +111,91 @@ _PREFERRED_KEYWORDS = {"lyrics", "lyric", "lyrical", "karaoke", "official audio"
 # Default parallel workers — network I/O bound, so more workers help
 _DEFAULT_MAX_WORKERS = min(12, (os.cpu_count() or 4) + 4)
 
-# Audio analysis cache — persists results across runs so we skip yt-dlp + librosa
+# Audio analysis cache — persists results across runs so we skip yt-dlp
 # for tracks we've already analyzed.
 _CACHE_FILE = Path(__file__).resolve().parent.parent / ".analysis_cache.json"
+
+_TARGET_SR = 22050
+
+
+def _load_audio(filepath: str, sr: int = _TARGET_SR, duration: float = 30.0) -> tuple[np.ndarray, int]:
+    """Load audio file, convert to mono, resample, and truncate."""
+    data, orig_sr = sf.read(filepath, dtype="float32", always_2d=True)
+    # Mix to mono
+    y = data.mean(axis=1)
+    # Truncate to duration
+    max_samples = int(duration * orig_sr)
+    if len(y) > max_samples:
+        y = y[:max_samples]
+    # Resample
+    if orig_sr != sr:
+        num_samples = int(len(y) * sr / orig_sr)
+        y = resample(y, num_samples).astype(np.float32)
+    return y, sr
+
+
+def _estimate_tempo(y: np.ndarray, sr: int) -> float:
+    """Estimate BPM using onset-strength autocorrelation (similar to librosa)."""
+    from scipy.signal import find_peaks  # noqa: PLC0415
+
+    # Compute a simple spectral flux onset strength envelope
+    hop = 512
+    n_fft = 2048
+    # STFT magnitude
+    n_frames = 1 + (len(y) - n_fft) // hop
+    if n_frames < 2:
+        return 120.0  # fallback
+    onset_env = np.zeros(n_frames, dtype=np.float32)
+    window = np.hanning(n_fft).astype(np.float32)
+    for i in range(n_frames):
+        frame = y[i * hop : i * hop + n_fft] * window
+        mag = np.abs(np.fft.rfft(frame))
+        onset_env[i] = mag.sum()
+    # Half-wave rectified first-order difference
+    onset_env = np.maximum(0, np.diff(onset_env))
+    if len(onset_env) < 4:  # noqa: PLR2004
+        return 120.0
+
+    # Autocorrelation of onset envelope
+    corr = np.correlate(onset_env, onset_env, mode="full")
+    corr = corr[len(corr) // 2 :]
+    # BPM range: 60-200 -> lag range in frames
+    fps = sr / hop
+    min_lag = max(1, int(fps * 60 / 200))
+    max_lag = min(len(corr) - 1, int(fps * 60 / 60))
+    if min_lag >= max_lag:
+        return 120.0
+    corr_slice = corr[min_lag : max_lag + 1]
+    peaks, _ = find_peaks(corr_slice)
+    if len(peaks) == 0:
+        best_lag = min_lag + int(np.argmax(corr_slice))
+    else:
+        best_lag = min_lag + peaks[int(np.argmax(corr_slice[peaks]))]
+    return 60.0 * fps / best_lag
+
+
+def _chroma_stft(y: np.ndarray, sr: int, n_fft: int = 4096, hop: int = 512) -> np.ndarray:
+    """Compute 12-bin chroma via STFT (lightweight replacement for librosa.feature.chroma_cqt)."""
+    n_frames = 1 + (len(y) - n_fft) // hop
+    chroma = np.zeros((12, max(n_frames, 1)), dtype=np.float32)
+    if n_frames < 1:
+        return chroma
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+    # Map each FFT bin to a chroma pitch class (skip DC / very low freqs)
+    valid = freqs > 20  # noqa: PLR2004
+    pitches = np.round(12 * np.log2(freqs[valid] / 440.0 + 1e-10)) % 12
+    pitches = pitches.astype(int)
+    window = np.hanning(n_fft).astype(np.float32)
+    for i in range(n_frames):
+        frame = y[i * hop : i * hop + n_fft] * window
+        mag = np.abs(np.fft.rfft(frame))
+        mag_valid = mag[valid]
+        for p in range(12):
+            chroma[p, i] = mag_valid[pitches == p].sum()
+    # Normalize each frame
+    norms = chroma.sum(axis=0, keepdims=True)
+    norms[norms == 0] = 1.0
+    return chroma / norms
 
 
 def _load_cache() -> dict[str, dict]:
@@ -243,7 +325,7 @@ class SpotifyPlaylistSorter:
         duration_ms: int | None = None,
         release_year: str = "",
     ) -> dict | None:
-        """Search YouTube via yt-dlp and analyze the first 30 s of audio with librosa.
+        """Search YouTube via yt-dlp and analyze the first 30 s of audio.
 
         Args:
             sp_id: Spotify track ID (for logging).
@@ -266,11 +348,10 @@ class SpotifyPlaylistSorter:
         y, sr = result
 
         # BPM
-        tempo_arr = librosa.feature.rhythm.tempo(y=y, sr=sr)
-        bpm = float(tempo_arr[0])
+        bpm = float(_estimate_tempo(y, sr))
 
         # Key + mode via Krumhansl-Kessler
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+        chroma = _chroma_stft(y, sr)
         pitch_class, mode = SpotifyPlaylistSorter._detect_key_mode(chroma.mean(axis=1))
         camelot = _CAMELOT_MAP.get((pitch_class, mode))
         if camelot is None:
@@ -278,7 +359,7 @@ class SpotifyPlaylistSorter:
             return None
 
         # Raw RMS energy (normalized across playlist later)
-        rms_mean = float(librosa.feature.rms(y=y).mean())
+        rms_mean = float(np.sqrt(np.mean(y**2)))
 
         return {"tempo": bpm, "energy": rms_mean, "key": pitch_class, "mode": mode, "camelot": camelot}
 
@@ -286,7 +367,7 @@ class SpotifyPlaylistSorter:
     def _download_and_load(
         query: str, track_name: str, sp_id: str, expected_secs: float | None
     ) -> tuple[np.ndarray, int | float] | None:
-        """Search YouTube for candidates, pick the best duration match, download, and load with librosa.
+        """Search YouTube for candidates, pick the best duration match, download, and load audio.
 
         Searches for multiple results and selects the one whose duration is
         closest to the Spotify track.  This guarantees at least one match as
@@ -432,15 +513,15 @@ class SpotifyPlaylistSorter:
                     return None
                 filepath = str(files[0])
 
-                return librosa.load(filepath, sr=22050, mono=True, duration=30.0)
-        except Exception:  # noqa: BLE001 — yt-dlp/librosa raise many different error types
+                return _load_audio(filepath, sr=22050, duration=30.0)
+        except Exception:  # noqa: BLE001 — yt-dlp/audio loading raise many different error types
             logger.warning("Audio analysis failed for '%s' (%s)", track_name, sp_id, exc_info=True)
             return None
 
     def _fetch_audio_features_local(
         self, tracks: list[dict], progress_callback: Callable[[int, int], None] | None = None
     ) -> dict[str, dict]:
-        """Analyze audio features for every track via yt-dlp + librosa.
+        """Analyze audio features for every track via yt-dlp + audio analysis.
 
         Args:
             tracks: Track dicts (must include ``Track`` and ``Artist`` keys).
@@ -522,7 +603,7 @@ class SpotifyPlaylistSorter:
             self.original_track_order = []
             return None
 
-        # Analyze audio features locally via yt-dlp + librosa
+        # Analyze audio features locally via yt-dlp + audio analysis
         audio_features = self._fetch_audio_features_local(spotify_tracks, progress_callback=progress_callback)
 
         if not audio_features:
