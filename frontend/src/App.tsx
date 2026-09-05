@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import {
   Link,
   Navigate,
@@ -27,6 +27,7 @@ import { Button } from "@/components/ui/button"
 import { ModeToggle } from "@/components/mode-toggle"
 import { Input } from "@/components/ui/input"
 import { Alert, AlertDescription } from "@/components/ui/alert"
+import { toast } from "@/components/ui/toast"
 import { api, ApiError, type Job, type Playlist, type Session } from "@/lib/api"
 
 function Loading({ className = "min-h-dvh" }: { className?: string }) {
@@ -45,7 +46,6 @@ function Shell() {
   const session = useLoaderData<Session>()
   const navigation = useNavigation()
   const revalidator = useRevalidator()
-  const [error, setError] = useState("")
   const [leaving, setLeaving] = useState(false)
   async function logout() {
     setLeaving(true)
@@ -53,7 +53,13 @@ function Shell() {
       await api("/auth/logout", { method: "POST", headers: { "X-CSRF-Token": session.csrf ?? "" } })
       window.location.assign("/")
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Please try again.")
+      toast.add({
+        title: "Couldn't sign out",
+        description: err instanceof Error ? err.message : "Please try again.",
+        type: "error",
+        priority: "high",
+        timeout: 8000,
+      })
       setLeaving(false)
     }
   }
@@ -113,11 +119,6 @@ function Shell() {
         className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-5 py-6 outline-none sm:px-8 sm:py-8"
         aria-busy={navigation.state === "loading"}
       >
-        {error && (
-          <Alert variant="destructive" className="mb-6">
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
-        )}
         {navigation.state === "loading" && <Loading className="flex-1" />}
         <div hidden={navigation.state === "loading"}>
           <Outlet />
@@ -129,7 +130,25 @@ function Shell() {
 
 function Welcome() {
   const session = useRouteLoaderData<Session>("root")
-  const [params] = useSearchParams()
+  const [params, setParams] = useSearchParams()
+  useEffect(() => {
+    if (!params.has("error")) return
+    toast.add({
+      id: "spotify-login-error",
+      title: "Couldn't connect Spotify",
+      description: "Please try again.",
+      type: "error",
+      priority: "high",
+      timeout: 8000,
+    })
+    setParams(
+      (current) => {
+        current.delete("error")
+        return current
+      },
+      { replace: true },
+    )
+  }, [params, setParams])
   if (session?.user) return <Navigate to="/playlists" replace />
   return (
     <section className="mx-auto max-w-2xl py-8 sm:py-16">
@@ -144,11 +163,6 @@ function Welcome() {
       <p className="mt-5 max-w-sm text-base leading-7 text-muted-foreground">
         Pick the first song. We'll find a smooth order for the rest.
       </p>
-      {params.has("error") && (
-        <Alert variant="destructive" className="mt-6">
-          <AlertDescription>We couldn't connect Spotify. Please try again.</AlertDescription>
-        </Alert>
-      )}
       {session?.configured ? (
         <Button
           size="lg"

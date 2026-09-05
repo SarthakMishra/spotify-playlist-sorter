@@ -1,5 +1,6 @@
 import * as React from "react"
 import { cn } from "cn"
+import { ScrollArea, ScrollBar } from "@/components/ui/scroll-area"
 
 function Table({
   className,
@@ -7,16 +8,14 @@ function Table({
   ...props
 }: React.ComponentProps<"table"> & { scrollLabel?: string }) {
   return (
-    <div
+    <ScrollArea
       data-slot="table-container"
-      role={scrollLabel ? "region" : undefined}
-      aria-label={scrollLabel}
-      tabIndex={scrollLabel ? 0 : undefined}
-      className={cn(
-        "relative w-full overflow-x-auto",
-        scrollLabel &&
-          "max-h-[min(55dvh,28rem)] [scrollbar-gutter:stable] overflow-auto rounded-xl border focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring",
-      )}
+      className={cn("w-full overflow-hidden", scrollLabel && "rounded-xl border")}
+      viewportProps={{
+        role: scrollLabel ? "region" : undefined,
+        "aria-label": scrollLabel,
+        className: scrollLabel ? "max-h-[min(55dvh,28rem)]" : undefined,
+      }}
     >
       <table
         data-slot="table"
@@ -27,7 +26,8 @@ function Table({
         )}
         {...props}
       />
-    </div>
+      <ScrollBar orientation="horizontal" />
+    </ScrollArea>
   )
 }
 

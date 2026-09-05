@@ -1,6 +1,6 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react"
+import { lazy, Suspense, useEffect, useEffectEvent, useRef, useState } from "react"
 import { Link, useLoaderData, useParams, useRouteLoaderData } from "react-router"
-import { ArrowLeft, ArrowRight, Check, ExternalLink, LoaderCircle, Music2 } from "lucide-react"
+import { ArrowLeft, ArrowRight, ExternalLink, LoaderCircle, Music2 } from "lucide-react"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/combobox"
 import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress"
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
+import { toast } from "@/components/ui/toast"
 import {
   Table,
   TableHeader,
@@ -82,13 +83,19 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
   const session = useRouteLoaderData<Session>("root")
   const [job, setJob] = useState(initialJob?.playlist_id === playlist.id ? initialJob : null)
   const [error, setError] = useState("")
-  const [pending, setPending] = useState(false)
+  const [pending, setPending] = useState<"analyze" | "sort" | "save" | null>(null)
   const [firstTrackId, setFirstTrackId] = useState("")
   const actionController = useRef<AbortController | null>(null)
+  const progressToast = useRef<string | null>(null)
   const jobStatus = job?.status
-  const busy = pending || isWorking(job)
+  const busy = pending !== null || isWorking(job)
+  const activity = pending === "sort" ? "sorting" : pending === "save" ? "saving" : jobStatus
   const otherJob =
     initialJob?.playlist_id !== playlist.id && isWorking(initialJob) ? initialJob : null
+  const checking =
+    pending === "analyze" ||
+    jobStatus === "analyzing" ||
+    (!job && !otherJob && playlist.total > 0 && !error)
   const tracks = job?.tracks ?? []
   const firstId = firstTrackId || job?.sorted_tracks[0]?.id || tracks[0]?.id || ""
   const choices = [...new Map(tracks.map((track) => [track.id, track])).values()]
@@ -96,7 +103,55 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
   const hasPreview = !!job?.sorted_tracks.length
   const firstChanged = hasPreview && firstId !== job?.sorted_tracks[0]?.id
 
-  useEffect(() => () => actionController.current?.abort(), [])
+  const startChecking = useEffectEvent(() => {
+    if (!job && !otherJob && playlist.total > 0) void run("analyze")
+  })
+
+  useEffect(() => {
+    // Let Strict Mode's setup/cleanup pass finish before starting a server job.
+    const timer = setTimeout(() => startChecking(), 0)
+    return () => clearTimeout(timer)
+  }, [playlist.id])
+
+  useEffect(
+    () => () => {
+      actionController.current?.abort()
+      if (progressToast.current) toast.close(progressToast.current)
+      progressToast.current = null
+    },
+    [],
+  )
+
+  useEffect(() => {
+    if (error) {
+      if (progressToast.current) toast.close(progressToast.current)
+      progressToast.current = null
+    } else if (activity === "sorting" || activity === "saving") {
+      progressToast.current = toast.add({
+        id: `playlist-${playlist.id}`,
+        title: activity === "sorting" ? "Finding a smooth order..." : "Saving to Spotify...",
+        description: playlist.name,
+        type: "loading",
+        priority: "low",
+        timeout: 0,
+      })
+    } else if (progressToast.current) {
+      const failed = activity === "error"
+      toast.add({
+        id: progressToast.current,
+        title: failed
+          ? "Couldn't finish the playlist"
+          : activity === "saved"
+            ? "Saved to Spotify"
+            : "Your new order is ready",
+        description: job?.error || playlist.name,
+        type: failed ? "error" : "success",
+        priority: failed ? "high" : "low",
+        timeout: failed ? 8000 : 5000,
+      })
+      progressToast.current = null
+    }
+  }, [activity, error, job?.error, playlist.id, playlist.name])
 
   useEffect(() => {
     if (error || !jobStatus || !["analyzing", "sorting", "saving"].includes(jobStatus))
@@ -134,7 +189,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
     if (busy) return
     const controller = new AbortController()
     actionController.current = controller
-    setPending(true)
+    setPending(action)
     setError("")
     const path = action === "analyze" ? `/playlists/${playlist.id}/analyze` : `/job/${action}`
     try {
@@ -159,9 +214,22 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
         window.location.assign("/")
         return
       }
-      setError(err instanceof Error ? err.message : "Something went wrong. Please try again.")
+      const message = err instanceof Error ? err.message : "Please try again."
+      if (action === "analyze") {
+        setError(message)
+      } else {
+        toast.add({
+          id: progressToast.current ?? undefined,
+          title: "Couldn't start the request",
+          description: message,
+          type: "error",
+          priority: "high",
+          timeout: 8000,
+        })
+      }
+      progressToast.current = null
     } finally {
-      if (!controller.signal.aborted) setPending(false)
+      if (!controller.signal.aborted) setPending(null)
     }
   }
 
@@ -198,7 +266,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
         </div>
       </div>
 
-      {(error || job?.error) && (
+      {pending !== "analyze" && (error || job?.error) && (
         <Alert variant="destructive" className="mt-7">
           <AlertDescription>
             {error || job?.error}
@@ -218,7 +286,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
         </Alert>
       )}
 
-      {otherJob && !job ? (
+      {otherJob && !job && (
         <Alert className="mt-8">
           <AlertDescription>
             Another playlist is still being checked.
@@ -227,59 +295,62 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
             </Link>
           </AlertDescription>
         </Alert>
-      ) : (
-        (!job || job.status === "error") && (
-          <div className="mt-9">
-            <h2 className="font-medium">Let's check the songs first.</h2>
-            <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">
-              This can take a few minutes. Your playlist stays as it is until you save.
-            </p>
-            <Button
-              className="mt-5"
-              onClick={() => void run("analyze")}
-              disabled={busy || playlist.total === 0}
-            >
-              {pending && <LoaderCircle className="motion-safe:animate-spin" aria-hidden="true" />}
-              {job ? "Check again" : "Check songs"}
-              <ArrowRight aria-hidden="true" />
-            </Button>
-            {playlist.total === 0 && (
-              <p className="mt-3 text-sm text-muted-foreground">Add some songs on Spotify first.</p>
-            )}
-          </div>
-        )
       )}
 
-      {job && isWorking(job) && (
-        <div className="my-9 rounded-xl border p-5" aria-live="polite">
-          {job.status === "analyzing" ? (
-            <>
-              <Progress value={job.total ? job.completed : null} max={job.total || 100}>
-                <ProgressLabel>Checking songs...</ProgressLabel>
-                <ProgressValue>
-                  {() => (job.total ? `${job.completed} of ${job.total}` : "Getting ready")}
-                </ProgressValue>
-              </Progress>
-              <p className="mt-3 text-sm text-muted-foreground">
-                You can leave this page and come back.
-              </p>
-            </>
-          ) : (
-            <p className="flex items-center gap-2 text-sm">
-              <LoaderCircle className="size-4 motion-safe:animate-spin" aria-hidden="true" />
-              {job.status === "sorting" ? "Finding a smooth order..." : "Saving to Spotify..."}
-            </p>
-          )}
+      {!job && !otherJob && playlist.total === 0 && (
+        <p className="mt-8 text-sm text-muted-foreground">
+          This playlist is empty. Add some songs on Spotify first.
+        </p>
+      )}
+
+      {!checking && !otherJob && (jobStatus === "error" || (!job && error)) && (
+        <Button
+          className="mt-5"
+          onClick={() => void run("analyze")}
+          disabled={busy || playlist.total === 0}
+        >
+          Check again
+          <ArrowRight aria-hidden="true" />
+        </Button>
+      )}
+
+      {checking && (
+        <div className="my-8 rounded-xl border bg-muted/20 p-5 sm:p-6" aria-live="polite">
+          <Progress
+            className="items-center gap-y-4"
+            value={jobStatus === "analyzing" && job?.total ? job.completed : null}
+            max={job?.total || 100}
+          >
+            <h2>
+              <ProgressLabel className="flex items-center gap-2 text-base font-semibold">
+                <LoaderCircle className="size-4 motion-safe:animate-spin" aria-hidden="true" />
+                Checking songs
+              </ProgressLabel>
+            </h2>
+            <ProgressValue className="text-xs">
+              {() =>
+                jobStatus === "analyzing" && job?.total
+                  ? `${job.completed} of ${job.total}`
+                  : "Getting ready"
+              }
+            </ProgressValue>
+          </Progress>
+          <p className="mt-4 text-sm leading-6 text-muted-foreground">
+            You can leave this page and come back. Your playlist stays as it is until you save.
+          </p>
         </div>
       )}
 
       {!!tracks.length && job && job.status !== "error" && (
         <>
           <div className="mt-6 border-t pt-5">
-            <label htmlFor="first-song" className="mb-2 block text-sm font-medium">
+            <label htmlFor="first-song" className="block text-base font-semibold">
               First song
             </label>
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
+            <p className="mt-1 text-sm text-muted-foreground">
+              We'll start here and order the rest for you.
+            </p>
+            <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:items-start">
               <div className="min-w-0 flex-1">
                 <Combobox
                   items={choices}
@@ -315,9 +386,6 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
                 <ArrowRight aria-hidden="true" />
               </Button>
             </div>
-            <p className="mt-2 text-xs leading-5 text-muted-foreground">
-              We'll start here and order the rest for you.
-            </p>
           </div>
           {job.kept_count > 0 && (
             <Alert className="mt-6">
@@ -333,21 +401,12 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
           {hasPreview && (
             <div className="mt-6 flex flex-col gap-3 border-t pt-5 sm:flex-row sm:items-center sm:justify-between">
               <div>
-                <h2 className="text-sm font-semibold">Playlist preview</h2>
-                <div aria-live="polite" className="mt-1">
-                  {job.status === "saved" ? (
-                    <p className="flex items-center gap-2 text-sm font-medium">
-                      <Check className="size-4" aria-hidden="true" />
-                      Saved to Spotify.
-                    </p>
-                  ) : (
-                    <p className="text-sm text-muted-foreground">
-                      {firstChanged
-                        ? "Sort again to use this first song."
-                        : "Review the order before saving."}
-                    </p>
-                  )}
-                </div>
+                <h2 className="text-base font-semibold">Playlist preview</h2>
+                <p aria-live="polite" className="mt-1 text-sm text-muted-foreground">
+                  {firstChanged
+                    ? "Sort again to use this first song."
+                    : "Review the song order below."}
+                </p>
               </div>
               {job.status === "saved" ? (
                 <Button
@@ -374,10 +433,14 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
           <div className="mt-5">
             {hasPreview ? (
               <Tabs
+                className="gap-4"
                 defaultValue="new"
                 key={job.sorted_tracks.map((track) => track.occurrence).join(",")}
               >
-                <TabsList aria-label="Playlist preview" className="w-full sm:w-fit">
+                <TabsList
+                  aria-label="Playlist preview"
+                  className="w-full bg-muted/70 sm:w-fit dark:bg-muted/50"
+                >
                   <TabsTrigger value="new">New order</TabsTrigger>
                   <TabsTrigger value="original">Original</TabsTrigger>
                   <TabsTrigger value="details">Song details</TabsTrigger>
