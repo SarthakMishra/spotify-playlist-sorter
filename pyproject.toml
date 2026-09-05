@@ -3,18 +3,18 @@ name = "spotify-playlist-sorter"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
-    "numpy>=2.2.4",
-    "pandas>=2.2.3",
-    "plotly>=6.0.1",
-    "python-dotenv>=1.1.0",
-    "soundfile>=0.13.0",
-    "spotipy>=2.25.1",
-    "streamlit>=1.31.0",
-    "yt-dlp>=2026.3.17",
+    "numpy>=2.5.2",
+    "pandas>=3.0.5",
+    "plotly>=7.0.0",
+    "python-dotenv>=1.2.3",
+    "soundfile>=0.14.0",
+    "spotipy>=2.26.0",
+    "streamlit>=1.63.0",
+    "yt-dlp>=2026.8.19",
 ]
 
 [dependency-groups]
-dev = ["ruff>=0.11.6", "ty>=0.0.0a1", "deptry>=0.23.0"]
+dev = ["ruff>=0.16.6", "ty>=0.0.78", "deptry>=0.25.1"]
 
 [tool.ty.environment]
 python-version = "3.13"
@@ -55,6 +55,7 @@ ignore = [
     "COM812",  # Use a constant for the message in a raise statement
     "TC001",   # Move application import into a type-checking block
     "E501",    # Line too long
+    "CPY001",  # Copyright headers are not required
 ]
 
 [tool.ruff.lint.per-file-ignores]

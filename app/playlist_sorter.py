@@ -97,11 +97,30 @@ _BRACKETED_RE = re.compile(r"\s*[\(\[][^\)\]]*[\)\]]")
 # Variant keywords — if present in the YouTube title but NOT in the Spotify track
 # (or vice versa), the result is likely the wrong version of the song.
 _VARIANT_KEYWORDS = {
-    "remix", "remixed", "slowed", "reverb", "reverbed", "sped up", "speed up",
-    "bass boosted", "8d audio", "8d", "lofi", "lo-fi", "lo fi",
-    "instrumental", "cover", "mashup", "mash up",
-    "live", "concert", "acoustic", "unplugged",
-    "radio edit", "extended", "club mix",
+    "remix",
+    "remixed",
+    "slowed",
+    "reverb",
+    "reverbed",
+    "sped up",
+    "speed up",
+    "bass boosted",
+    "8d audio",
+    "8d",
+    "lofi",
+    "lo-fi",
+    "lo fi",
+    "instrumental",
+    "cover",
+    "mashup",
+    "mash up",
+    "live",
+    "concert",
+    "acoustic",
+    "unplugged",
+    "radio edit",
+    "extended",
+    "club mix",
 }
 
 # Keywords that indicate a clean audio source — give these a slight boost
@@ -375,7 +394,7 @@ class SpotifyPlaylistSorter:
     @staticmethod
     def _download_and_load(
         query: str, track_name: str, sp_id: str, expected_secs: float | None
-    ) -> tuple[np.ndarray, int | float] | None:
+    ) -> tuple[np.ndarray, int] | None:
         """Search YouTube for candidates, pick the best duration match, download, and load audio.
 
         Searches for multiple results and selects the one whose duration is
@@ -440,7 +459,7 @@ class SpotifyPlaylistSorter:
                     """
                     yt_lower = (entry.get("title") or "").lower()
                     yt_variants = {kw for kw in _VARIANT_KEYWORDS if kw in yt_lower}
-                    if (sp_variants ^ yt_variants):
+                    if sp_variants ^ yt_variants:
                         return 0.0
                     return -0.05 if any(kw in yt_lower for kw in _PREFERRED_KEYWORDS) else 0.0
 
@@ -523,7 +542,7 @@ class SpotifyPlaylistSorter:
                 filepath = str(files[0])
 
                 return _load_audio(filepath, sr=22050, duration=30.0)
-        except Exception:  # noqa: BLE001 — yt-dlp/audio loading raise many different error types
+        except Exception:  # yt-dlp/audio loading raise many different error types
             logger.warning("Audio analysis failed for '%s' (%s)", track_name, sp_id, exc_info=True)
             return None
 
@@ -559,8 +578,11 @@ class SpotifyPlaylistSorter:
 
             def analyze_one(track: dict) -> tuple[str, dict | None]:
                 return track["id"], self._analyze_track(
-                    track["id"], track["Track"], track["Artist"],
-                    track.get("duration_ms"), track.get("release_year", ""),
+                    track["id"],
+                    track["Track"],
+                    track["Artist"],
+                    track.get("duration_ms"),
+                    track.get("release_year", ""),
                 )
 
             with ThreadPoolExecutor(max_workers=_DEFAULT_MAX_WORKERS) as executor:

@@ -1,5 +1,5 @@
 # ---------- builder ----------
-FROM ghcr.io/astral-sh/uv:python3.13-alpine AS builder
+FROM ghcr.io/astral-sh/uv:python3.14-alpine AS builder
 
 WORKDIR /app
 
@@ -18,14 +18,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN find /app/.venv -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null; \
     find /app/.venv -type d -name "tests" -exec rm -rf {} + 2>/dev/null; \
     find /app/.venv -type d -name "test" -exec rm -rf {} + 2>/dev/null; \
-    rm -rf /app/.venv/lib/python3.13/site-packages/pyarrow*; \
-    rm -rf /app/.venv/lib/python3.13/site-packages/pydeck*; \
-    rm -rf /app/.venv/lib/python3.13/site-packages/numpy/tests*; \
-    rm -rf /app/.venv/lib/python3.13/site-packages/pandas/tests*; \
+    rm -rf /app/.venv/lib/python3.14/site-packages/pydeck*; \
+    rm -rf /app/.venv/lib/python3.14/site-packages/numpy/tests*; \
+    rm -rf /app/.venv/lib/python3.14/site-packages/pandas/tests*; \
     true
 
 # ---------- runtime ----------
-FROM python:3.13-alpine
+FROM python:3.14-alpine
 
 LABEL org.opencontainers.image.source="https://github.com/SarthakMishra/spotify-playlist-sorter"
 LABEL org.opencontainers.image.description="Spotify Playlist Sorter - Streamlit App"
@@ -35,7 +34,7 @@ LABEL org.opencontainers.image.description="Spotify Playlist Sorter - Streamlit 
 RUN apk add --no-cache libsndfile && \
     ln -s /usr/lib/libsndfile.so.1 /usr/lib/libsndfile.so
 
-COPY --from=mwader/static-ffmpeg:7.1.1 /ffmpeg /usr/local/bin/ffmpeg
+COPY --from=mwader/static-ffmpeg:9.0.1 /ffmpeg /usr/local/bin/ffmpeg
 
 # Copy only the venv and app source — uv binary stays in builder
 COPY --from=builder /app/.venv /app/.venv
