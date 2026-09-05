@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import tempfile
-import time
+from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from io import StringIO
@@ -21,8 +21,7 @@ import spotipy
 import yt_dlp
 
 # Import constants from local constants module
-from constants import (
-    API_BATCH_SIZE,
+from app.constants import (
     BPM_GOOD_THRESHOLD,
     BPM_MEDIUM_THRESHOLD,
     CAMELOT_MAX_NUMBER,
@@ -200,7 +199,7 @@ def _estimate_tempo(y: np.ndarray, sr: int) -> float:
         best_lag = min_lag + int(np.argmax(corr_slice))
     else:
         best_lag = min_lag + peaks[int(np.argmax(corr_slice[peaks]))]
-    return 60.0 * fps / best_lag
+    return float(60.0 * fps / best_lag)
 
 
 def _chroma_stft(y: np.ndarray, sr: int, n_fft: int = 4096, hop: int = 512) -> np.ndarray:
@@ -227,7 +226,7 @@ def _chroma_stft(y: np.ndarray, sr: int, n_fft: int = 4096, hop: int = 512) -> n
     return chroma / norms
 
 
-def _load_cache() -> dict[str, dict]:
+def _load_cache() -> dict[str, dict[str, Any]]:
     """Load the analysis cache from disk."""
     if _CACHE_FILE.exists():
         try:
@@ -237,7 +236,7 @@ def _load_cache() -> dict[str, dict]:
     return {}
 
 
-def _save_cache(cache: dict[str, dict]) -> None:
+def _save_cache(cache: dict[str, dict[str, Any]]) -> None:
     """Persist the analysis cache to disk."""
     _CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
@@ -276,6 +275,8 @@ class SpotifyPlaylistSorter:
         self.camelot_map = self._build_camelot_map()
         self.playlist_name: str | None = None
         self.original_track_order: list[str] | None = None
+        self.original_items: list[str | None] = []
+        self.snapshot_id: str | None = None
 
     def _build_camelot_map(self) -> dict[str, list[str]]:
         """Build a map of compatible Camelot keys."""
@@ -301,23 +302,25 @@ class SpotifyPlaylistSorter:
 
         return camelot_map
 
-    def _fetch_tracks_from_spotify(self) -> list[dict]:
+    def _fetch_tracks_from_spotify(self) -> list[dict[str, Any]]:
         """Fetch all tracks in the playlist from Spotify API."""
         tracks = []
-        results = self.sp.playlist_tracks(
-            self.playlist_id,
-            fields="items(track(id,name,artists,popularity,duration_ms,album(release_date))),next",
-        )
+        self.original_items = []
+        results = self.sp.playlist_items(self.playlist_id)
         while results:
             for item in results["items"]:
-                track = item.get("track")
-                if not track or not track.get("id"):
+                track = item.get("item") or item.get("track") or {}
+                track_id = track.get("id")
+                if track.get("type", "track") != "track" or track.get("is_local") or item.get("is_local"):
+                    track_id = None
+                self.original_items.append(track_id)
+                if not track_id:
                     continue
                 artist_names = ", ".join(a["name"] for a in track.get("artists", []))
                 release_date = (track.get("album") or {}).get("release_date", "")
                 tracks.append(
                     {
-                        "id": track["id"],
+                        "id": track_id,
                         "Track": track["name"],
                         "Artist": artist_names,
                         "Popularity": track.get("popularity"),
@@ -353,7 +356,7 @@ class SpotifyPlaylistSorter:
         artist_name: str,
         duration_ms: int | None = None,
         release_year: str = "",
-    ) -> dict | None:
+    ) -> dict[str, Any] | None:
         """Search YouTube via yt-dlp and analyze the first 30 s of audio.
 
         Args:
@@ -393,7 +396,7 @@ class SpotifyPlaylistSorter:
         return {"tempo": bpm, "energy": rms_mean, "key": pitch_class, "mode": mode, "camelot": camelot}
 
     @staticmethod
-    def _download_and_load(
+    def _download_and_load(  # noqa: C901, PLR0915
         query: str, track_name: str, sp_id: str, expected_secs: float | None
     ) -> tuple[np.ndarray, int] | None:
         """Search YouTube for candidates, pick the best duration match, download, and load audio.
@@ -437,11 +440,11 @@ class SpotifyPlaylistSorter:
 
             if len(entries) > 1:
 
-                def _title_sim(entry: dict) -> float:
+                def _title_sim(entry: dict[str, Any]) -> float:
                     yt_title = _clean_track_name(entry.get("title") or "").lower()
                     return SequenceMatcher(None, clean_expected, yt_title).ratio()
 
-                def _variant_penalty(entry: dict) -> float:
+                def _variant_penalty(entry: dict[str, Any]) -> float:
                     """Penalize when YouTube title has variant keywords the Spotify track doesn't (or vice versa)."""
                     yt_lower = (entry.get("title") or "").lower()
                     yt_variants = {kw for kw in _VARIANT_KEYWORDS if kw in yt_lower}
@@ -450,13 +453,13 @@ class SpotifyPlaylistSorter:
                     # Each mismatch adds a heavy penalty (capped at 1.0)
                     return min(len(mismatched) * 0.5, 1.0)
 
-                def _dur_penalty(entry: dict) -> float:
+                def _dur_penalty(entry: dict[str, Any]) -> float:
                     if not expected_secs:
                         return 0.0
                     yt_dur = entry.get("duration") or 0
                     return min(abs(yt_dur - expected_secs) / max(expected_secs, 1), 1.0)
 
-                def _preferred_bonus(entry: dict) -> float:
+                def _preferred_bonus(entry: dict[str, Any]) -> float:
                     """Small bonus (negative penalty) for lyrical/official audio sources.
 
                     Only applies when the entry has NO variant mismatch — a "Remix Lyrics"
@@ -553,9 +556,9 @@ class SpotifyPlaylistSorter:
             logger.warning("Audio analysis failed for '%s' (%s)", track_name, sp_id, exc_info=True)
             return None
 
-    def _fetch_audio_features_local(
-        self, tracks: list[dict], progress_callback: Callable[[int, int], None] | None = None
-    ) -> dict[str, dict]:
+    def _fetch_audio_features_local(  # noqa: C901
+        self, tracks: list[dict[str, Any]], progress_callback: Callable[[int, int], None] | None = None
+    ) -> dict[str, dict[str, Any]]:
         """Analyze audio features for every track via yt-dlp + audio analysis.
 
         Args:
@@ -564,12 +567,12 @@ class SpotifyPlaylistSorter:
                 called after each track finishes analysis.
         """
         cache = _load_cache()
-        features: dict[str, dict] = {}
+        features: dict[str, dict[str, Any]] = {}
         total = len(tracks)
         completed = 0
 
         # Separate cached vs uncached tracks
-        uncached: list[dict] = []
+        uncached: list[dict[str, Any]] = []
         for track in tracks:
             sp_id = track["id"]
             if sp_id in cache:
@@ -583,7 +586,7 @@ class SpotifyPlaylistSorter:
         if uncached:
             logger.info("Cache hit for %d/%d tracks, analyzing %d.", len(tracks) - len(uncached), total, len(uncached))
 
-            def analyze_one(track: dict) -> tuple[str, dict | None]:
+            def analyze_one(track: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
                 return track["id"], self._analyze_track(
                     track["id"],
                     track["Track"],
@@ -626,8 +629,9 @@ class SpotifyPlaylistSorter:
         """
         logger.info("Loading playlist metadata for: %s", self.playlist_id)
         try:
-            playlist_info = self.sp.playlist(self.playlist_id, fields="name")
+            playlist_info = self.sp.playlist(self.playlist_id, fields="name,snapshot_id")
             self.playlist_name = playlist_info["name"]
+            self.snapshot_id = playlist_info["snapshot_id"]
             logger.info("Playlist Name (from Spotify): '%s'", self.playlist_name)
         except (spotipy.SpotifyException, KeyError, ValueError) as e:
             logger.warning("Failed to get playlist name from Spotify: %s. Will proceed without it.", e)
@@ -678,7 +682,6 @@ class SpotifyPlaylistSorter:
             return None
 
         self.tracks_data = pd.DataFrame(rows)
-        self.original_track_order = [t["id"] for t in spotify_tracks if t["id"] in self.tracks_data["id"].to_numpy()]
 
         # Drop rows missing essential fields
         initial_count = len(self.tracks_data)
@@ -691,10 +694,12 @@ class SpotifyPlaylistSorter:
             logger.error("No valid tracks remaining after filtering.")
             return None
 
+        self.original_track_order = [t["id"] for t in spotify_tracks if t["id"] in self.tracks_data["id"].to_numpy()]
+
         logger.info("Loaded %d tracks with audio features.", len(self.tracks_data))
         return self.tracks_data
 
-    def calculate_transition_score(self, track1: pd.Series, track2: pd.Series) -> float:
+    def calculate_transition_score(self, track1: pd.Series, track2: pd.Series) -> float:  # noqa: C901, PLR0912, PLR0915
         """Calculate a transition score between two tracks based on key, BPM, and energy."""
         # Get track data
         key1 = track1.get("Camelot")
@@ -776,7 +781,7 @@ class SpotifyPlaylistSorter:
         # Key is weighted most heavily since harmonic compatibility is paramount
         return key_score * 0.5 * key_multiplier + bpm_score * 0.3 + energy_score * 0.2
 
-    def sort_playlist(self, start_track_id: str) -> list[str]:
+    def sort_playlist(self, start_track_id: str) -> list[str]:  # noqa: C901
         """Sort the playlist using transition scores, starting from anchor."""
         if self.tracks_data is None or self.tracks_data.empty:
             logger.error("Track data is not loaded or is empty. Cannot sort.")
@@ -853,7 +858,8 @@ class SpotifyPlaylistSorter:
             )
 
         logger.info("Playlist sorting complete. Final track count: %s", len(sorted_ids))
-        return sorted_ids
+        counts = Counter(self.original_track_order)
+        return [track_id for track_id in sorted_ids for _ in range(counts[track_id])]
 
     def compare_playlists(self, sorted_ids: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
         """Compare original (scraped order) and sorted playlist."""
@@ -898,7 +904,7 @@ class SpotifyPlaylistSorter:
 
         return original_df, sorted_df
 
-    def get_transition_analysis(self, sorted_ids: list[str]) -> list[dict[str, Any]]:
+    def get_transition_analysis(self, sorted_ids: list[str]) -> list[dict[str, Any]]:  # noqa: C901
         """Generate analysis of the transitions in the sorted playlist."""
         if self.tracks_data is None or self.tracks_data.empty:
             logger.warning("No track data to analyze transitions.")
@@ -988,91 +994,41 @@ class SpotifyPlaylistSorter:
 
         return transitions
 
-    def _get_track_uris(self, track_ids: list[str]) -> dict[str, str]:
-        """Get Spotify URIs for track IDs, using the API to ensure accuracy."""
-        uri_map = {}
-        max_retries = 3
-
-        # Process in batches of 50 to avoid hitting API rate limits
-        for i in range(0, len(track_ids), API_BATCH_SIZE):
-            batch_ids = track_ids[i : i + API_BATCH_SIZE]
-            last_exc: Exception | None = None
-            for attempt in range(1, max_retries + 1):
-                try:
-                    tracks_details = self.sp.tracks(batch_ids)["tracks"]
-                    for track in tracks_details:
-                        if track and "id" in track and "uri" in track:
-                            uri_map[track["id"]] = track["uri"]
-                        elif track and track.get("id"):
-                            logger.warning("Could not find URI for track ID: %s", track["id"])
-                    last_exc = None
-                    break  # success
-                except Exception as exc:  # noqa: BLE001
-                    last_exc = exc
-                    wait = 2**attempt
-                    logger.warning(
-                        "Batch starting index %s failed (attempt %s/%s), retrying in %ss: %s",
-                        i,
-                        attempt,
-                        max_retries,
-                        wait,
-                        exc,
-                    )
-                    time.sleep(wait)
-            if last_exc is not None:
-                logger.error(
-                    "Permanently failed to fetch track details batch (starting index %s) after %s attempts.",
-                    i,
-                    max_retries,
-                )
-            time.sleep(0.5)
-
-        return uri_map
-
     def update_spotify_playlist(self, sorted_ids: list[str]) -> tuple[bool, str]:
-        """Update the Spotify playlist with the new track order."""
-        if not sorted_ids:
-            logger.error("No sorted track IDs provided to update playlist.")
-            return False, "No sorted track IDs provided"
-        if self.tracks_data is None or self.tracks_data.empty:
-            logger.error("No track data available to map IDs to URIs.")
-            return False, "No track data available"
+        """Move existing occurrences without deleting duplicates or unanalyzed songs."""
+        if not self.snapshot_id or not sorted_ids or Counter(sorted_ids) != Counter(self.original_track_order):
+            return False, "Check the playlist again before saving."
 
-        logger.info("Fetching URIs for %s sorted tracks...", len(sorted_ids))
-        uri_map = self._get_track_uris(sorted_ids)
-
-        track_uris = [uri_map[track_id] for track_id in sorted_ids if track_id in uri_map]
-
-        if not track_uris:
-            logger.error("No valid track URIs could be fetched for the sorted IDs. Cannot update playlist.")
-            return False, "No valid track URIs could be fetched"
-
-        if len(track_uris) != len(sorted_ids):
-            missing = len(sorted_ids) - len(track_uris)
-            msg = (
-                f"Could only resolve URIs for {len(track_uris)}/{len(sorted_ids)} tracks "
-                f"({missing} missing). Aborting playlist update to prevent data loss."
-            )
-            logger.error(msg)
-            return False, msg
-
-        logger.info("Updating Spotify playlist '%s' with %s tracks.", self.playlist_name, len(track_uris))
-
+        positions: dict[str, deque[int]] = defaultdict(deque)
+        for index, track_id in enumerate(self.original_items):
+            if track_id in sorted_ids:
+                positions[track_id].append(index)
+        if sum(map(len, positions.values())) != len(sorted_ids):
+            return False, "The song list changed. Check the playlist again."
+        ordered_positions = iter(positions[track_id].popleft() for track_id in sorted_ids)
+        target = [
+            next(ordered_positions) if track_id in positions else index
+            for index, track_id in enumerate(self.original_items)
+        ]
+        current = list(range(len(target)))
         try:
-            self.sp.playlist_replace_items(self.playlist_id, track_uris[:100])
-            logger.info("Replaced/set first %s tracks.", min(len(track_uris), 100))
-
-            for i in range(100, len(track_uris), 100):
-                batch = track_uris[i : i + 100]
-                self.sp.playlist_add_items(self.playlist_id, batch)
-                logger.info("Added batch of %s tracks (starting index %s).", len(batch), i)
-                time.sleep(1)
-
-            logger.info("Successfully updated playlist '%s' order on Spotify!", self.playlist_name)
-            return True, f"Successfully updated playlist '{self.playlist_name}' with {len(track_uris)} tracks"
-
-        except Exception as e:
-            error_msg = str(e)
-            logger.exception("Failed to update Spotify playlist: %s", error_msg)
-            logger.info("Check API permissions (scope), rate limits, and playlist ownership.")
-            return False, f"Failed to update playlist: {error_msg}"
+            latest = self.sp.playlist(self.playlist_id, fields="snapshot_id")["snapshot_id"]
+            if latest != self.snapshot_id:
+                return False, "This playlist changed on Spotify. Check it again before saving."
+            # ponytail: one request per moved song; batch adjacent moves if save time becomes a problem.
+            for destination, original_position in enumerate(target):
+                source = current.index(original_position)
+                if source == destination:
+                    continue
+                result = self.sp.playlist_reorder_items(
+                    self.playlist_id, source, destination, snapshot_id=self.snapshot_id
+                )
+                self.snapshot_id = result["snapshot_id"]
+                current.insert(destination, current.pop(source))
+        except Exception:
+            logger.exception("Could not finish reordering playlist %s", self.playlist_id)
+            self.snapshot_id = None
+            return False, "Saving stopped. Some songs may have moved. Check the playlist again before saving."
+        else:
+            self.original_items = [self.original_items[index] for index in target]
+            return True, "Saved to Spotify."

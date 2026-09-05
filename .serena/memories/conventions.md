@@ -1,7 +1,8 @@
 # Code conventions
 
-- Follow `pyproject.toml` for Ruff and ty configuration. Existing code uses annotated signatures, future annotations, Google-style docstrings, double quotes, and 120-character formatting.
-- Runtime imports between app modules are unqualified sibling imports. ty's `extra-paths = ["app"]` and direct-check `PYTHONPATH=app` must agree with Streamlit's script execution.
-- Keep logging in the backend and Streamlit rendering/session-state mutations in `app/app.py` or the existing auth flow. Playlist analysis accepts a progress callback instead of importing UI behavior into worker functions.
-- `.cursor/rules/terminal.mdc` retains obsolete references to pylint and pyright. Actual task commands and `pyproject.toml` use Ruff and ty; treat those files as authoritative.
-- Cookie exports, Spotify credentials/token caches, audio files, and analysis caches are local artifacts. Keep cookie inputs read-only; each yt-dlp instance uses its own in-memory copy because yt-dlp saves cookies on close and analysis runs concurrently.
+- `pyproject.toml` is authoritative for Ruff and ty. Ruff enables all rules with formatter/docstring conflicts and narrow legacy complexity exceptions. ty enables all diagnostics as errors and checks app plus tests.
+- The frontend uses pnpm, Oxlint with type-aware rules, Oxfmt and strict TypeScript. Keep both compiler projects strict. The `skipLibCheck` exception covers dependency declarations, not owned component source; its reason is recorded in README.
+- Use the existing shadcn Base Luma components and preset tokens. Plain consumer copy belongs in the frontend; log implementation details on the backend.
+- Browser JSON decoding has one documented generic type assertion in the API helper. Request bodies and response models are checked by FastAPI/Pydantic. Spotify credentials and tokens never enter frontend env variables or response payloads.
+- Local secrets, cookie exports, downloaded audio and analysis caches remain untracked. Cookie input files are read-only; each yt-dlp instance uses a separate in-memory copy.
+- Editor recommendations use Ruff, Astral ty and Oxc. The workspace disables the competing Pylance language server; CLI configuration remains authoritative.

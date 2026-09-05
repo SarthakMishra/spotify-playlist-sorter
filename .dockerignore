@@ -16,3 +16,6 @@ audio_files/
 *.egg-info
 build/
 dist/
+**/node_modules/
+frontend/dist/
+.pnpm-store/

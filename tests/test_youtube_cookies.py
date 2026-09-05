@@ -8,9 +8,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
-import playlist_sorter
+from app import playlist_sorter
 
 
 class YoutubeCookiesTest(unittest.TestCase):
@@ -32,7 +33,9 @@ class YoutubeCookiesTest(unittest.TestCase):
                     expected = "SID=test-cookie" if cookie_path == str(cookies) else None
                     seen.clear()
 
-                    def extract_info(ydl: playlist_sorter.yt_dlp.YoutubeDL, url: str, *, download: bool) -> dict:
+                    def extract_info(
+                        ydl: playlist_sorter.yt_dlp.YoutubeDL, url: str, *, download: bool
+                    ) -> dict[str, Any]:
                         seen.append((download, ydl.cookiejar.get_cookie_header("https://www.youtube.com/")))
                         if download:
                             assert url == "https://www.youtube.com/watch?v=test"

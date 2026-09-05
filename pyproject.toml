@@ -3,23 +3,39 @@ name = "spotify-playlist-sorter"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi>=0.141.1",
     "numpy>=2.5.2",
     "pandas>=3.0.5",
-    "plotly>=7.0.0",
+    "pydantic>=2.13.5",
     "python-dotenv>=1.2.3",
     "soundfile>=0.14.0",
     "spotipy>=2.26.0",
-    "streamlit>=1.63.0",
+    "uvicorn>=0.52.4",
     "yt-dlp>=2026.8.19",
 ]
 
 [dependency-groups]
-dev = ["ruff>=0.16.6", "ty>=0.0.78", "deptry>=0.25.1"]
+dev = [
+    "ruff>=0.16.6",
+    "ty>=0.0.78",
+    "deptry>=0.25.1",
+    "httpx2>=2.12.0",
+]
+
+[tool.uv]
+required-version = ">=0.12.10"
+
+[tool.ty.rules]
+all = "error"
+
+[tool.ty.terminal]
+error-on-warning = true
+
+[tool.ty.src]
+include = ["app", "tests"]
 
 [tool.ty.environment]
 python-version = "3.13"
-extra-paths = ["app"]
-
 
 [tool.ruff]
 line-length = 120
@@ -40,23 +56,8 @@ exclude = [
 [tool.ruff.lint]
 # Enable all rules by default, then selectively disable
 select = ["ALL"]
-ignore = [
-    # Rules that conflict with other tools/preferences
-    "D203",    # one-blank-line-before-class
-    "D212",    # multi-line-summary-first-line
-    "FBT001",  # Boolean positional arg in function definition (required for typer)
-    "FBT002",  # Boolean default value in function definition (required for typer)
-    "C901",    # function too complex
-    "PLR0911", # too many return statements
-    "PLR0912", # too many branches
-    "PLR0913", # too many arguments in function definition
-    "PLR0915", # too many statements
-    "TRY300",  # Consider moving this statement to an `else` block
-    "COM812",  # Use a constant for the message in a raise statement
-    "TC001",   # Move application import into a type-checking block
-    "E501",    # Line too long
-    "CPY001",  # Copyright headers are not required
-]
+# Google docstrings and Ruff formatting select one rule from each conflicting pair.
+ignore = ["D203", "D212", "COM812", "CPY001"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]

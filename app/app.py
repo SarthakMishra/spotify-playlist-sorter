@@ -1,533 +1,444 @@
-"""Streamlit web application for Spotify playlist sorting."""
+"""FastAPI endpoints and the compiled React app."""
 
 from __future__ import annotations
 
+import json
 import logging
-import os
+import secrets
+import time
+from collections import Counter
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from threading import Lock
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
+from urllib.parse import urlsplit
 
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import streamlit as st
-from playlist_sorter import SpotifyPlaylistSorter
-from spotify_auth import (
-    get_all_playlists,
-    get_auth_url,
-    get_redirect_uri,
-    get_spotify_client,
-)
-from spotify_auth import (
-    load_credentials as load_spotify_credentials,
-)
+import spotipy
+from dotenv import load_dotenv
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import BaseModel, Field
+from spotipy.exceptions import SpotifyOauthError
+
+from app.playlist_sorter import SpotifyPlaylistSorter
+from app.spotify_auth import get_all_playlists, get_auth_manager, get_redirect_uri, get_spotify_client, is_configured
 
 if TYPE_CHECKING:
-    import spotipy
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    from spotipy.oauth2 import SpotifyOAuth
+
 logger = logging.getLogger(__name__)
-
-# Path for saving credentials (relative to this file's directory)
-CREDENTIALS_FILE = Path(__file__).parent.parent / ".spotify_credentials"
-
-# Number of expected lines in credentials file (client_id and client_secret)
-EXPECTED_CREDENTIALS_LINES = 2
-
-# Minimum number of tracks needed for a meaningful chart
-MIN_TRACKS_FOR_CHART = 2
+SESSION_SECONDS = 24 * 60 * 60
+LOGIN_SECONDS = 10 * 60
+MAX_SESSIONS = 200
+COOKIE = "playlist_session"
+SpotifyId = Annotated[str, Field(pattern=r"^[A-Za-z0-9]{22}$")]
 
 
-# --- Credential helpers ---
+class Track(BaseModel):
+    """The song data shown in a preview."""
+
+    occurrence: str
+    id: str
+    name: str
+    artist: str
+    key: str
+    bpm: float
+    energy: float
 
 
-def save_credentials(client_id: str, client_secret: str) -> bool:
-    """Save credentials to a local file."""
+class JobView(BaseModel):
+    """Public job state; tokens and sorter objects never enter responses."""
+
+    playlist_id: str
+    revision: str = Field(default_factory=lambda: secrets.token_urlsafe(16))
+    name: str = "Your playlist"
+    status: Literal["analyzing", "ready", "sorting", "saving", "saved", "error"] = "analyzing"
+    completed: int = 0
+    total: int = 0
+    kept_count: int = 0
+    tracks: list[Track] = Field(default_factory=list)
+    sorted_tracks: list[Track] = Field(default_factory=list)
+    transitions: list[dict[str, Any]] = Field(default_factory=list)
+    error: str | None = None
+
+
+@dataclass
+class Job:
+    """One playlist and preview per session."""
+
+    sorter: SpotifyPlaylistSorter
+    view: JobView
+    sorted_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Session:
+    """Server-only OAuth state with an opaque browser cookie."""
+
+    auth: SpotifyOAuth
+    state: str
+    expires: float = field(default_factory=lambda: time.time() + LOGIN_SECONDS)
+    csrf: str = field(default_factory=lambda: secrets.token_urlsafe(32))
+    user: dict[str, str] = field(default_factory=dict)
+    job: Job | None = None
+    lock: Lock = field(default_factory=Lock)
+
+
+class SessionView(BaseModel):
+    """The small amount of login state the browser needs."""
+
+    configured: bool
+    user: dict[str, str] | None = None
+    csrf: str | None = None
+
+
+class Playlist(BaseModel):
+    """An editable Spotify playlist."""
+
+    id: str
+    name: str
+    total: int
+    image: str | None = None
+
+
+class PreviewRequest(BaseModel):
+    """Bind a mutation to the preview this browser actually saw."""
+
+    revision: Annotated[str, Field(min_length=1, max_length=100)]
+
+
+class SortRequest(PreviewRequest):
+    """Validate the first song before any sorting work starts."""
+
+    first_track_id: SpotifyId
+
+
+def _lookup_session(request: Request) -> Session | None:
+    with request.app.state.sessions_lock:
+        sessions = cast("dict[str, Session]", request.app.state.sessions)
+        for key in list(sessions):
+            if sessions[key].expires < time.time():
+                del sessions[key]
+        return sessions.get(request.cookies.get(COOKIE))
+
+
+def _require_session(request: Request) -> Session:
+    session = _lookup_session(request)
+    if session is None or not session.user:
+        raise HTTPException(401, "Connect Spotify to continue.")
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        csrf = request.headers.get("X-CSRF-Token", "")
+        if not secrets.compare_digest(csrf, session.csrf):
+            raise HTTPException(403, "Refresh the page and try again.")
+    return session
+
+
+CurrentSession = Annotated[Session, Depends(_require_session)]
+
+
+def _set_cookie(response: Response, session_id: str) -> None:
+    response.set_cookie(
+        COOKIE,
+        session_id,
+        max_age=SESSION_SECONDS,
+        httponly=True,
+        secure=get_redirect_uri().startswith("https://"),
+        samesite="lax",
+    )
+
+
+def _tracks(frame: pd.DataFrame) -> list[Track]:
+    """Give each occurrence a stable key, including repeated Spotify songs."""
+    columns = {"Track": "name", "Artist": "artist", "Camelot": "key", "BPM": "bpm", "Energy": "energy"}
+    counts: Counter[str] = Counter()
+    tracks = []
+    for row in json.loads(frame.rename(columns=columns).to_json(orient="records") or "[]"):
+        counts[row["id"]] += 1
+        tracks.append(Track.model_validate({**row, "occurrence": f"{row['id']}:{counts[row['id']]}"}))
+    return tracks
+
+
+def _run_job(job: Job, action: str, first_track_id: str | None, release: Callable[[], None]) -> None:
+    """Run blocking work in FastAPI's background thread pool."""
     try:
-        with CREDENTIALS_FILE.open("w") as f:
-            f.write(f"{client_id}\n{client_secret}")
-        logger.info("Credentials saved successfully")
-        return True
+        if action == "analyze":
+
+            def progress(done: int, total: int) -> None:
+                job.view = job.view.model_copy(update={"completed": done, "total": total})
+
+            tracks = job.sorter.load_playlist(progress_callback=progress)
+            if tracks is None or tracks.empty:
+                job.view = job.view.model_copy(
+                    update={"status": "error", "error": "We couldn't check these songs. Please try again."}
+                )
+                return
+            job.view = job.view.model_copy(
+                update={
+                    "name": job.sorter.playlist_name or "Your playlist",
+                    "tracks": _tracks(tracks),
+                    "kept_count": len(job.sorter.original_items) - len(tracks),
+                    "status": "ready",
+                }
+            )
+        elif action == "sort":
+            job.sorted_ids = job.sorter.sort_playlist(first_track_id or "")
+            if not job.sorted_ids:
+                job.view = job.view.model_copy(
+                    update={"status": "error", "error": "Choose a first song and try again."}
+                )
+                return
+            _, sorted_frame = job.sorter.compare_playlists(job.sorted_ids)
+            transitions = job.sorter.get_transition_analysis(job.sorted_ids)
+            job.view = job.view.model_copy(
+                update={
+                    "sorted_tracks": _tracks(sorted_frame),
+                    "transitions": json.loads(pd.DataFrame(transitions).to_json(orient="records") or "[]"),
+                    "status": "ready",
+                }
+            )
+        else:
+            success, message = job.sorter.update_spotify_playlist(job.sorted_ids)
+            job.view = job.view.model_copy(
+                update={
+                    "status": "saved" if success else "error",
+                    "error": None if success else message,
+                }
+            )
     except Exception:
-        logger.exception("Failed to save credentials")
-        return False
-
-
-def load_credentials() -> tuple[str | None, str | None]:
-    """Load credentials from a local file."""
-    try:
-        if not CREDENTIALS_FILE.exists():
-            return None, None
-
-        with CREDENTIALS_FILE.open() as f:
-            lines = f.readlines()
-
-        if len(lines) >= EXPECTED_CREDENTIALS_LINES:
-            client_id = lines[0].strip()
-            client_secret = lines[1].strip()
-            logger.info("Credentials loaded successfully")
-            return client_id, client_secret
-        return None, None
-    except Exception:
-        logger.exception("Failed to load credentials")
-        return None, None
-
-
-# --- Session state helpers ---
-
-
-def _init_session_state() -> None:
-    """Initialize all session state variables with defaults."""
-    defaults: dict[str, Any] = {
-        "authenticated": False,
-        "playlists": None,
-        "playlist_id": None,
-        "tracks_data": None,
-        "sorter": None,
-        "sorted_ids": None,
-        "anchor_track_id": None,
-        "original_df": None,
-        "sorted_df": None,
-        "transitions": None,
-        "auth_flow_started": False,
-        "auth_error": None,
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-    if "custom_client_id" not in st.session_state:
-        client_id, client_secret = load_spotify_credentials()
-        st.session_state.custom_client_id = client_id or ""
-        st.session_state.custom_client_secret = client_secret or ""
-
-    if "credentials_locked" not in st.session_state:
-        st.session_state.credentials_locked = bool(
-            st.session_state.custom_client_id and st.session_state.custom_client_secret
-        )
-
-
-def _clear_auth_state() -> None:
-    """Reset authentication-related session state."""
-    st.session_state.authenticated = False
-    st.session_state.token_info = None
-    st.session_state.playlists = None
-    st.session_state.auth_flow_started = False
-    st.session_state.auth_error = None
-
-
-def _clear_playlist_state() -> None:
-    """Reset playlist-related session state when switching playlists."""
-    st.session_state.tracks_data = None
-    st.session_state.sorter = None
-    st.session_state.sorted_ids = None
-    st.session_state.anchor_track_id = None
-    st.session_state.original_df = None
-    st.session_state.sorted_df = None
-    st.session_state.transitions = None
-
-
-# --- Sidebar rendering ---
-
-
-def _render_credential_inputs() -> None:
-    """Render the credential input section in the sidebar."""
-    # Environment selection
-    if "is_local_environment" not in st.session_state:
-        st.session_state.is_local_environment = False
-
-    is_local = st.checkbox("Running locally", value=st.session_state.is_local_environment)
-    if is_local != st.session_state.is_local_environment:
-        st.session_state.is_local_environment = is_local
-        if "token_info" in st.session_state:
-            _clear_auth_state()
-            st.rerun()
-
-    if st.session_state.credentials_locked:
-        st.text_input("Client ID", value="*" * 10, disabled=True)
-        st.text_input("Client Secret", value="*" * 10, disabled=True)
-
-        if st.button("Reset Credentials", width="stretch"):
-            st.session_state.custom_client_id = ""
-            st.session_state.custom_client_secret = ""
-            st.session_state.credentials_locked = False
-            _clear_auth_state()
-            if CREDENTIALS_FILE.exists():
-                try:
-                    CREDENTIALS_FILE.unlink()
-                except Exception:
-                    logger.exception("Failed to delete credentials file")
-            st.rerun()
-    else:
-        st.caption("Need credentials? [Create a Spotify app](https://developer.spotify.com/dashboard)")
-        custom_client_id = st.text_input("Client ID", value=st.session_state.custom_client_id, type="password")
-        custom_client_secret = st.text_input(
-            "Client Secret", value=st.session_state.custom_client_secret, type="password"
-        )
-
-        if st.button("Save Credentials", type="primary", width="stretch"):
-            if custom_client_id and custom_client_secret:
-                st.session_state.custom_client_id = custom_client_id
-                st.session_state.custom_client_secret = custom_client_secret
-                if save_credentials(custom_client_id, custom_client_secret):
-                    st.session_state.credentials_locked = True
-                    _clear_auth_state()
-                    st.rerun()
-                else:
-                    st.error("Failed to save credentials.")
-            else:
-                st.error("Both Client ID and Client Secret are required.")
-
-
-def _render_auth_flow() -> None:
-    """Render the Spotify OAuth authentication flow UI."""
-    auth_url = get_auth_url()
-
-    if not auth_url:
-        st.error("Enter valid Spotify API credentials to continue.")
-        return
-
-    st.link_button("Connect Spotify Account", auth_url, width="stretch")
-
-    if st.session_state.auth_error:
-        st.error(st.session_state.auth_error)
-
-    if "code" in st.query_params:
-        st.info("Authorization code received. Processing...")
-        with st.expander("Troubleshooting"):
-            st.write(f"Redirect URI: `{get_redirect_uri()}`")
-            st.write("Make sure your Spotify app's redirect URI matches exactly.")
-            if st.button("Retry Authentication"):
-                _clear_auth_state()
-                st.rerun()
-
-
-def _render_playlist_selector(sp: spotipy.Spotify) -> None:
-    """Render playlist loading and selection UI."""
-    if st.button("Refresh Playlists"):
-        with st.spinner("Loading playlists..."):
-            st.session_state.playlists = get_all_playlists(sp)
-
-    if st.session_state.playlists is None:
-        with st.spinner("Loading playlists..."):
-            st.session_state.playlists = get_all_playlists(sp)
-
-    if not st.session_state.playlists:
-        st.info("No playlists found.")
-        return
-
-    playlist_options = {f"{p['name']} ({p['tracks']['total']} tracks)": p["id"] for p in st.session_state.playlists}
-    selected_playlist = st.selectbox("Playlist", options=list(playlist_options.keys()), label_visibility="collapsed")
-
-    if not selected_playlist:
-        return
-
-    playlist_id = playlist_options[selected_playlist]
-
-    if st.session_state.playlist_id != playlist_id:
-        st.session_state.playlist_id = playlist_id
-        _clear_playlist_state()
-
-    if st.button("Load Playlist", width="stretch"):
-        progress_bar = st.progress(0, text="Fetching tracks...")
-        status_text = st.empty()
-
-        def on_progress(done: int, total: int) -> None:
-            pct = done / total if total else 1.0
-            progress_bar.progress(pct, text=f"Analyzing audio... {done}/{total}")
-            status_text.caption(f"{done}/{total} tracks analyzed")
-
-        sorter = SpotifyPlaylistSorter(playlist_id, sp)
-        tracks_data = sorter.load_playlist(progress_callback=on_progress)
-        progress_bar.empty()
-        status_text.empty()
-
-        if tracks_data is not None and not tracks_data.empty:
-            st.session_state.tracks_data = tracks_data
-            st.session_state.sorter = sorter
-            st.success(f"Loaded {len(tracks_data)} tracks")
-        else:
-            st.error("Failed to load playlist data.")
-
-
-def _render_sidebar() -> None:
-    """Render the full sidebar with auth and playlist selection."""
-    with st.sidebar:
-        st.header("Spotify Playlist Sorter")
-        _render_credential_inputs()
-
-        if not (st.session_state.custom_client_id and st.session_state.custom_client_secret):
-            return
-
-        # Set credentials for the OAuth flow
-        os.environ["SPOTIFY_CLIENT_ID"] = st.session_state.custom_client_id
-        os.environ["SPOTIFY_CLIENT_SECRET"] = st.session_state.custom_client_secret
-
-        st.divider()
-
-        if not st.session_state.authenticated:
-            sp = get_spotify_client()
-            if sp:
-                st.session_state.authenticated = True
-                st.session_state.auth_error = None
-                st.rerun()
-        else:
-            sp = get_spotify_client()
-            if not sp:
-                st.session_state.authenticated = False
-                st.session_state.auth_error = "Token expired or invalid"
-                st.rerun()
-
-        if st.session_state.authenticated and sp:
-            st.success("Connected to Spotify", icon="✅")
-            _render_playlist_selector(sp)
-            if st.button("Sign Out"):
-                _clear_auth_state()
-                st.rerun()
-        else:
-            _render_auth_flow()
-
-        with st.expander("Debug"):
-            st.caption(f"Auth: {'Yes' if st.session_state.authenticated else 'No'}")
-            st.caption(f"Token: {'Yes' if st.session_state.get('token_info') else 'No'}")
-            if st.button("Clear Session"):
-                for key in list(st.session_state.keys()):
-                    del st.session_state[key]
-                st.rerun()
-
-
-# --- Main content rendering ---
-
-
-def _render_sorting_controls() -> None:
-    """Render anchor track selection and sort button."""
-    playlist_name = st.session_state.sorter.playlist_name
-    st.subheader(f"{playlist_name}")
-    st.caption(f"{len(st.session_state.tracks_data)} tracks with audio data")
-
-    track_options = {
-        f"{row['Track']} - {row['Artist']}": row["id"] for _, row in st.session_state.tracks_data.iterrows()
-    }
-    selected_anchor = st.selectbox("Anchor track (playlist will start here)", options=list(track_options.keys()))
-
-    if not selected_anchor:
-        return
-
-    anchor_track_id = track_options[selected_anchor]
-    st.session_state.anchor_track_id = anchor_track_id
-
-    button_label = "Re-sort" if st.session_state.get("sorted_ids") else "Sort Playlist"
-    if st.button(button_label, type="primary"):
-        with st.spinner("Sorting..."):
-            sorted_ids = st.session_state.sorter.sort_playlist(anchor_track_id)
-            if sorted_ids:
-                st.session_state.sorted_ids = sorted_ids
-                original_df, sorted_df = st.session_state.sorter.compare_playlists(sorted_ids)
-                st.session_state.original_df = original_df
-                st.session_state.sorted_df = sorted_df
-                st.session_state.transitions = st.session_state.sorter.get_transition_analysis(sorted_ids)
-            else:
-                st.error("Sorting failed.")
-
-
-def _render_sorted_results() -> None:
-    """Render the sorted playlist comparison and transition analysis."""
-    if not (
-        st.session_state.sorted_ids
-        and st.session_state.original_df is not None
-        and st.session_state.sorted_df is not None
-    ):
-        return
-
-    display_columns = ["Track", "Artist", "Camelot", "BPM", "Energy"]
-
-    tab_sorted, tab_original = st.tabs(["Sorted Order", "Original Order"])
-
-    with tab_sorted:
-        st.dataframe(st.session_state.sorted_df[display_columns], hide_index=True, width="stretch")
-
-    with tab_original:
-        st.dataframe(st.session_state.original_df[display_columns], hide_index=True, width="stretch")
-
-    if st.session_state.transitions:
-        _render_transition_analysis(st.session_state.transitions)
-
-    st.divider()
-
-    if st.button("Apply to Spotify", type="primary"):
-        with st.spinner("Updating playlist on Spotify..."):
-            success, message = st.session_state.sorter.update_spotify_playlist(st.session_state.sorted_ids)
-            if success:
-                st.success(message)
-            else:
-                st.error(message)
-
-
-def _render_transition_analysis(all_transitions: list[dict[str, Any]]) -> None:
-    """Render the transition analysis table and chart."""
-    transitions = [t for t in all_transitions if not t.get("summary", False)]
-
-    # Build compact transition rows
-    transition_data = []
-    for transition in transitions:
-        if "score" not in transition:
-            continue
-        transition_data.append(_build_transition_row(transition))
-
-    if not transition_data:
-        return
-
-    with st.expander("Transition Details", expanded=False):
-        st.dataframe(pd.DataFrame(transition_data), hide_index=True, width="stretch")
-
-    with st.expander("Visual Analysis", expanded=False):
+        logger.exception("Playlist %s failed during %s", job.view.playlist_id, action)
+        message = "Something went wrong. Please check the playlist again."
+        if action == "save":
+            message = "Saving stopped. Some songs may have moved. Check the playlist again."
+        job.view = job.view.model_copy(update={"status": "error", "error": message})
+    finally:
+        release()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Keep session state within this server process."""
+    app.state.sessions = {}
+    app.state.sessions_lock = Lock()
+    # ponytail: one playlist analysis at a time; add a durable queue before running multiple server workers.
+    app.state.analysis_lock = Lock()
+    yield
+    app.state.sessions.clear()
+
+
+router = APIRouter()
+
+
+async def private_responses(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    """Keep API results out of shared caches."""
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "same-origin"
+    return response
+
+
+async def invalid_request(_request: Request, _exc: Exception) -> JSONResponse:
+    """Return a short validation message without echoing submitted values."""
+    return JSONResponse({"detail": "Check your choice and try again."}, status_code=422)
+
+
+async def spotify_error(request: Request, exc: Exception) -> JSONResponse:
+    """Map Spotify failures to a retry or reconnect message."""
+    spotify_status = exc.http_status if isinstance(exc, spotipy.SpotifyException) else None
+    logger.warning("Spotify request failed with status %s", spotify_status)
+    if spotify_status == status.HTTP_401_UNAUTHORIZED or isinstance(exc, SpotifyOauthError):
+        session = _lookup_session(request)
+        if session:
+            session.user.clear()
+        return JSONResponse({"detail": "Connect Spotify again to continue."}, status_code=401)
+    return JSONResponse({"detail": "Spotify couldn't complete that request. Please try again."}, status_code=502)
+
+
+async def unexpected_error(_request: Request, exc: Exception) -> JSONResponse:
+    """Log server failures without returning their internals."""
+    logger.error("Request failed", exc_info=exc)
+    return JSONResponse({"detail": "Something went wrong. Please try again."}, status_code=500)
+
+
+@router.get("/api/health")
+def health() -> dict[str, str]:
+    """Report whether the server is running."""
+    return {"status": "ok"}
+
+
+@router.get("/api/session")
+def session_info(request: Request) -> SessionView:
+    """Return login state without exposing Spotify tokens."""
+    session = _lookup_session(request)
+    if session and session.user:
+        return SessionView(configured=is_configured(), user=session.user, csrf=session.csrf)
+    return SessionView(configured=is_configured())
+
+
+@router.get("/api/auth/login")
+def login(request: Request) -> RedirectResponse:
+    """Start a new Spotify login with a unique state value."""
+    if not is_configured():
+        return RedirectResponse("/?error=setup", status_code=303)
+    # Set the session cookie on the same host Spotify will return to.
+    if request.url.hostname == "localhost" and urlsplit(get_redirect_uri()).hostname == "127.0.0.1":
+        return RedirectResponse(str(request.url.replace(hostname="127.0.0.1")), status_code=303)
+    _lookup_session(request)  # Remove expired sessions before admitting a new login.
+    state = secrets.token_urlsafe(32)
+    session = Session(auth=get_auth_manager(state), state=state)
+    session_id = secrets.token_urlsafe(32)
+    with request.app.state.sessions_lock:
+        if len(request.app.state.sessions) >= MAX_SESSIONS:
+            raise HTTPException(503, "We're busy right now. Please try again soon.")
+        old_id = request.cookies.get(COOKIE)
+        request.app.state.sessions.pop(old_id, None)
+        request.app.state.sessions[session_id] = session
+    response = RedirectResponse(session.auth.get_authorize_url(state=state), status_code=303)
+    _set_cookie(response, session_id)
+    return response
+
+
+@router.get("/api/auth/callback")
+def callback(request: Request, state: str = "", code: str = "", error: str = "") -> RedirectResponse:
+    """Consume the login state once and rotate the session cookie."""
+    session = _lookup_session(request)
+    if not session:
+        return RedirectResponse("/?error=login", status_code=303)
+    with session.lock:
+        if not session.state or not secrets.compare_digest(state, session.state):
+            return RedirectResponse("/?error=login", status_code=303)
+        session.state = ""
+        if error or not code:
+            return RedirectResponse("/?error=login", status_code=303)
         try:
-            fig = create_transition_chart(transitions)
-            st.plotly_chart(fig, use_container_width=True)
-        except (ValueError, TypeError, KeyError):
-            st.caption("Not enough data to render chart.")
+            session.auth.get_access_token(code, as_dict=False, check_cache=False)
+            profile = get_spotify_client(session.auth).current_user()
+            session.user = {"id": profile["id"], "name": profile.get("display_name") or "Spotify listener"}
+        except Exception:
+            logger.exception("Spotify login failed")
+            return RedirectResponse("/?error=login", status_code=303)
+        session.expires = time.time() + SESSION_SECONDS
+        session_id = secrets.token_urlsafe(32)
+        with request.app.state.sessions_lock:
+            request.app.state.sessions.pop(request.cookies.get(COOKIE), None)
+            request.app.state.sessions[session_id] = session
+    response = RedirectResponse("/playlists", status_code=303)
+    _set_cookie(response, session_id)
+    return response
 
 
-def _build_transition_row(transition: dict[str, Any]) -> dict[str, Any]:
-    """Build a compact transition row for the analysis table."""
-    bpm_diff = transition.get("bpm_diff")
-    energy_diff = transition.get("energy_diff")
-
-    row: dict[str, Any] = {
-        "#": transition["index"],
-        "From": transition["track1_name"],
-        "To": transition["track2_name"],
-        "Key": f"{transition['key1']} → {transition['key2']}",
-        "BPM Diff": f"{bpm_diff:.0f}" if bpm_diff is not None else "-",
-        "Energy Diff": f"{energy_diff:+.2f}" if energy_diff is not None else "-",
-        "Score": f"{transition['score']:.2f}",
-    }
-
-    return row
+@router.post("/api/auth/logout")
+def logout(request: Request, response: Response, _session: CurrentSession) -> dict[str, bool]:
+    """Forget this browser session and expire its cookie."""
+    with request.app.state.sessions_lock:
+        request.app.state.sessions.pop(request.cookies.get(COOKIE), None)
+    response.delete_cookie(COOKIE)
+    return {"ok": True}
 
 
-def _render_landing_page() -> None:
-    """Render the unauthenticated landing page."""
-    st.markdown(
-        "Sort your Spotify playlists for smooth transitions using "
-        "**harmonic mixing** (Camelot wheel), **BPM matching**, and **energy flow**."
-    )
-
-    redirect_uri = get_redirect_uri()
-
-    st.info(
-        f"**Setup:** Create a [Spotify app](https://developer.spotify.com/dashboard), "
-        f"set redirect URI to `{redirect_uri}`, then enter your credentials in the sidebar.",
-        icon="👈",
-    )
+@router.get("/api/playlists")
+def playlists(session: CurrentSession) -> list[Playlist]:
+    """List the playlists this listener can edit."""
+    return [Playlist.model_validate(p) for p in get_all_playlists(get_spotify_client(session.auth), session.user["id"])]
 
 
-# --- Chart creation ---
+@router.get("/api/job")
+def job_info(session: CurrentSession) -> JobView | None:
+    """Return this session's current playlist and progress."""
+    return session.job.view if session.job else None
 
 
-def create_transition_chart(transitions: list[dict[str, Any]]) -> go.Figure:
-    """Create a scatter plot of track transitions (BPM vs Key, colored by Energy)."""
-    chart_data = []
-
-    for i, transition in enumerate(transitions):
-        if "score" not in transition:
-            continue
-
+@router.post("/api/playlists/{playlist_id}/analyze", status_code=202)
+def analyze(playlist_id: SpotifyId, request: Request, session: CurrentSession, background: BackgroundTasks) -> JobView:
+    """Check an editable playlist without blocking the response."""
+    with session.lock:
+        if session.job and session.job.view.status in {"analyzing", "sorting", "saving"}:
+            raise HTTPException(409, "Please wait for this playlist to finish.")
+        if not request.app.state.analysis_lock.acquire(blocking=False):
+            raise HTTPException(409, "We're checking another playlist. Please try again shortly.")
         try:
-            bpm1 = float(transition["bpm1"]) if transition["bpm1"] is not None else 0
-            bpm2 = float(transition["bpm2"]) if transition["bpm2"] is not None else 0
-            energy1 = float(transition["energy1"]) if transition["energy1"] is not None else 0
-            energy2 = float(transition["energy2"]) if transition["energy2"] is not None else 0
+            sp = get_spotify_client(session.auth)
+            info = sp.playlist(playlist_id, fields="owner(id),collaborative")
+            if info.get("owner", {}).get("id") != session.user["id"] and not info.get("collaborative"):
+                raise HTTPException(403, "Choose a playlist you can edit.")  # noqa: TRY301
+            job = Job(SpotifyPlaylistSorter(playlist_id, sp), JobView(playlist_id=playlist_id))
+            session.job = job
+            background.add_task(_run_job, job, "analyze", None, request.app.state.analysis_lock.release)
+        except Exception:
+            request.app.state.analysis_lock.release()
+            raise
+        else:
+            return job.view
 
-            track1 = {
-                "Track": f"{transition['track1_name']} - {transition['track1_artist']}",
-                "Key": transition["key1"],
-                "BPM": bpm1,
-                "Energy": energy1,
-                "Position": i,
-                "TrackNum": i + 1,
+
+def begin_action(
+    session: Session, background: BackgroundTasks, action: str, revision: str, first: str | None = None
+) -> JobView:
+    """Reject stale previews and start one action for this session."""
+    with session.lock:
+        job = session.job
+        if not job or job.view.status not in {"ready", "saved"}:
+            raise HTTPException(409, "Check the playlist before continuing.")
+        if revision != job.view.revision:
+            raise HTTPException(409, "This preview changed in another tab. Reload the page to continue.")
+        if action == "sort" and first not in {track.id for track in job.view.tracks}:
+            raise HTTPException(422, "Choose a first song from this playlist.")
+        if action == "save" and not job.sorted_ids:
+            raise HTTPException(409, "Sort the playlist before saving.")
+        job.view = job.view.model_copy(
+            update={
+                "status": "sorting" if action == "sort" else "saving",
+                "error": None,
+                "revision": secrets.token_urlsafe(16),
             }
-            track2 = {
-                "Track": f"{transition['track2_name']} - {transition['track2_artist']}",
-                "Key": transition["key2"],
-                "BPM": bpm2,
-                "Energy": energy2,
-                "Position": i + 1,
-                "TrackNum": i + 2,
-            }
-
-            if i == 0 or chart_data[-1]["Track"] != track1["Track"]:
-                chart_data.append(track1)
-            chart_data.append(track2)
-        except (ValueError, TypeError, KeyError):
-            continue
-
-    if len(chart_data) < MIN_TRACKS_FOR_CHART:
-        msg = "Not enough valid transition data to create chart"
-        raise ValueError(msg)
-
-    chart_df = pd.DataFrame(chart_data)
-
-    fig = px.scatter(
-        chart_df,
-        x="BPM",
-        y="Key",
-        color="Energy",
-        size="Energy",
-        color_continuous_scale="Viridis",
-        hover_name="Track",
-        text="TrackNum",
-        range_color=[0, 1],
-    )
-
-    fig.update_layout(
-        height=500,
-        xaxis_title="BPM",
-        yaxis_title="Key (Camelot)",
-        margin={"l": 40, "r": 20, "t": 20, "b": 40},
-    )
-
-    fig.update_traces(
-        textposition="top center",
-        textfont={"size": 9, "color": "gray"},
-        marker={"line": {"width": 1, "color": "darkgray"}},
-        selector={"mode": "markers+text"},
-    )
-
-    return fig
+        )
+        background.add_task(_run_job, job, action, first, lambda: None)
+        return job.view
 
 
-# --- Page setup & entry point ---
+@router.post("/api/job/sort", status_code=202)
+def sort(body: SortRequest, session: CurrentSession, background: BackgroundTasks) -> JobView:
+    """Preview a new order starting with the selected song."""
+    return begin_action(session, background, "sort", body.revision, body.first_track_id)
 
 
-st.set_page_config(
-    page_title="Spotify Playlist Sorter",
-    page_icon="🎵",
-    layout="wide",
-    initial_sidebar_state="expanded",
+@router.post("/api/job/save", status_code=202)
+def save(body: PreviewRequest, session: CurrentSession, background: BackgroundTasks) -> JobView:
+    """Apply only the preview the browser has seen."""
+    return begin_action(session, background, "save", body.revision)
+
+
+@router.api_route("/api", include_in_schema=False, methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+@router.api_route(
+    "/api/{path:path}", include_in_schema=False, methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 )
+def unknown_api() -> None:
+    """Keep unknown API paths out of the SPA fallback."""
+    raise HTTPException(404, "This page wasn't found.")
 
 
-def main() -> None:
-    """Main application entry point."""
-    _init_session_state()
-    _render_sidebar()
-
-    if st.session_state.authenticated:
-        if st.session_state.tracks_data is not None and st.session_state.sorter is not None:
-            _render_sorting_controls()
-            _render_sorted_results()
-        else:
-            st.caption("Select a playlist from the sidebar to get started.")
-    else:
-        _render_landing_page()
-
-    st.caption(
-        "[@MishraMishry](https://x.com/MishraMishry) · "
-        "[Source](https://github.com/SarthakMishra/spotify-playlist-sorter)"
+def create_app(frontend_dir: Path | None = None) -> FastAPI:
+    """Create the API; a Node build supplies the static frontend directory."""
+    load_dotenv()
+    app = FastAPI(title="Playlist Sorter", lifespan=lifespan)
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
+    app.middleware("http")(private_responses)
+    app.add_exception_handler(RequestValidationError, invalid_request)
+    app.add_exception_handler(spotipy.SpotifyException, spotify_error)
+    app.add_exception_handler(SpotifyOauthError, spotify_error)
+    app.add_exception_handler(Exception, unexpected_error)
+    app.include_router(router)
+    app.frontend(
+        "/", directory=frontend_dir or Path(__file__).resolve().parent.parent / "frontend/dist", check_dir=False
     )
+    return app
 
 
-if __name__ == "__main__":
-    main()
+app = create_app()

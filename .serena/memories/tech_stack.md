@@ -1,7 +1,9 @@
 # Runtime and tooling
 
-- Python minimum and Ruff/ty target are 3.13; the Docker runtime uses Python 3.14 Alpine. `pyproject.toml` and `uv.lock` are the dependency sources of truth; use uv and the local `.venv`.
-- Streamlit provides the UI, pandas the track tables, Plotly the charts, and Spotipy the Spotify API/OAuth client. yt-dlp downloads audio; soundfile and numpy perform local analysis. ffmpeg is a system dependency; Alpine also needs libsndfile.
-- Development checks use Ruff and ty. `typings/spotipy/*.pyi` supplies local Spotipy stubs; preserve them when changing API calls or typing configuration.
-- `docker compose up` runs the published GHCR image. Local source changes require an explicit image build; Compose has no build step or app-source mount.
-- `.github/workflows/publish-image.yml` publishes images on main pushes, version tags, and manual dispatch. It does not run Python validation.
+- FastAPI serves the Vite build through native `app.frontend`. `/api` has a separate 404 route so unknown API URLs never return SPA HTML.
+- Spotipy OAuth caches are per-session and server-only. Login rotates the opaque cookie; POST requests require the session CSRF header. The public redirect URI controls the Secure cookie flag.
+- Vite proxies `/api` locally. Use the same browser origin for login and callback: port 5173 in development, port 8000 for the built app. Register the exact callback path with Spotify.
+- The Docker build uses Node only to compile the frontend, then copies the bundle into a non-root Python runtime with ffmpeg and libsndfile. The working directory must be writable for the analysis cache.
+- Python dependency versions live in `pyproject.toml`/`uv.lock`; frontend versions and pnpm version live in `frontend/package.json`/`pnpm-lock.yaml`. Use uv for Python and pnpm for frontend work.
+- Local Spotipy stubs under `typings/` support type checking. Preserve them when changing API calls.
+- CI checks both stacks and builds the frontend before the existing main/tag/manual image publishing step; pull requests run checks without publishing.

@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  pull_request:
   workflow_dispatch:
 
 env:
@@ -11,7 +12,40 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: "0.12.10"
+          python-version: "3.13"
+          enable-cache: true
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@11.24.0 --activate
+      - name: Install locked dependencies
+        run: |
+          uv sync --locked
+          pnpm --dir frontend install --frozen-lockfile
+      - name: Check Python
+        run: |
+          uv run ruff check app tests
+          uv run ruff format --check app tests
+          uv run ty check
+          uv run python -m unittest discover -s tests -v
+      - name: Check and build frontend
+        run: |
+          pnpm --dir frontend check
+          pnpm --dir frontend build
+
   build-and-push:
+    needs: check
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
