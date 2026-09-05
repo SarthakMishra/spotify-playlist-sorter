@@ -20,7 +20,7 @@ pnpm --dir frontend build
 uv run uvicorn app.app:app --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
-Open **http://127.0.0.1:8000**. With [Task](https://taskfile.dev/), use `task setup` and `task run` instead. API documentation is at `/docs`.
+Open **http://127.0.0.1:8000**. With [Task](https://taskfile.dev/), use `task setup` and `task serve` instead. API documentation is at `/docs`.
 
 If Spotify says `redirect_uri: Not matching configuration`, open your app in the Spotify Developer Dashboard, choose **Settings**, and save `http://127.0.0.1:8000/api/auth/callback` under **Redirect URIs**. Include `/api/auth/callback` with no trailing slash. Check the app whose client ID matches your `.env`. Opening the app at `localhost` automatically switches login to `127.0.0.1` so the session cookie reaches the callback.
 
@@ -28,7 +28,7 @@ Credentials and Spotify tokens stay on the server. The browser receives an opaqu
 
 ## Development
 
-Run `task dev` to start FastAPI and Vite with reload. Open **http://127.0.0.1:5173** and register `http://127.0.0.1:5173/api/auth/callback` in your Spotify app too. Vite proxies `/api` to FastAPI; the callback returns through the same browser origin. `task dev` sets the local callback for you.
+Run `task run` or `task dev` to start FastAPI with reload and Vite with frontend hot reload. Open **http://127.0.0.1:5173** and register `http://127.0.0.1:5173/api/auth/callback` in your Spotify app too. Vite proxies `/api` to FastAPI; the callback returns through the same browser origin. Both commands set the local callback for you. Use `task serve` to build and serve the production frontend at **http://127.0.0.1:8000**.
 
 Without Task, run these in separate terminals:
 

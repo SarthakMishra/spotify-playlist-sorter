@@ -57,6 +57,11 @@ tasks:
       - task: build
 
   run:
+    desc: Run FastAPI and Vite with hot reload at http://127.0.0.1:5173
+    cmds:
+      - task: dev
+
+  serve:
     desc: Build and serve the app at http://127.0.0.1:8000
     cmds:
       - task: build

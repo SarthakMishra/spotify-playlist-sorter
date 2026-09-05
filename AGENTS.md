@@ -13,7 +13,8 @@ Use Python 3.13+, Node 24, pnpm 11, uv, ffmpeg, and Task. Run these from the rep
 - `task setup`: install dependencies from `uv.lock` and `frontend/pnpm-lock.yaml`.
 - `task dev`: start reloading FastAPI and Vite servers at `http://127.0.0.1:5173`.
 - `task build`: type-check and build the frontend.
-- `task run`: build and serve the app at `http://127.0.0.1:8000`.
+- `task run`: start reloading FastAPI and Vite servers at `http://127.0.0.1:5173`, like `task dev`.
+- `task serve`: build and serve the app at `http://127.0.0.1:8000`.
 - `task test`: run offline tests, equivalent to `uv run python -m unittest discover -s tests -v`.
 - `task check`: run lint, formatting, type checks, tests, and the production build.
 - `task fix`: apply safe lint fixes and formatting, then recheck lint and types.
