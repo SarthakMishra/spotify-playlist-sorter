@@ -3,9 +3,11 @@ venv
 __pycache__
 *.pyc
 .git
+.serena/
 .ruff_cache
 .cache
 .env
+cookies.txt
 .spotify_cache
 .spotify_credentials
 .analysis_cache.json

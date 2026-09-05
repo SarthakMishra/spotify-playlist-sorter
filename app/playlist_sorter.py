@@ -10,6 +10,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
+from io import StringIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -413,6 +414,10 @@ class SpotifyPlaylistSorter:
                 "skip_download": True,
                 "ignoreerrors": True,
             }
+            cookies_file = os.environ.get("YOUTUBE_COOKIES_FILE")
+            if cookies_file and Path(cookies_file).is_file():
+                # yt-dlp saves cookies on close; keep read-only mounts and parallel workers isolated.
+                search_opts["cookiefile"] = StringIO(Path(cookies_file).read_text(encoding="utf-8"))
             with yt_dlp.YoutubeDL(search_opts) as ydl:
                 info = ydl.extract_info(query, download=False)
             if not info:
@@ -531,6 +536,8 @@ class SpotifyPlaylistSorter:
                         },
                     ],
                 }
+                if cookies_file and Path(cookies_file).is_file():
+                    dl_opts["cookiefile"] = StringIO(Path(cookies_file).read_text(encoding="utf-8"))
                 with yt_dlp.YoutubeDL(dl_opts) as ydl:
                     ydl.extract_info(video_url, download=True)
 

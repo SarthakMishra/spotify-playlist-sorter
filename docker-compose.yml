@@ -7,4 +7,9 @@ services:
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
       - SPOTIFY_REDIRECT_URI=${SPOTIFY_REDIRECT_URI:-http://127.0.0.1:8501}
+      - YOUTUBE_COOKIES_FILE=${YOUTUBE_COOKIES_FILE:-}
+    # To use YouTube cookies (fixes bot detection), uncomment and set path:
+    # volumes:
+    #   - ./cookies.txt:/tmp/cookies.txt:ro
+    # And set YOUTUBE_COOKIES_FILE=/tmp/cookies.txt in your .env
     restart: unless-stopped

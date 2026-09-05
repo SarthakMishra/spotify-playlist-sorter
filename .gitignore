@@ -12,3 +12,4 @@ audio_files/
 .ruff_cache
 .cache
 .spotify_credentials
+cookies.txt
