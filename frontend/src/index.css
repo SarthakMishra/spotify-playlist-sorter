@@ -131,6 +131,7 @@
 @layer base {
   html {
     color-scheme: light;
+    scrollbar-gutter: stable;
   }
   html.dark {
     color-scheme: dark;

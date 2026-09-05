@@ -53,7 +53,7 @@ export function PlaylistRoute() {
 
 function SongList({ tracks, label }: { tracks: Track[]; label: string }) {
   return (
-    <Table className="table-fixed">
+    <Table className="table-fixed" scrollLabel={label}>
       <TableCaption className="sr-only">{label}</TableCaption>
       <TableHeader>
         <TableRow>
@@ -64,12 +64,12 @@ function SongList({ tracks, label }: { tracks: Track[]; label: string }) {
       <TableBody>
         {tracks.map((track, index) => (
           <TableRow key={track.occurrence}>
-            <TableCell className="align-top text-muted-foreground tabular-nums">
+            <TableCell className="py-2.5 align-top text-muted-foreground tabular-nums">
               {index + 1}
             </TableCell>
-            <TableCell className="whitespace-normal">
+            <TableCell className="py-2.5 whitespace-normal">
               <p className="font-medium break-words">{track.name}</p>
-              <p className="mt-1 break-words text-muted-foreground">{track.artist}</p>
+              <p className="mt-0.5 break-words text-muted-foreground">{track.artist}</p>
             </TableCell>
           </TableRow>
         ))}
@@ -84,7 +84,6 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
   const [error, setError] = useState("")
   const [pending, setPending] = useState(false)
   const [firstTrackId, setFirstTrackId] = useState("")
-  const [detailsOpen, setDetailsOpen] = useState(false)
   const actionController = useRef<AbortController | null>(null)
   const jobStatus = job?.status
   const busy = pending || isWorking(job)
@@ -170,23 +169,23 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
     <section className="mx-auto max-w-2xl">
       <Link
         to="/playlists"
-        className="mb-7 inline-flex items-center gap-2 rounded-md text-sm text-muted-foreground hover:text-foreground"
+        className="mb-5 inline-flex min-h-8 items-center gap-2 rounded-md text-sm text-muted-foreground hover:text-foreground"
       >
         <ArrowLeft className="size-4" aria-hidden="true" />
         Your playlists
       </Link>
-      <div className="flex items-center gap-5">
+      <div className="flex items-center gap-4">
         {playlist.image ? (
           <img
             src={playlist.image}
             alt=""
-            width={88}
-            height={88}
-            className="size-20 shrink-0 rounded-xl object-cover sm:size-22"
+            width={64}
+            height={64}
+            className="size-16 shrink-0 rounded-xl object-cover"
           />
         ) : (
-          <div className="flex size-20 shrink-0 items-center justify-center rounded-xl bg-muted">
-            <Music2 className="size-8 text-muted-foreground" aria-hidden="true" />
+          <div className="flex size-16 shrink-0 items-center justify-center rounded-xl bg-muted">
+            <Music2 className="size-7 text-muted-foreground" aria-hidden="true" />
           </div>
         )}
         <div className="min-w-0">
@@ -276,7 +275,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
 
       {!!tracks.length && job && job.status !== "error" && (
         <>
-          <div className="mt-9 border-t pt-7">
+          <div className="mt-6 border-t pt-5">
             <label htmlFor="first-song" className="mb-2 block text-sm font-medium">
               First song
             </label>
@@ -307,7 +306,11 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
                   </ComboboxContent>
                 </Combobox>
               </div>
-              <Button onClick={() => void run("sort")} disabled={busy || !firstId}>
+              <Button
+                variant={hasPreview ? "outline" : "default"}
+                onClick={() => void run("sort")}
+                disabled={busy || !firstId}
+              >
                 {hasPreview ? "Sort again" : "Sort playlist"}
                 <ArrowRight aria-hidden="true" />
               </Button>
@@ -327,45 +330,11 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
               </AlertDescription>
             </Alert>
           )}
-          <div className="mt-8">
-            {hasPreview ? (
-              <Tabs defaultValue="new" key={job.sorted_tracks.map((track) => track.id).join("")}>
-                <TabsList aria-label="Song order">
-                  <TabsTrigger value="new">New order</TabsTrigger>
-                  <TabsTrigger value="original">Original</TabsTrigger>
-                </TabsList>
-                <TabsContent value="new">
-                  <SongList tracks={job.sorted_tracks} label="New song order" />
-                </TabsContent>
-                <TabsContent value="original">
-                  <SongList tracks={tracks} label="Original song order" />
-                </TabsContent>
-              </Tabs>
-            ) : (
-              <SongList tracks={tracks} label="Songs in your playlist" />
-            )}
-          </div>
           {hasPreview && (
-            <>
-              <details
-                className="mt-6 border-t py-5"
-                onToggle={(event) => setDetailsOpen(event.currentTarget.open)}
-              >
-                <summary className="w-fit cursor-pointer rounded-md text-sm font-medium">
-                  Song details
-                </summary>
-                {detailsOpen && (
-                  <Suspense
-                    fallback={
-                      <p className="py-5 text-sm text-muted-foreground">Loading details...</p>
-                    }
-                  >
-                    <SongDetails tracks={job.sorted_tracks} transitions={job.transitions} />
-                  </Suspense>
-                )}
-              </details>
-              <div className="mt-3 flex flex-col items-start gap-4 border-t py-6 sm:flex-row sm:items-center sm:justify-between">
-                <div aria-live="polite">
+            <div className="mt-6 flex flex-col gap-3 border-t pt-5 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <h2 className="text-sm font-semibold">Playlist preview</h2>
+                <div aria-live="polite" className="mt-1">
                   {job.status === "saved" ? (
                     <p className="flex items-center gap-2 text-sm font-medium">
                       <Check className="size-4" aria-hidden="true" />
@@ -375,33 +344,66 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
                     <p className="text-sm text-muted-foreground">
                       {firstChanged
                         ? "Sort again to use this first song."
-                        : "Ready? Save this order to your playlist."}
+                        : "Review the order before saving."}
                     </p>
                   )}
                 </div>
-                {job.status === "saved" ? (
-                  <Button
-                    variant="outline"
-                    render={
-                      <a
-                        aria-label="Open Spotify"
-                        href={`https://open.spotify.com/playlist/${playlist.id}`}
-                        target="_blank"
-                        rel="noreferrer"
-                      />
+              </div>
+              {job.status === "saved" ? (
+                <Button
+                  variant="outline"
+                  render={
+                    <a
+                      aria-label="Open Spotify"
+                      href={`https://open.spotify.com/playlist/${playlist.id}`}
+                      target="_blank"
+                      rel="noreferrer"
+                    />
+                  }
+                >
+                  Open Spotify
+                  <ExternalLink aria-hidden="true" />
+                </Button>
+              ) : (
+                <Button onClick={() => void run("save")} disabled={busy || firstChanged}>
+                  Save to Spotify
+                </Button>
+              )}
+            </div>
+          )}
+          <div className="mt-5">
+            {hasPreview ? (
+              <Tabs
+                defaultValue="new"
+                key={job.sorted_tracks.map((track) => track.occurrence).join(",")}
+              >
+                <TabsList aria-label="Playlist preview" className="w-full sm:w-fit">
+                  <TabsTrigger value="new">New order</TabsTrigger>
+                  <TabsTrigger value="original">Original</TabsTrigger>
+                  <TabsTrigger value="details">Song details</TabsTrigger>
+                </TabsList>
+                <TabsContent value="new">
+                  <SongList tracks={job.sorted_tracks} label="New song order" />
+                </TabsContent>
+                <TabsContent value="original">
+                  <SongList tracks={tracks} label="Original song order" />
+                </TabsContent>
+                <TabsContent value="details">
+                  <Suspense
+                    fallback={
+                      <output className="block py-5 text-sm text-muted-foreground">
+                        Loading details...
+                      </output>
                     }
                   >
-                    Open Spotify
-                    <ExternalLink aria-hidden="true" />
-                  </Button>
-                ) : (
-                  <Button onClick={() => void run("save")} disabled={busy || firstChanged}>
-                    Save to Spotify
-                  </Button>
-                )}
-              </div>
-            </>
-          )}
+                    <SongDetails tracks={job.sorted_tracks} transitions={job.transitions} />
+                  </Suspense>
+                </TabsContent>
+              </Tabs>
+            ) : (
+              <SongList tracks={tracks} label="Songs in your playlist" />
+            )}
+          </div>
         </>
       )}
     </section>

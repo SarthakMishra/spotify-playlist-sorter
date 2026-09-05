@@ -26,7 +26,7 @@ export default function SongDetails({
   transitions: Transition[]
 }) {
   return (
-    <div className="pt-6">
+    <div className="pt-3">
       <p className="mb-4 text-sm leading-6 text-muted-foreground">
         Speed is shown in beats per minute. Energy shows how loud a song is compared with the
         others.
@@ -43,8 +43,20 @@ export default function SongDetails({
             margin={{ top: 10, right: 0, left: 0, bottom: 10 }}
           >
             <CartesianGrid stroke="var(--border)" vertical={false} />
-            <XAxis dataKey="position" tickLine={false} axisLine={false} minTickGap={24} />
-            <YAxis yAxisId="bpm" tickLine={false} axisLine={false} width={40} />
+            <XAxis
+              dataKey="position"
+              tick={{ fill: "var(--muted-foreground)" }}
+              tickLine={false}
+              axisLine={false}
+              minTickGap={24}
+            />
+            <YAxis
+              yAxisId="bpm"
+              tick={{ fill: "var(--muted-foreground)" }}
+              tickLine={false}
+              axisLine={false}
+              width={40}
+            />
             <YAxis
               tick={{ fill: "var(--muted-foreground)" }}
               yAxisId="energy"
@@ -87,10 +99,11 @@ export default function SongDetails({
       <p className="mt-2 mb-5 text-xs text-muted-foreground">
         Solid line: speed. Dashed line: energy. Songs run left to right.
       </p>
-      <Table>
-        <TableCaption>
-          Key uses Camelot numbers. Nearby numbers usually fit well together.
-        </TableCaption>
+      <p className="mb-3 text-xs text-muted-foreground">
+        Key uses Camelot numbers. Nearby numbers usually fit well together.
+      </p>
+      <Table scrollLabel="Song details in new order">
+        <TableCaption className="sr-only">Song details in new order</TableCaption>
         <TableHeader>
           <TableRow>
             <TableHead>Song</TableHead>
@@ -102,7 +115,10 @@ export default function SongDetails({
         <TableBody>
           {tracks.map((track) => (
             <TableRow key={track.occurrence}>
-              <TableCell className="max-w-56 whitespace-normal">{track.name}</TableCell>
+              <TableCell className="min-w-36 break-words whitespace-normal">
+                <p className="font-medium">{track.name}</p>
+                <p className="mt-0.5 text-muted-foreground">{track.artist}</p>
+              </TableCell>
               <TableCell>{track.key}</TableCell>
               <TableCell className="tabular-nums">{Math.round(track.bpm)}</TableCell>
               <TableCell className="tabular-nums">{Math.round(track.energy * 100)}%</TableCell>
@@ -113,10 +129,11 @@ export default function SongDetails({
       {transitions.length > 0 && (
         <>
           <h3 className="mt-8 mb-2 text-sm font-medium">Between songs</h3>
-          <Table>
-            <TableCaption>
-              A higher match means the songs are closer in key, speed, and energy.
-            </TableCaption>
+          <p className="mb-3 text-xs text-muted-foreground">
+            A higher match means the songs are closer in key, speed, and energy.
+          </p>
+          <Table scrollLabel="Transitions between songs">
+            <TableCaption className="sr-only">Transitions between songs</TableCaption>
             <TableHeader>
               <TableRow>
                 <TableHead>From / to</TableHead>
@@ -127,7 +144,7 @@ export default function SongDetails({
             <TableBody>
               {transitions.map((transition) => (
                 <TableRow key={transition.index}>
-                  <TableCell className="max-w-64 whitespace-normal">
+                  <TableCell className="min-w-36 break-words whitespace-normal">
                     <p>{transition.track1_name}</p>
                     <p className="mt-1 text-muted-foreground">{transition.track2_name}</p>
                   </TableCell>

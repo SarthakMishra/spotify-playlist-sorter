@@ -24,13 +24,17 @@ import {
   Search,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { ModeToggle } from "@/components/mode-toggle"
 import { Input } from "@/components/ui/input"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { api, ApiError, type Job, type Playlist, type Session } from "@/lib/api"
 
-function Loading() {
+function Loading({ className = "min-h-dvh" }: { className?: string }) {
   return (
-    <p aria-live="polite" className="flex items-center gap-2 py-10 text-sm text-muted-foreground">
+    <p
+      aria-live="polite"
+      className={`flex items-center justify-center gap-2 text-sm text-muted-foreground ${className}`}
+    >
       <LoaderCircle className="size-4 motion-safe:animate-spin" aria-hidden="true" />
       Loading...
     </p>
@@ -40,6 +44,7 @@ function Loading() {
 function Shell() {
   const session = useLoaderData<Session>()
   const navigation = useNavigation()
+  const revalidator = useRevalidator()
   const [error, setError] = useState("")
   const [leaving, setLeaving] = useState(false)
   async function logout() {
@@ -53,34 +58,59 @@ function Shell() {
     }
   }
   return (
-    <div className="min-h-dvh">
+    <div className="flex min-h-dvh flex-col">
       <a
         href="#main"
         className="sr-only focus:not-sr-only focus:absolute focus:z-50 focus:bg-background focus:p-3"
       >
         Skip to content
       </a>
-      <header className="border-b">
-        <div className="mx-auto flex h-18 max-w-5xl items-center justify-between gap-4 px-5 sm:px-8">
+      <header className="relative px-5 after:absolute after:inset-x-0 after:bottom-0 after:h-px after:bg-linear-to-r after:from-background after:via-border after:to-background sm:px-8">
+        <div className="mx-auto flex min-h-12 max-w-2xl flex-wrap items-center justify-between gap-3 py-2">
           <Link
             to={session.user ? "/playlists" : "/"}
-            className="flex items-center gap-2.5 rounded-md font-semibold tracking-tight"
+            className="flex items-center gap-2 rounded-md text-sm font-semibold tracking-tight"
           >
             <ListMusic className="size-5" aria-hidden="true" />
             Playlist sorter
           </Link>
-          {session.user && (
-            <Button variant="ghost" size="sm" onClick={() => void logout()} disabled={leaving}>
-              <LogOut aria-hidden="true" />
-              Sign out
-            </Button>
-          )}
+          <div className="flex flex-wrap items-center gap-2 max-sm:w-full">
+            {session.user && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="gap-2 text-muted-foreground focus-visible:text-foreground max-sm:flex-1"
+                aria-label="Refresh playlists"
+                onClick={() => void revalidator.revalidate()}
+                disabled={revalidator.state !== "idle"}
+              >
+                <RefreshCw
+                  className={revalidator.state !== "idle" ? "motion-safe:animate-spin" : ""}
+                  aria-hidden="true"
+                />
+                Refresh
+              </Button>
+            )}
+            <ModeToggle />
+            {session.user && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="gap-2 text-muted-foreground focus-visible:text-foreground max-sm:flex-1"
+                onClick={() => void logout()}
+                disabled={leaving}
+              >
+                <LogOut aria-hidden="true" />
+                Sign out
+              </Button>
+            )}
+          </div>
         </div>
       </header>
       <main
         id="main"
         tabIndex={-1}
-        className="mx-auto max-w-5xl px-5 py-10 outline-none sm:px-8 sm:py-14"
+        className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-5 py-6 outline-none sm:px-8 sm:py-8"
         aria-busy={navigation.state === "loading"}
       >
         {error && (
@@ -88,12 +118,10 @@ function Shell() {
             <AlertDescription>{error}</AlertDescription>
           </Alert>
         )}
-        {navigation.state === "loading" && (
-          <div aria-live="polite" className="mb-4 text-sm text-muted-foreground">
-            Loading...
-          </div>
-        )}
-        <Outlet />
+        {navigation.state === "loading" && <Loading className="flex-1" />}
+        <div hidden={navigation.state === "loading"}>
+          <Outlet />
+        </div>
       </main>
     </div>
   )
@@ -104,7 +132,7 @@ function Welcome() {
   const [params] = useSearchParams()
   if (session?.user) return <Navigate to="/playlists" replace />
   return (
-    <section className="mx-auto max-w-xl py-8 sm:py-16">
+    <section className="mx-auto max-w-2xl py-8 sm:py-16">
       <div className="mb-8 flex size-14 items-center justify-center rounded-2xl bg-muted">
         <Music2 className="size-7" aria-hidden="true" />
       </div>
@@ -142,37 +170,17 @@ function Welcome() {
 
 function PlaylistList() {
   const playlists = useRouteLoaderData<Playlist[]>("playlists") ?? []
-  const revalidator = useRevalidator()
   const [search, setSearch] = useState("")
   const filtered = playlists.filter((playlist) =>
     playlist.name.toLocaleLowerCase().includes(search.toLocaleLowerCase().trim()),
   )
   return (
     <section className="mx-auto max-w-2xl">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-3xl font-semibold tracking-tight">Your playlists</h1>
-          <p className="mt-2 text-muted-foreground">Choose a playlist you want to sort.</p>
-        </div>
-        <Button
-          variant="ghost"
-          size="icon"
-          aria-label="Refresh playlists"
-          onClick={() => void revalidator.revalidate()}
-          disabled={revalidator.state !== "idle"}
-        >
-          <RefreshCw
-            className={revalidator.state !== "idle" ? "motion-safe:animate-spin" : ""}
-            aria-hidden="true"
-          />
-        </Button>
-      </div>
+      <h1 className="text-3xl font-semibold tracking-tight">Your playlists</h1>
+      <p className="mt-2 text-muted-foreground">Choose a playlist you want to sort.</p>
       {playlists.length > 0 ? (
         <>
-          <label htmlFor="playlist-search" className="mt-8 mb-2 block text-sm font-medium">
-            Find a playlist
-          </label>
-          <div className="relative">
+          <div className="relative mt-8">
             <Search
               className="pointer-events-none absolute top-3 left-3 size-4 text-muted-foreground"
               aria-hidden="true"
@@ -182,16 +190,17 @@ function PlaylistList() {
               type="search"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search by name"
+              aria-label="Search your playlists"
+              placeholder="Search your playlists"
               className="h-10 pl-10"
             />
           </div>
           <ul className="mt-5 divide-y">
             {filtered.map((playlist) => (
-              <li key={playlist.id}>
+              <li key={playlist.id} className="py-1">
                 <Link
                   to={`/playlists/${playlist.id}`}
-                  className="group flex items-center gap-4 rounded-lg py-4 pr-2 transition-colors hover:bg-muted/50"
+                  className="group flex items-center gap-4 rounded-lg p-3 transition-colors hover:bg-muted/50"
                 >
                   {playlist.image ? (
                     <img
