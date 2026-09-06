@@ -88,8 +88,8 @@ function SongList({
               {index + 1}
             </TableCell>
             <TableCell className="py-2.5 whitespace-normal">
-              <p className="font-medium break-words">{track.name}</p>
-              <p className="mt-0.5 break-words text-muted-foreground">{track.artist}</p>
+              <p className="wrap-break-words font-medium">{track.name}</p>
+              <p className="wrap-break-words mt-0.5 text-muted-foreground">{track.artist}</p>
               {checking && !track.fixed_reason && (
                 <p className="mt-1 text-xs text-muted-foreground">
                   {states[track.analysis_status]}
@@ -151,7 +151,7 @@ function ReviewSummary({ job }: { job: Job }) {
           <ol className="mt-3 divide-y">
             {review.highlights.map((note) => (
               <li key={note.track1_occurrence} className="py-3 text-sm first:pt-0 last:pb-0">
-                <p className="font-medium break-words">
+                <p className="wrap-break-words font-medium">
                   {note.index}. {note.track1_name} → {note.index + 1}. {note.track2_name}
                 </p>
                 <p className="mt-1 leading-6 text-muted-foreground">{note.text}</p>
@@ -513,7 +513,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
           </div>
         )}
         <div className="min-w-0">
-          <h1 className="text-2xl font-semibold tracking-tight break-words sm:text-3xl">
+          <h1 className="wrap-break-words text-2xl font-semibold tracking-tight sm:text-3xl">
             {playlist.name}
           </h1>
           <p className="mt-2 text-sm text-muted-foreground">

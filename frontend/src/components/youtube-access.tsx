@@ -200,7 +200,7 @@ export function YouTubeAccessPage() {
         <p className="mt-3">
           For local Chrome, add these settings to the app's .env file and restart it:
         </p>
-        <pre className="mt-3 rounded-md bg-muted p-3 text-xs break-words whitespace-pre-wrap">
+        <pre className="wrap-break-words mt-3 rounded-md bg-muted p-3 text-xs whitespace-pre-wrap">
           {
             "YOUTUBE_BROWSER=chrome\n# Optional, for a specific profile:\nYOUTUBE_BROWSER_PROFILE=Default"
           }
@@ -214,7 +214,7 @@ export function YouTubeAccessPage() {
           Player support uses Node 24 and yt-dlp's bundled challenge scripts. To update them with
           the app's dependencies:
         </p>
-        <pre className="mt-3 rounded-md bg-muted p-3 text-xs break-words whitespace-pre-wrap">
+        <pre className="wrap-break-words mt-3 rounded-md bg-muted p-3 text-xs whitespace-pre-wrap">
           uv sync --locked
         </pre>
         <p className="mt-3 text-muted-foreground">
