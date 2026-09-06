@@ -28,7 +28,7 @@ Repeated analysis of an unchanged recording uses the cache; changed source/versi
 
 ## Answer
 
-2026-09-06: Implemented with librosa 1.0.0, locked for the current Python 3.13/NumPy environment. [Audio measurements](../../../app/audio_analysis.py) are independent of service I/O; [playlist_sorter.py](../../../app/playlist_sorter.py) owns matching, downloads, cache checkpoints and ordering. Librosa includes its declared transitive dependencies; no learned model is used.
+2026-09-06: Implemented with librosa 1.0.0, locked for the current Python 3.13/NumPy environment. [Audio measurements](../../../api/audio_analysis.py) are independent of service I/O; [playlist_sorter.py](../../../api/playlist_sorter.py) owns matching, downloads, cache checkpoints and ordering. Librosa includes its declared transitive dependencies; no learned model is used.
 
 The resolver retains title, credited-artist and version evidence, rejects duration/variant mismatches, and applies the 0.85 score and 0.10 margin even to a single result. Karaoke and view-count preferences are removed. After an accepted source fails, only that candidate is removed and the remaining ranking must independently clear both checks before retrying. Initial ambiguity never triggers downloads. Uncertain, failed and overlong recordings return distinct status/reason values and remain visible in fixed positions.
 

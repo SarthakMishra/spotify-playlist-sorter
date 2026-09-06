@@ -34,7 +34,7 @@ all = "error"
 error-on-warning = true
 
 [tool.ty.src]
-include = ["app", "tests"]
+include = ["api", "tests"]
 
 [tool.ty.environment]
 python-version = "3.13"

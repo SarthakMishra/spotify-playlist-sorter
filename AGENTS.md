@@ -2,9 +2,9 @@
 
 ## Project structure and module organization
 
-- `app/app.py` defines FastAPI routes, sessions, jobs, and SPA serving. `app/playlist_sorter.py` handles audio analysis and ordering; `app/spotify_auth.py` handles Spotify authentication.
+- `api/app.py` defines FastAPI routes, sessions, jobs, and SPA serving. `api/playlist_sorter.py` handles audio analysis and ordering; `api/spotify_auth.py` handles Spotify authentication.
 - `frontend/src/` contains the React/TypeScript app. Put page components in `components/`, shared shadcn controls in `components/ui/`, and API helpers in `lib/`. Static assets live in `frontend/public/`; builds output to `frontend/dist/`.
-- `tests/` contains offline Python regression tests. `typings/spotipy/` provides local type stubs; `docs/` contains architecture research.
+- `tests/` contains offline Python regression tests; `docs/` contains architecture research.
 
 ## Build, test, and development commands
 

@@ -6,8 +6,8 @@ import urllib.request
 
 import numpy as np
 
-from app.audio_analysis import analyze_audio
-from app.youtube import access_status
+from api.audio_analysis import analyze_audio
+from api.youtube import access_status
 
 state = access_status(None)
 assert state['node_available'] and state['scripts_available']
@@ -17,7 +17,7 @@ assert analyze_audio(np.zeros(22050, dtype=np.float32))['duration'] == 1
 print('Node:', subprocess.check_output(['node', '--version'], text=True).strip())
 print('Runtime UID:', os.getuid())
 server = subprocess.Popen(
-    ['uvicorn', 'app.app:app', '--host', '127.0.0.1', '--port', '8000', '--no-access-log'],
+    ['uvicorn', 'api.app:app', '--host', '127.0.0.1', '--port', '8000', '--no-access-log'],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
 )
 try:

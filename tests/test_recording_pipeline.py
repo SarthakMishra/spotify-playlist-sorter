@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import yt_dlp
 
-from app import playlist_sorter
+from api import playlist_sorter
 
 TRACK = {"id": "a", "Track": "Example", "Artist": "Artist", "album": "Album", "duration_ms": 180000}
 SOURCE = {"id": "abcdefghijk", "title": "Artist - Example", "duration": 180, "artist": "Artist"}

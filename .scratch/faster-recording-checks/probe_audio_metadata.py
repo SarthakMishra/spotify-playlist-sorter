@@ -2,8 +2,8 @@
 import re
 from time import perf_counter
 import yt_dlp
-from app.playlist_sorter import SpotifyPlaylistSorter
-from app.youtube import youtube_options
+from api.playlist_sorter import SpotifyPlaylistSorter
+from api.youtube import youtube_options
 source={'id':'rrim6_9VSeM','url':'https://www.youtube.com/watch?v=rrim6_9VSeM','duration':252}
 with yt_dlp.YoutubeDL({**youtube_options(''),'format':'bestaudio'}) as ydl:
  video=ydl.extract_info(source['url'],download=False)

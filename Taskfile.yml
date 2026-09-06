@@ -20,16 +20,16 @@ tasks:
       - pnpm --dir frontend check
 
   lint:check:
-    cmds: [uv run ruff check app tests]
+    cmds: [uv run ruff check api tests]
 
   lint:fix:
-    cmds: [uv run ruff check --fix app tests]
+    cmds: [uv run ruff check --fix api tests]
 
   lint:format:
-    cmds: [uv run ruff format app tests]
+    cmds: [uv run ruff format api tests]
 
   lint:format:check:
-    cmds: [uv run ruff format --check app tests]
+    cmds: [uv run ruff format --check api tests]
 
   lint:ty:
     cmds: [uv run ty check]
@@ -65,7 +65,7 @@ tasks:
     desc: Build and serve the app at http://127.0.0.1:5178
     cmds:
       - task: build
-      - uv run uvicorn app.app:app --host 127.0.0.1 --port 5178 --no-access-log
+      - uv run uvicorn api.app:app --host 127.0.0.1 --port 5178 --no-access-log
 
   dev:
     desc: Run FastAPI and Vite together at http://127.0.0.1:5178
@@ -74,7 +74,7 @@ tasks:
   dev:api:
     env:
       SPOTIFY_REDIRECT_URI: http://127.0.0.1:5178/api/auth/callback
-    cmds: [uv run uvicorn app.app:app --host 127.0.0.1 --port 8000 --reload --no-access-log]
+    cmds: [uv run uvicorn api.app:app --host 127.0.0.1 --port 8000 --reload --no-access-log]
 
   dev:web:
     cmds: [pnpm --dir frontend dev]

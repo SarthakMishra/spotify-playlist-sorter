@@ -18,8 +18,8 @@ from urllib.parse import parse_qs, urlparse
 from fastapi.testclient import TestClient
 from spotipy.exceptions import SpotifyOauthError
 
-from app.app import COOKIE, Session, create_app
-from app.playlist_sorter import SpotifyPlaylistSorter
+from api.app import COOKIE, Session, create_app
+from api.playlist_sorter import SpotifyPlaylistSorter
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -86,10 +86,10 @@ class MigrationTest(unittest.TestCase):
         oauth.get_authorize_url.side_effect = lambda *, state: f"https://accounts.spotify.com/authorize?state={state}"
         with (
             tempfile.TemporaryDirectory() as temp,
-            patch("app.app.is_configured", return_value=True),
-            patch("app.app.get_redirect_uri", return_value="http://127.0.0.1:5178/api/auth/callback"),
-            patch("app.app.get_auth_manager", return_value=oauth),
-            patch("app.app.get_spotify_client", return_value=sp),
+            patch("api.app.is_configured", return_value=True),
+            patch("api.app.get_redirect_uri", return_value="http://127.0.0.1:5178/api/auth/callback"),
+            patch("api.app.get_auth_manager", return_value=oauth),
+            patch("api.app.get_spotify_client", return_value=sp),
             patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features),
         ):
             directory = Path(temp)
@@ -266,7 +266,7 @@ class MigrationTest(unittest.TestCase):
         for features in ({}, {UNCHECKED: {"status": "ready", "tempo": None, "energy": 0.5, "camelot": None}}):
             with (
                 self.subTest(movable=len(features)),
-                patch("app.app.get_spotify_client", return_value=sp),
+                patch("api.app.get_spotify_client", return_value=sp),
                 patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features),
                 TestClient(app) as client,
             ):
@@ -378,7 +378,7 @@ class MigrationTest(unittest.TestCase):
         app = create_app()
         with (
             TestClient(app) as client,
-            patch("app.app.get_spotify_client", return_value=sp),
+            patch("api.app.get_spotify_client", return_value=sp),
             patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features) as analyze_audio,
         ):
             session = Session(auth=Mock(), state="", user={"id": "listener"}, youtube_cookies="")
@@ -476,8 +476,8 @@ class MigrationTest(unittest.TestCase):
         app = create_app()
         with (
             tempfile.TemporaryDirectory() as directory,
-            patch("app.playlist_sorter._CACHE_FILE", Path(directory) / "cache.json"),
-            patch("app.app.get_spotify_client", return_value=sp),
+            patch("api.playlist_sorter._CACHE_FILE", Path(directory) / "cache.json"),
+            patch("api.app.get_spotify_client", return_value=sp),
             patch.object(SpotifyPlaylistSorter, "_analyze_track", side_effect=analyze),
             TestClient(app) as client,
             ThreadPoolExecutor(max_workers=1) as requests,
@@ -525,7 +525,7 @@ class MigrationTest(unittest.TestCase):
         app = create_app()
         with (
             TestClient(app) as client,
-            patch("app.app.get_spotify_client", return_value=sp),
+            patch("api.app.get_spotify_client", return_value=sp),
             patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", side_effect=RuntimeError("Interrupted")),
         ):
             session = Session(auth=Mock(), state="", user={"id": "listener"}, youtube_cookies="")
@@ -549,7 +549,7 @@ class MigrationTest(unittest.TestCase):
         app = create_app()
         sp = Mock()
         sp.current_user_playlists.side_effect = SpotifyOauthError("invalid_grant", "Token expired")
-        with TestClient(app) as client, patch("app.app.get_spotify_client", return_value=sp):
+        with TestClient(app) as client, patch("api.app.get_spotify_client", return_value=sp):
             app.state.sessions["test-session"] = Session(
                 auth=Mock(), state="", user={"id": "listener"}, youtube_cookies=""
             )
@@ -585,7 +585,7 @@ class MigrationTest(unittest.TestCase):
                     assert "set-cookie" in second.headers
                     sp = Mock()
                     sp.current_user.return_value = {"id": "listener"}
-                    with patch("app.app.get_spotify_client", return_value=sp):
+                    with patch("api.app.get_spotify_client", return_value=sp):
                         session = next(iter(app.state.sessions.values()))
                         session.auth.get_access_token = Mock(return_value="test-token")
                         response = client.get(

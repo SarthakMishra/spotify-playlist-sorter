@@ -23,8 +23,8 @@ import pandas as pd
 import spotipy
 import yt_dlp
 
-from app.audio_analysis import ANALYSIS_VERSION, MAX_SECONDS, SETTINGS, analyze_audio, load_audio
-from app.youtube import SHARED_FAILURES, SourceAccessError, configured_cookies, failure_reason, youtube_options
+from api.audio_analysis import ANALYSIS_VERSION, MAX_SECONDS, SETTINGS, analyze_audio, load_audio
+from api.youtube import SHARED_FAILURES, SourceAccessError, configured_cookies, failure_reason, youtube_options
 
 if TYPE_CHECKING:
     from collections.abc import Callable

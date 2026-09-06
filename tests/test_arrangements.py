@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from app import playlist_sorter
+from api import playlist_sorter
 
 
 def segment(tempo: float = 120.0, level: float = -20.0) -> dict[str, Any]:

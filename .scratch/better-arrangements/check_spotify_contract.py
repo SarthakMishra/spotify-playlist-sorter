@@ -12,8 +12,8 @@ from unittest.mock import Mock, patch
 from requests import Response
 from spotipy import SpotifyException
 
-from app.playlist_sorter import SpotifyPlaylistSorter
-from app.spotify_auth import get_all_playlists, get_spotify_client
+from api.playlist_sorter import SpotifyPlaylistSorter
+from api.spotify_auth import get_all_playlists, get_spotify_client
 
 PLAYLIST = "p" * 22
 TRACK = "a" * 22

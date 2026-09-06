@@ -33,7 +33,7 @@ Use the terms in [CONTEXT.md](../../CONTEXT.md). In particular, a playlist entry
 | Percentage match scores and an RMS-based energy chart | Explain estimated changes without claiming percentages of musical quality |
 | Snapshot, revision, session and interrupted-save checks | Preserve and extend them to every new control |
 
-The relevant code is [playlist_sorter.py](../../app/playlist_sorter.py), [app.py](../../app/app.py), [playlist-page.tsx](../../frontend/src/components/playlist-page.tsx), and [song-details.tsx](../../frontend/src/components/song-details.tsx). The existing browser regression in [test_api.py](../../tests/test_api.py) demonstrates that the preview can omit intervening fixed entries.
+The relevant code is [playlist_sorter.py](../../api/playlist_sorter.py), [app.py](../../api/app.py), [playlist-page.tsx](../../frontend/src/components/playlist-page.tsx), and [song-details.tsx](../../frontend/src/components/song-details.tsx). The existing browser regression in [test_api.py](../../tests/test_api.py) demonstrates that the preview can omit intervening fixed entries.
 
 Repository investigation also found two extraction errors. The custom chroma routine maps a 440 Hz tone to pitch-class zero even though key detection expects A at nine. Resampling after truncation scales amplitude using the original file length. Both were reproduced with generated audio during investigation. Replacing these routines requires regression checks and invalidating existing feature caches; old estimates must not silently survive the upgrade.
 
@@ -151,7 +151,7 @@ Warm arrangement targets are under 2 seconds for 100 entries and under 5 seconds
 
 ## Implementation boundaries
 
-Keep FastAPI, React, current shadcn controls, Recharts, sessions, and the move-only Spotify writer. Keep scoring helpers independent of network calls so generated features can exercise them offline, initially within `app/playlist_sorter.py`. Do not create a provider framework or rewrite the app to obtain that separation.
+Keep FastAPI, React, current shadcn controls, Recharts, sessions, and the move-only Spotify writer. Keep scoring helpers independent of network calls so generated features can exercise them offline, initially within `api/playlist_sorter.py`. Do not create a provider framework or rewrite the app to obtain that separation.
 
 Extend `Track` into a complete entry representation with nullable measurements, item kind, original position, duration, fixed reason and recording status. Extend `SortRequest` with a validated profile enum and optional first/last occurrence identifiers. Update `JobView` to expose the complete original and suggested sequence, analysis coverage and only the explanations needed by the UI. Keep the saved arrangement and its revision on the server. Reject unknown profiles, foreign occurrence IDs and conflicting pins.
 

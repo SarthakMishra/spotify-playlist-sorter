@@ -16,7 +16,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import soundfile as sf
 
-from app import audio_analysis, playlist_sorter
+from api import audio_analysis, playlist_sorter
 
 
 def recording(track: dict[str, Any], **_kwargs: object) -> dict[str, Any]:

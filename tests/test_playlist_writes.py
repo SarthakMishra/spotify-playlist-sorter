@@ -12,8 +12,8 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
-from app.app import COOKIE, Job, JobView, Session, _tracks, create_app
-from app.playlist_sorter import SpotifyPlaylistSorter
+from api.app import COOKIE, Job, JobView, Session, _tracks, create_app
+from api.playlist_sorter import SpotifyPlaylistSorter
 
 PLAYLIST = "p" * 22
 

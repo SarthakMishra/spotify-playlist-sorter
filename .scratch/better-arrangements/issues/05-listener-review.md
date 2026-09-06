@@ -52,6 +52,6 @@ The [browser check](../check_preview.cjs) passed at 1280px light and 390px dark 
 
 Screenshots: [desktop analysis progress](../light-1280-analysis-progress.png), [mobile comparison](../dark-390-time-comparison.png), [desktop comparison](../light-1280-time-comparison.png), [interrupted check](../dark-390-interrupted-check.png).
 
-Implementation locations: [job progress and API](../../../app/app.py), [review evidence](../../../app/playlist_sorter.py), [page and states](../../../frontend/src/components/playlist-page.tsx), [comparison](../../../frontend/src/components/song-details.tsx), [timeline helpers](../../../frontend/src/lib/review.ts).
+Implementation locations: [job progress and API](../../../api/app.py), [review evidence](../../../api/playlist_sorter.py), [page and states](../../../frontend/src/components/playlist-page.tsx), [comparison](../../../frontend/src/components/song-details.tsx), [timeline helpers](../../../frontend/src/lib/review.ts).
 
 Source/access permission and listener preference remain unverified as recorded earlier. No live media download or Spotify mutation was performed. Next frontier: ticket 06, verified saving and one safe session restore.

@@ -3,8 +3,8 @@ import json
 import re
 from time import perf_counter
 import yt_dlp
-from app.playlist_sorter import SpotifyPlaylistSorter, _metadata, _shortlist, _rank_recordings
-from app.youtube import youtube_options
+from api.playlist_sorter import SpotifyPlaylistSorter, _metadata, _shortlist, _rank_recordings
+from api.youtube import youtube_options
 
 for track in [
  {'id':'probe-tension','Track':'Tension','Artist':'Diljit Dosanjh','duration_ms':168200},

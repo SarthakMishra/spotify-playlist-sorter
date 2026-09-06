@@ -1,7 +1,7 @@
 """Retry an owner-selected playlist recording anonymously with fresh yt-dlp extraction."""
 import re
 from time import perf_counter
-from app.playlist_sorter import SpotifyPlaylistSorter
+from api.playlist_sorter import SpotifyPlaylistSorter
 
 source={'id':'rrim6_9VSeM','url':'https://www.youtube.com/watch?v=rrim6_9VSeM','duration':252}
 started=perf_counter()

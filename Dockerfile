@@ -24,11 +24,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends libsndfile1 lib
 COPY --from=frontend /usr/local/bin/node /usr/local/bin/node
 COPY --from=mwader/static-ffmpeg:9.0.1 /ffmpeg /usr/local/bin/ffmpeg
 COPY --from=builder /app/.venv /app/.venv
-COPY app /app/app
+COPY api /app/api
 COPY --from=frontend /web/dist /app/frontend/dist
 ENV PATH="/app/.venv/bin:$PATH"
 WORKDIR /app
 USER sorter
 EXPOSE 8000
 HEALTHCHECK CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
-ENTRYPOINT ["uvicorn", "app.app:app", "--host=0.0.0.0", "--port=8000", "--workers=1", "--no-access-log"]
+ENTRYPOINT ["uvicorn", "api.app:app", "--host=0.0.0.0", "--port=8000", "--workers=1", "--no-access-log"]

@@ -54,7 +54,7 @@ The initial [spec](../.scratch/better-arrangements/spec.md#match-the-recording-b
 
 ## Implemented extraction and measured limits
 
-Ticket 03 implements [audio_analysis.py](../app/audio_analysis.py) with librosa 1.0.0. The loader streams five-second native blocks through librosa's stateful resampler into one mono float32 buffer. Using one-sample frames/hops for decoding makes an integer-second block align with any integer native sample rate. Spectral analysis then uses overlapping frames in bounded thirty-second blocks and carries the previous log-power frame across blocks for onset differences. No learned model is used.
+Ticket 03 implements [audio_analysis.py](../api/audio_analysis.py) with librosa 1.0.0. The loader streams five-second native blocks through librosa's stateful resampler into one mono float32 buffer. Using one-sample frames/hops for decoding makes an integer-second block align with any integer native sample rate. Spectral analysis then uses overlapping frames in bounded thirty-second blocks and carries the previous log-power frame across blocks for onset differences. No learned model is used.
 
 Evidence strengths are heuristics, not probabilities. Single pitches do not receive major/minor key labels; silence and generated aperiodic noise do not receive tempo estimates. The rhythm measurement removes the onset activity baseline before checking autocorrelation peaks, then retains competing tempo candidates and reduces ambiguous evidence. Short excerpts have less support. Raw level/activity measurements stay in the cache; intensity normalization happens per playlist.
 

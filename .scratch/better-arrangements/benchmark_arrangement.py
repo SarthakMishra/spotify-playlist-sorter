@@ -10,7 +10,7 @@ from unittest.mock import Mock
 
 import numpy as np
 
-from app.playlist_sorter import SpotifyPlaylistSorter
+from api.playlist_sorter import SpotifyPlaylistSorter
 
 count = int(sys.argv[1])
 rng = np.random.default_rng(42)

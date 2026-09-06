@@ -23,9 +23,9 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from spotipy.exceptions import SpotifyOauthError
 
-from app.playlist_sorter import Profile, SpotifyPlaylistSorter
-from app.spotify_auth import get_all_playlists, get_auth_manager, get_redirect_uri, get_spotify_client, is_configured
-from app.youtube import SourceAccessError, access_status, validate_cookie_text
+from api.playlist_sorter import Profile, SpotifyPlaylistSorter
+from api.spotify_auth import get_all_playlists, get_auth_manager, get_redirect_uri, get_spotify_client, is_configured
+from api.youtube import SourceAccessError, access_status, validate_cookie_text
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable

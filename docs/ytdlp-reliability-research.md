@@ -6,7 +6,7 @@ The first changes should reduce unnecessary video requests, distinguish source f
 
 ## What the current application does
 
-At the start of this investigation, `_analyze_track` in [playlist_sorter.py](../app/playlist_sorter.py) searched ten results with full extraction enabled. It then extracted the selected video again to download it. `download=False` prevented media downloading but did not prevent extraction of every search result. Search errors were ignored and warnings hidden, so a failed extraction could eventually produce the same "Recording uncertain" result as an actual metadata ambiguity.
+At the start of this investigation, `_analyze_track` in [playlist_sorter.py](../api/playlist_sorter.py) searched ten results with full extraction enabled. It then extracted the selected video again to download it. `download=False` prevented media downloading but did not prevent extraction of every search result. Search errors were ignored and warnings hidden, so a failed extraction could eventually produce the same "Recording uncertain" result as an actual metadata ambiguity.
 
 The matcher also demanded a 0.10 gap between the two highest scores. Two uploads with equally strong title, artist and duration evidence therefore both became unusable. It compared every artist name literally and treated uploader text as interchangeable with structured artist metadata. The cache retained only successful analyses. Rechecking unsuccessful songs repeated their source work.
 
@@ -78,7 +78,7 @@ Keep offline tests for request counts, structured metadata, conflicting versions
 
 ## Implemented result and validation
 
-Implemented on 2026-09-06 in [playlist_sorter.py](../app/playlist_sorter.py), [YouTube access](../app/youtube.py) and the [setup page](../frontend/src/components/youtube-access.tsx). Cookies remain optional. With no upload or configured source, yt-dlp receives no cookie settings and continues anonymously. The owner can explicitly select anonymous access even when a server cookie source exists. The app's short explanation says cookies can help find the correct recording when YouTube requires sign-in, and are used for searches and audio downloads.
+Implemented on 2026-09-06 in [playlist_sorter.py](../api/playlist_sorter.py), [YouTube access](../api/youtube.py) and the [setup page](../frontend/src/components/youtube-access.tsx). Cookies remain optional. With no upload or configured source, yt-dlp receives no cookie settings and continues anonymously. The owner can explicitly select anonymous access even when a server cookie source exists. The app's short explanation says cookies can help find the correct recording when YouTube requires sign-in, and are used for searches and audio downloads.
 
 The resolver now searches ten flat results, filters known title/duration/version conflicts and fully extracts at most three promising candidates. Downloads reuse the chosen full info dictionary in memory. Structured track names retain genuine title words and artist names; credited-feature display suffixes are normalized without dropping later version qualifiers. Exact structured title, every expected artist and album agreement may pass without the upload-only margin. The 0.85 minimum score and hard duration/version checks remain; weaker candidates still need the 0.10 margin. Both the specification and the earlier librosa research now record this correction.
 

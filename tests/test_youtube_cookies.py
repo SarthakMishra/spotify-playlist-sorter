@@ -16,8 +16,8 @@ from unittest.mock import Mock, patch
 from fastapi.testclient import TestClient
 from yt_dlp.cookies import YDLLogger, YoutubeDLCookieJar
 
-from app import playlist_sorter, youtube
-from app.app import COOKIE, Job, JobView, Session, create_app
+from api import playlist_sorter, youtube
+from api.app import COOKIE, Job, JobView, Session, create_app
 
 COOKIES = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t4102444800\tSID\tprivate-cookie\n"
 UNRELATED = ".example.com\tTRUE\t/\tTRUE\t4102444800\tsecret\tunrelated-secret\n"

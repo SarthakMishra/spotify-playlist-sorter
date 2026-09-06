@@ -4,7 +4,7 @@ Checked on 2026-09-05. Sources below are official documentation, project-owned r
 
 ## Recommendation
 
-Use a Vite React TypeScript app, React Router, Tailwind v4 and the requested shadcn preset. Build the frontend once and serve `frontend/dist` through FastAPI. Keep the current sequence: connect Spotify, pick a playlist, analyze its songs, pick the first song, preview the new order, and explicitly save it. Existing transition details and charts belong behind a disclosure. These requirements come from `app/app.py` and `README.md`.
+Use a Vite React TypeScript app, React Router, Tailwind v4 and the requested shadcn preset. Build the frontend once and serve `frontend/dist` through FastAPI. Keep the current sequence: connect Spotify, pick a playlist, analyze its songs, pick the first song, preview the new order, and explicitly save it. Existing transition details and charts belong behind a disclosure. These requirements come from `api/app.py` and `README.md`.
 
 The current app has no audio playback, genre filtering, file uploads or manual drag sorting. The registry research below identifies reusable options without adding those features to this migration.
 

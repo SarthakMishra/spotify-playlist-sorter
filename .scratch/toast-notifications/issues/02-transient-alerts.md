@@ -17,7 +17,7 @@ The YouTube access page added to the worktree during this pass now uses toasts f
 
 Toast actions now sit below the message, fixing the unreadable narrow text column at 320px without adding dependencies.
 
-Validation: the [browser check](../check.cjs) passed at 1280px/light, 390px/dark, and 320px/light with mocked API requests. It covers the reported fetch failure, request retry, dismissal and recovery, navigation cleanup, interrupted saves, keyboard access, and YouTube feedback/validation. Accessibility checks exclude Base UI's invisible focus guards and inspect urgent toasts while focused, when Base UI exposes their controls. Frontend lint, formatting, types, production build, and `git diff --check` passed. `task check` stops on two existing Python lint errors in `app/youtube.py`.
+Validation: the [browser check](../check.cjs) passed at 1280px/light, 390px/dark, and 320px/light with mocked API requests. It covers the reported fetch failure, request retry, dismissal and recovery, navigation cleanup, interrupted saves, keyboard access, and YouTube feedback/validation. Accessibility checks exclude Base UI's invisible focus guards and inspect urgent toasts while focused, when Base UI exposes their controls. Frontend lint, formatting, types, production build, and `git diff --check` passed. `task check` stops on two existing Python lint errors in `api/youtube.py`.
 
 Screenshots: [desktop](../light-1280-polling-error.png), [dark mobile](../dark-390-polling-error.png), [320px](../light-320-polling-error.png).
 

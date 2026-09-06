@@ -18,7 +18,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.0.1
         with:
           version: "0.12.10"
           python-version: "3.13"
@@ -34,8 +34,8 @@ jobs:
           pnpm --dir frontend install --frozen-lockfile
       - name: Check Python
         run: |
-          uv run ruff check app tests
-          uv run ruff format --check app tests
+          uv run ruff check api tests
+          uv run ruff format --check api tests
           uv run ty check
           uv run python -m unittest discover -s tests -v
       - name: Check and build frontend
