@@ -19,7 +19,7 @@ def is_configured() -> bool:
 
 def get_redirect_uri() -> str:
     """Use the public browser origin, including Vite's port during development."""
-    return os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8000/api/auth/callback")
+    return os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:5178/api/auth/callback")
 
 
 def get_auth_manager(state: str) -> SpotifyOAuth:

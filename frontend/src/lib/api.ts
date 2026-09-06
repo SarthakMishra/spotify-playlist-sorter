@@ -5,33 +5,90 @@ export type Session = {
 }
 
 export type Playlist = { id: string; name: string; total: number; image: string | null }
+export type Profile = "smooth" | "variety"
 export type Track = {
   occurrence: string
-  id: string
+  original_position: number
+  id: string | null
+  duration_ms: number | null
+  kind: string
+  fixed_reason: string | null
+  analysis_status:
+    | "pending"
+    | "matching"
+    | "downloading"
+    | "analyzing"
+    | "ready"
+    | "uncertain"
+    | "error"
+    | "fixed"
   name: string
   artist: string
-  key: string
-  bpm: number
-  energy: number
+  key: string | null
+  bpm: number | null
+  energy: number | null
 }
 export type Transition = {
   index: number
   track1_name: string
   track2_name: string
-  key1: string
-  key2: string
+  track1_occurrence: string
+  track2_occurrence: string
   bpm_diff: number | null
   energy_diff: number | null
   score: number | null
+  components: Record<"tempo" | "intensity" | "texture" | "chroma", number | null>
+  evidence: Record<"tempo" | "intensity" | "texture" | "chroma", number>
 }
 export type Job = {
   playlist_id: string
   revision: string
   name: string
-  status: "analyzing" | "ready" | "sorting" | "saving" | "saved" | "error"
+  status:
+    | "analyzing"
+    | "ready"
+    | "sorting"
+    | "saving"
+    | "saved"
+    | "restoring"
+    | "restored"
+    | "error"
+  can_restore: boolean
   completed: number
   total: number
   kept_count: number
+  cached_count: number
+  recording_count: number
+  metadata_loaded: boolean
+  analyzed_count: number
+  profile: Profile
+  first_occurrence: string | null
+  last_occurrence: string | null
+  arrangement: {
+    version: number
+    cost: number | null
+    baseline_cost: number | null
+    terms: { transition: number; repetition: number; monotony: number } | null
+    evaluations: number
+    assessed_edges: number | null
+    total_edges: number
+    limited: boolean
+    unchanged: boolean
+    same_as_other_profile: boolean | null
+  } | null
+  review: {
+    original_assessed: number | null
+    suggested_assessed: number | null
+    total_edges: number
+    highlights: {
+      index: number
+      text: string
+      track1_occurrence: string
+      track2_occurrence: string
+      track1_name: string
+      track2_name: string
+    }[]
+  } | null
   tracks: Track[]
   sorted_tracks: Track[]
   transitions: Transition[]
@@ -65,5 +122,14 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
 }
 
 export function isWorking(job: Job | null) {
-  return !!job && ["analyzing", "sorting", "saving"].includes(job.status)
+  return !!job && ["analyzing", "sorting", "saving", "restoring"].includes(job.status)
+}
+
+export type YouTubeAccess = {
+  mode: "server" | "upload" | "anonymous"
+  server_source: "file" | "browser" | "anonymous"
+  browser: string | null
+  node_available: boolean
+  scripts_available: boolean
+  yt_dlp_version: string
 }

@@ -22,13 +22,14 @@ import {
   Music2,
   RefreshCw,
   Search,
+  Settings,
 } from "lucide-react"
-import { Button } from "@/components/ui/button"
+import { Button, buttonVariants } from "@/components/ui/button"
 import { ModeToggle } from "@/components/mode-toggle"
 import { Input } from "@/components/ui/input"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { toast } from "@/components/ui/toast"
-import { api, ApiError, type Job, type Playlist, type Session } from "@/lib/api"
+import { api, ApiError, type Job, type Playlist, type Session, type YouTubeAccess } from "@/lib/api"
 
 function Loading({ className = "min-h-dvh" }: { className?: string }) {
   return (
@@ -97,6 +98,20 @@ function Shell() {
                 Refresh
               </Button>
             )}
+            {session.user && (
+              <Link
+                to="/youtube"
+                className={buttonVariants({
+                  variant: "ghost",
+                  size: "sm",
+                  className:
+                    "gap-2 text-muted-foreground focus-visible:text-foreground max-sm:flex-1",
+                })}
+              >
+                <Settings aria-hidden="true" />
+                Settings
+              </Link>
+            )}
             <ModeToggle />
             {session.user && (
               <Button
@@ -161,17 +176,17 @@ function Welcome() {
         in a smoother order.
       </h1>
       <p className="mt-5 max-w-sm text-base leading-7 text-muted-foreground">
-        Pick the first song. We'll find a smooth order for the rest.
+        Pick a playlist. Choose a smooth flow or more variety, then review the order before saving.
       </p>
       {session?.configured ? (
-        <Button
-          size="lg"
-          className="mt-8"
-          render={<a aria-label="Connect Spotify" href="/api/auth/login" />}
+        <a
+          className={buttonVariants({ size: "lg", className: "mt-8" })}
+          aria-label="Connect Spotify"
+          href="/api/auth/login"
         >
           Connect Spotify
           <ArrowRight aria-hidden="true" />
-        </Button>
+        </a>
       ) : (
         <Alert className="mt-8">
           <AlertDescription>Spotify isn't set up yet. Please try again later.</AlertDescription>
@@ -276,9 +291,9 @@ function RouteError() {
       </p>
       <div className="mt-6 flex gap-3">
         <Button onClick={() => window.location.reload()}>Try again</Button>
-        <Button variant="outline" render={<a aria-label="Go back" href="/" />}>
+        <a className={buttonVariants({ variant: "outline" })} aria-label="Go back" href="/">
           Go back
-        </Button>
+        </a>
       </div>
     </main>
   )
@@ -317,6 +332,20 @@ export const router = createBrowserRouter([
             }),
           },
         ],
+      },
+      {
+        path: "youtube",
+        loader: async ({ request }) => {
+          try {
+            return await api<YouTubeAccess>("/youtube", { signal: request.signal })
+          } catch (error) {
+            if (error instanceof ApiError && error.status === 401) throw redirectDocument("/")
+            throw error
+          }
+        },
+        lazy: async () => ({
+          Component: (await import("@/components/youtube-access")).YouTubeAccessPage,
+        }),
       },
       {
         path: "*",

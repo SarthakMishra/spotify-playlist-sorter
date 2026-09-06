@@ -4,14 +4,16 @@ version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.141.1",
+    "librosa>=1.0.0",
     "numpy>=2.5.2",
     "pandas>=3.0.5",
     "pydantic>=2.13.5",
     "python-dotenv>=1.2.3",
+    "secretstorage>=3.3.3 ; sys_platform == 'linux'",
     "soundfile>=0.14.0",
     "spotipy>=2.26.0",
     "uvicorn>=0.52.4",
-    "yt-dlp>=2026.8.19",
+    "yt-dlp[default]>=2026.8.19",
 ]
 
 [dependency-groups]

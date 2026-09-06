@@ -3,11 +3,11 @@ services:
     build: .
     image: ghcr.io/sarthakmishra/spotify-playlist-sorter:latest
     ports:
-      - "8000:8000"
+      - "5178:8000"
     environment:
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
-      - SPOTIFY_REDIRECT_URI=${SPOTIFY_REDIRECT_URI:-http://127.0.0.1:8000/api/auth/callback}
+      - SPOTIFY_REDIRECT_URI=${SPOTIFY_REDIRECT_URI:-http://127.0.0.1:5178/api/auth/callback}
       - YOUTUBE_COOKIES_FILE=${YOUTUBE_COOKIES_FILE:-}
     # Optional YouTube cookies. The app only reads this file.
     # volumes:
