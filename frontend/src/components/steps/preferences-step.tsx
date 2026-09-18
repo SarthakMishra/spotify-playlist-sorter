@@ -19,15 +19,8 @@ import {
 } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import type { Preset, Track } from "@/lib/api"
-import {
-  PRESETS,
-  SLIDERS,
-  describeSlider,
-  luckyPreferences,
-  presetValues,
-  type Preferences,
-} from "@/lib/preferences"
+import type { Options, Preset, Track } from "@/lib/api"
+import { PRESETS, SLIDERS, describeSlider, luckyPreferences, presetValues } from "@/lib/preferences"
 
 type PlacementChoice = "keep" | "top" | "bottom" | "custom"
 
@@ -129,8 +122,8 @@ export function PreferencesStep({
   hasPreview,
   onArrange,
 }: {
-  preferences: Preferences
-  onPreferencesChange: (preferences: Preferences) => void
+  preferences: Options
+  onPreferencesChange: (preferences: Options) => void
   busy: boolean
   canSort: boolean
   choices: Track[]
@@ -155,7 +148,6 @@ export function PreferencesStep({
   const [defaultPlacement, setDefaultPlacement] = useState<"keep" | "top" | "bottom">("keep")
   const [moreOpen, setMoreOpen] = useState(!!fixedTracks.length)
   const heading = useRef<HTMLHeadingElement>(null)
-  const busyBlocked = busy
   useEffect(() => {
     heading.current?.focus()
   }, [])
@@ -283,7 +275,7 @@ export function PreferencesStep({
               }}
               aria-label={`${slider.label}. ${slider.hint}`}
               aria-describedby={`slider-${slider.key}-value`}
-              disabled={busyBlocked}
+              disabled={busy}
             />
           </div>
         ))}
@@ -322,7 +314,7 @@ export function PreferencesStep({
               )}
             </div>
             {fixedTracks.length > 0 && (
-              <fieldset disabled={busyBlocked} className="min-w-0">
+              <fieldset disabled={busy} className="min-w-0">
                 <legend className="text-sm font-medium">Items that can't be analyzed</legend>
                 {placementMode === "all" ? (
                   <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2">
@@ -477,7 +469,7 @@ export function PreferencesStep({
           </CollapsibleTrigger>
           <Button
             onClick={onArrange}
-            disabled={busyBlocked || placementConflict !== null}
+            disabled={busy || placementConflict !== null}
             size="lg"
             className="min-w-0 flex-1"
           >

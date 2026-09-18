@@ -1,19 +1,17 @@
 import type { Options, Preset, Track } from "@/lib/api"
 
-export type Preferences = Options
-
-export const DEFAULT_PREFERENCES: Preferences = {
+export const DEFAULT_PREFERENCES: Options = {
   preset: "steady",
   pace: 0.5,
   energy: 0.5,
   variety: 0.5,
 }
 
-export type PresetMeta = {
+type PresetMeta = {
   value: Preset
   label: string
   description: string
-  values: Pick<Preferences, "pace" | "energy" | "variety">
+  values: Pick<Options, "pace" | "energy" | "variety">
 }
 
 // Presets are named starting points; the sliders remain the real state so every
@@ -45,7 +43,7 @@ export const PRESETS: PresetMeta[] = [
   },
 ]
 
-export type SliderMeta = {
+type SliderMeta = {
   key: "pace" | "energy" | "variety"
   label: string
   low: string
@@ -79,7 +77,7 @@ export const SLIDERS: SliderMeta[] = [
   },
 ]
 
-export function presetValues(preset: Preset): Pick<Preferences, "pace" | "energy" | "variety"> {
+export function presetValues(preset: Preset): Pick<Options, "pace" | "energy" | "variety"> {
   return PRESETS.find((presetMeta) => presetMeta.value === preset)?.values ?? DEFAULT_PREFERENCES
 }
 
@@ -109,7 +107,7 @@ function jitter(): number {
   return Math.round((Math.random() * 0.8 + 0.1) * 100) / 100
 }
 
-export function luckyPreferences(): Preferences {
+export function luckyPreferences(): Options {
   const picked = PRESETS[Math.floor(Math.random() * PRESETS.length)]
   const preset = picked ?? PRESETS[0]
   if (!preset) return DEFAULT_PREFERENCES

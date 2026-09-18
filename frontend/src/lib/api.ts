@@ -45,18 +45,6 @@ export type Candidate = {
   live: boolean
   suggested: boolean
 }
-export type Transition = {
-  index: number
-  track1_name: string
-  track2_name: string
-  track1_occurrence: string
-  track2_occurrence: string
-  bpm_diff: number | null
-  energy_diff: number | null
-  score: number | null
-  components: Record<"tempo" | "intensity" | "texture" | "chroma", number | null>
-  evidence: Record<"tempo" | "intensity" | "texture" | "chroma", number>
-}
 export type ReviewHighlight = NonNullable<Job["review"]>["highlights"][number]
 export type Job = {
   playlist_id: string
@@ -75,8 +63,6 @@ export type Job = {
   completed: number
   total: number
   kept_count: number
-  cached_count: number
-  recording_count: number
   metadata_loaded: boolean
   analyzed_count: number
   options: Options
@@ -84,21 +70,8 @@ export type Job = {
   last_occurrence: string | null
   placements: Record<string, number>
   arrangement: {
-    version: number
-    cost: number | null
-    baseline_cost: number | null
-    terms: {
-      transition: number
-      repetition: number
-      monotony: number
-      pace: number
-      energy: number
-    } | null
-    evaluations: number
-    assessed_edges: number | null
-    total_edges: number
-    limited: boolean
     unchanged: boolean
+    limited: boolean
   } | null
   review: {
     original_assessed: number | null
@@ -115,7 +88,6 @@ export type Job = {
   } | null
   tracks: Track[]
   sorted_tracks: Track[]
-  transitions: Transition[]
   error: string | null
 }
 

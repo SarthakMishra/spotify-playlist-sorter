@@ -14,11 +14,12 @@ import {
   isRematchStage,
   isWorking,
   type Job,
+  type Options,
   type Playlist,
   type Session,
   type Track,
 } from "@/lib/api"
-import { DEFAULT_PREFERENCES, matchAttention, type Preferences } from "@/lib/preferences"
+import { DEFAULT_PREFERENCES, matchAttention } from "@/lib/preferences"
 
 type StepId = "check" | "preferences" | "review"
 
@@ -57,7 +58,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
   const [step, setStep] = useState<StepId>(() => initialStep(initialJob))
   const [error, setError] = useState("")
   const [pending, setPending] = useState<"analyze" | "sort" | "save" | "restore" | null>(null)
-  const [preferences, setPreferences] = useState<Preferences>(
+  const [preferences, setPreferences] = useState<Options>(
     initialJob?.options
       ? {
           preset: initialJob.options.preset,

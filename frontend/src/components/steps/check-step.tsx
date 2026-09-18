@@ -10,7 +10,7 @@ import {
 import { cn } from "cn"
 import { Button } from "@/components/ui/button"
 import { MatchFixDialog } from "@/components/match-fix-dialog"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import type { Session, Track } from "@/lib/api"
 import { matchAttention } from "@/lib/preferences"
@@ -131,15 +131,9 @@ export function CheckStep({
   useEffect(() => {
     heading.current?.focus()
   }, [])
+  const shown = issuesOnly ? noted : tracks
   return (
-    <Tabs
-      value={issuesOnly ? "issues" : "all"}
-      onValueChange={(value) => {
-        if (value === "issues") setIssuesOnly(true)
-        else if (value === "all") setIssuesOnly(false)
-      }}
-      className="space-y-5"
-    >
+    <section className="space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0">
           <h2
@@ -159,45 +153,40 @@ export function CheckStep({
           </p>
         </div>
         {noted.length > 0 && (
-          <TabsList aria-label="Which songs to show">
-            <TabsTrigger value="issues">Issues</TabsTrigger>
-            <TabsTrigger value="all">All songs</TabsTrigger>
-          </TabsList>
+          <ToggleGroup
+            value={[issuesOnly ? "issues" : "all"]}
+            onValueChange={(values: unknown[]) => {
+              const next = values[0]
+              if (next === "issues" || next === "all") setIssuesOnly(next === "issues")
+            }}
+            aria-label="Which songs to show"
+          >
+            <ToggleGroupItem value="issues" size="sm">
+              Issues
+            </ToggleGroupItem>
+            <ToggleGroupItem value="all" size="sm">
+              All songs
+            </ToggleGroupItem>
+          </ToggleGroup>
         )}
       </div>
-      <TabsContent value="issues">
-        <ul className="divide-y">
-          {noted.map((track) => (
-            <MatchRow
-              key={track.occurrence}
-              track={track}
-              attention={matchAttention(track)}
-              session={session}
-              disabled={busy}
-              onApplied={onApplied}
-            />
-          ))}
-        </ul>
-      </TabsContent>
-      <TabsContent value="all">
-        <ul className="divide-y">
-          {tracks.map((track) => (
-            <MatchRow
-              key={track.occurrence}
-              track={track}
-              attention={matchAttention(track)}
-              session={session}
-              disabled={busy}
-              onApplied={onApplied}
-            />
-          ))}
-        </ul>
-      </TabsContent>
+      <ul className="divide-y">
+        {shown.map((track) => (
+          <MatchRow
+            key={track.occurrence}
+            track={track}
+            attention={matchAttention(track)}
+            session={session}
+            disabled={busy}
+            onApplied={onApplied}
+          />
+        ))}
+      </ul>
       <div className="flex items-center gap-3">
         <Button onClick={onContinue} disabled={busy} size="lg" className="min-w-0 flex-1">
           {noted.some((track) => matchAttention(track) === "fix") ? "Continue anyway" : "Continue"}
         </Button>
       </div>
-    </Tabs>
+    </section>
   )
 }

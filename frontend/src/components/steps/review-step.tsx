@@ -1,4 +1,4 @@
-import { Fragment, Suspense, lazy } from "react"
+import { Fragment } from "react"
 import { CircleAlert } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import {
@@ -16,28 +16,14 @@ import { StatusBadge } from "@/components/steps/check-step"
 import type { Job, ReviewHighlight, Track } from "@/lib/api"
 import { measuredIntensity, intensityLabel } from "@/lib/review"
 
-const SongDetails = lazy(() => import("@/components/song-details"))
-const SlopeGraph = lazy(() => import("@/components/slope-graph"))
-
-// Warm the lazily loaded details chunks before their sections are opened.
-const preloadSongDetails = () => {
-  void import("@/components/song-details")
-}
-const preloadSlopeGraph = () => {
-  void import("@/components/slope-graph")
-}
-
-function VerdictLine({ job }: { job: Job }) {
-  const moved = job.sorted_tracks.filter(
-    (track, index) => track.original_position + 1 !== index + 1,
-  ).length
+function VerdictLine({ job, movedCount }: { job: Job; movedCount: number }) {
   const review = job.review
   const highlightCount = review?.highlights.length ?? 0
   const assessed = review?.suggested_assessed
   const parts: string[] = [
-    moved === 0
+    movedCount === 0
       ? "No songs moved."
-      : `${moved} of ${job.sorted_tracks.length} ${moved === 1 ? "song" : "songs"} moved.`,
+      : `${movedCount} of ${job.sorted_tracks.length} ${movedCount === 1 ? "song" : "songs"} moved.`,
   ]
   if (assessed != null && assessed > 0)
     parts.push(
@@ -75,25 +61,30 @@ function IntensityCell({ track }: { track: Track }) {
   )
 }
 
+function SoundCell({ track }: { track: Track }) {
+  const sound = [track.key, track.bpm == null ? null : Math.round(track.bpm)]
+    .filter((part) => part !== null)
+    .join(" · ")
+  if (!sound)
+    return (
+      <span className="text-xs text-muted-foreground/40" aria-label="Key and tempo unavailable">
+        —
+      </span>
+    )
+  return <span className="text-xs text-muted-foreground tabular-nums">{sound}</span>
+}
+
 function TransitionMarker({ note }: { note: ReviewHighlight }) {
   return (
     <TableMarkerRow>
       <TableCell
-        colSpan={5}
-        aria-label={`Transition note between ${note.track1_name} and ${note.track2_name}: ${note.text}`}
-        className="py-2 pr-3 pl-9"
+        colSpan={6}
+        aria-label={`Between ${note.track1_name} and ${note.track2_name}: ${note.text}`}
+        className="py-2 pr-3 pl-9 whitespace-normal"
       >
         <p className="flex items-start gap-2.5 text-xs leading-5 text-muted-foreground">
           <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-warning" aria-hidden="true" />
-          <span className="min-w-0">
-            <span className="font-medium text-foreground">
-              {note.track1_name} → {note.track2_name}
-            </span>
-            <span className="mx-1.5 text-muted-foreground/60" aria-hidden="true">
-              ·
-            </span>
-            {note.text}
-          </span>
+          <span className="min-w-0 wrap-break-word">{note.text}</span>
         </p>
       </TableCell>
     </TableMarkerRow>
@@ -123,12 +114,13 @@ function SongList({
       <TableCaption className="sr-only">{label}</TableCaption>
       <TableHeader>
         <TableRow>
-          <TableHead className="w-12">#</TableHead>
+          <TableHead className="w-10">#</TableHead>
           <TableHead>Song</TableHead>
+          <TableHead className="w-24 text-right">Key · BPM</TableHead>
           <TableHead className="w-20">
             <span className="sr-only">Intensity</span>
           </TableHead>
-          <TableHead className="w-20 text-right">Was</TableHead>
+          <TableHead className="w-14 text-right">Was</TableHead>
           <TableHead className="w-14">
             <span className="sr-only">Analysis status</span>
           </TableHead>
@@ -152,6 +144,9 @@ function SongList({
                 <TableCell className="py-2.5 whitespace-normal">
                   <p className="font-medium wrap-break-word">{track.name}</p>
                   <p className="mt-0.5 wrap-break-word text-muted-foreground">{track.artist}</p>
+                </TableCell>
+                <TableCell className="py-2.5 text-right align-top">
+                  <SoundCell track={track} />
                 </TableCell>
                 <TableCell className="py-2.5 align-top">
                   <IntensityCell track={track} />
@@ -224,7 +219,9 @@ export function ReviewStep({
                     : ""}
           </p>
         )}
-        {showNotes && !job.arrangement?.unchanged && <VerdictLine job={job} />}
+        {showNotes && !job.arrangement?.unchanged && (
+          <VerdictLine job={job} movedCount={movedCount} />
+        )}
       </div>
       {job.can_restore && (
         <div className="space-y-2">
@@ -253,56 +250,6 @@ export function ReviewStep({
         label={job.status === "restored" ? "Restored song order" : "Suggested song order"}
         highlights={showNotes ? (job.review?.highlights ?? []) : []}
       />
-      {showNotes && (
-        <div className="space-y-3">
-          {movedCount > 0 && (
-            <details className="rounded-xl border p-4">
-              <summary
-                onMouseEnter={preloadSlopeGraph}
-                onFocus={preloadSlopeGraph}
-                className="cursor-pointer rounded-sm text-sm font-medium focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring"
-              >
-                What moved
-              </summary>
-              <div className="mt-4 space-y-6">
-                <Suspense
-                  fallback={
-                    <output className="block py-5 text-sm text-muted-foreground">
-                      Loading chart...
-                    </output>
-                  }
-                >
-                  <SlopeGraph tracks={job.sorted_tracks} />
-                </Suspense>
-              </div>
-            </details>
-          )}
-          <details className="rounded-xl border p-4">
-            <summary
-              onMouseEnter={preloadSongDetails}
-              onFocus={preloadSongDetails}
-              className="cursor-pointer rounded-sm text-sm font-medium focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring"
-            >
-              Details
-            </summary>
-            <div className="mt-4 space-y-6">
-              <Suspense
-                fallback={
-                  <output className="block py-5 text-sm text-muted-foreground">
-                    Loading details...
-                  </output>
-                }
-              >
-                <SongDetails
-                  original={job.tracks}
-                  tracks={job.sorted_tracks}
-                  transitions={job.transitions}
-                />
-              </Suspense>
-            </div>
-          </details>
-        </div>
-      )}
       <div className="space-y-3">
         {!(job.status === "saved" || job.status === "restored" || job.arrangement?.unchanged) && (
           <Button size="lg" className="w-full" onClick={onSave} disabled={busy || choicesChanged}>
