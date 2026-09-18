@@ -12,7 +12,6 @@ audio_files/
 .ruff_cache
 .cache
 .spotify_credentials
-cookies.txt
 node_modules/
 dist/
 .pnpm-store/

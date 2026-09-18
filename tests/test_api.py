@@ -270,7 +270,7 @@ class MigrationTest(unittest.TestCase):
                 patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features),
                 TestClient(app) as client,
             ):
-                session = Session(auth=Mock(), state="", user={"id": "listener"}, youtube_cookies="")
+                session = Session(auth=Mock(), state="", user={"id": "listener"})
                 app.state.sessions["test-session"] = session
                 client.cookies.set(COOKIE, "test-session")
                 headers = {"X-CSRF-Token": session.csrf}
@@ -381,7 +381,7 @@ class MigrationTest(unittest.TestCase):
             patch("api.app.get_spotify_client", return_value=sp),
             patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features) as analyze_audio,
         ):
-            session = Session(auth=Mock(), state="", user={"id": "listener"}, youtube_cookies="")
+            session = Session(auth=Mock(), state="", user={"id": "listener"})
             app.state.sessions["test-session"] = session
             client.cookies.set(COOKIE, "test-session")
             headers = {"X-CSRF-Token": session.csrf}
@@ -503,7 +503,7 @@ class MigrationTest(unittest.TestCase):
             TestClient(app) as client,
             ThreadPoolExecutor(max_workers=1) as requests,
         ):
-            session = Session(auth=Mock(), state="", user={"id": "listener"}, youtube_cookies="")
+            session = Session(auth=Mock(), state="", user={"id": "listener"})
             app.state.sessions["test-session"] = session
             client.cookies.set(COOKIE, "test-session")
             headers = {"X-CSRF-Token": session.csrf}
@@ -549,7 +549,7 @@ class MigrationTest(unittest.TestCase):
             patch("api.app.get_spotify_client", return_value=sp),
             patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", side_effect=RuntimeError("Interrupted")),
         ):
-            session = Session(auth=Mock(), state="", user={"id": "listener"}, youtube_cookies="")
+            session = Session(auth=Mock(), state="", user={"id": "listener"})
             app.state.sessions["test-session"] = session
             client.cookies.set(COOKIE, "test-session")
             headers = {"X-CSRF-Token": session.csrf}
@@ -571,9 +571,7 @@ class MigrationTest(unittest.TestCase):
         sp = Mock()
         sp.current_user_playlists.side_effect = SpotifyOauthError("invalid_grant", "Token expired")
         with TestClient(app) as client, patch("api.app.get_spotify_client", return_value=sp):
-            app.state.sessions["test-session"] = Session(
-                auth=Mock(), state="", user={"id": "listener"}, youtube_cookies=""
-            )
+            app.state.sessions["test-session"] = Session(auth=Mock(), state="", user={"id": "listener"})
             client.cookies.set(COOKIE, "test-session")
             assert client.get("/api/playlists").status_code == 401
             assert client.get("/api/session").json()["user"] is None

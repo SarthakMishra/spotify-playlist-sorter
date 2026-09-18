@@ -46,30 +46,9 @@ Previewing never changes Spotify. Saving moves existing entries and verifies the
 
 After a successful save, **Restore previous order** can undo it once, provided Spotify still matches the saved result. The option ends after use, a new playlist analysis, sign-out, session expiry or a server restart. An observed external edit or uncertain save also removes it. There is no permanent undo history.
 
-## Optional YouTube cookies
+## YouTube requirements
 
-The app works anonymously by default. If YouTube requires sign-in, open **YouTube access** and upload a Netscape-format cookie export containing only `youtube.com` cookies. Uploads stay in memory for your server-side session and disappear on sign-out, expiry or restart. Choose **Use without cookies** to return to anonymous access.
-
-To export from Chrome:
-
-1. Install [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) and allow it in Incognito.
-2. Open an Incognito window, sign in to YouTube, then open `https://www.youtube.com/robots.txt` in the same tab.
-3. Export only `youtube.com` cookies in Netscape text format, then close the Incognito window. Avoid reopening that session because YouTube rotates cookies in open sessions.
-4. Upload the file in the app and check the playlist again. Successful cached analyses are reused.
-
-See [yt-dlp's export guidance](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies). Cookie files can grant access to your account. Upload them only to a server you trust, and keep them out of git.
-
-You can also set `YOUTUBE_COOKIES_FILE` in `.env` to an existing export, or read a browser on the backend's computer:
-
-```dotenv
-YOUTUBE_BROWSER=chrome
-YOUTUBE_BROWSER_PROFILE=Default
-YOUTUBE_BROWSER_KEYRING=
-```
-
-The profile and Linux keyring settings are optional. A configured file takes precedence over the browser. Restart after changing `.env`. The app only reads these sources. If browser access or decryption fails, or the backend runs remotely or in Docker, upload an export instead. Docker Compose includes an example read-only file mount.
-
-Node must be available to the backend for yt-dlp's YouTube player challenges. If YouTube limits requests, wait before retrying; cookies do not remove rate limits. Checks process at most two recordings at once and cache successful analyses. Failed searches are retried on the next check.
+The app looks up recordings anonymously. Node must be available to the backend for yt-dlp's YouTube player challenges. If YouTube limits requests, wait before retrying. Checks process at most two recordings at once and cache successful analyses. Failed searches are retried on the next check.
 
 ## Development
 

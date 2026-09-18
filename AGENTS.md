@@ -35,7 +35,7 @@ Follow the history's Conventional Commits style, such as `feat: ...`, `fix(confi
 
 ## Security and configuration
 
-Copy `.env.example` to `.env`; keep credentials, tokens, cookie exports, and caches untracked. Follow `README.md` for exact Spotify callback URLs. Keep tokens server-side and YouTube cookie inputs read-only. Run one server worker because sessions and jobs live in memory.
+Copy `.env.example` to `.env`; keep credentials, tokens, and caches untracked. Follow `README.md` for exact Spotify callback URLs. Keep tokens server-side. Run one server worker because sessions and jobs live in memory.
 
 ## Agent skills
 

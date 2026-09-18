@@ -213,7 +213,7 @@ class AudioAnalysisTest(unittest.TestCase):
                 if url.startswith("ytsearch")
                 else next(entry for entry in search.return_value["entries"] if url.endswith(entry["id"]))
             )
-            result = playlist_sorter.SpotifyPlaylistSorter._analyze_track(track, cookie_text="")
+            result = playlist_sorter.SpotifyPlaylistSorter._analyze_track(track)
             assert result["status"] == "ready"
             assert result["source"]["id"] == fallback["id"]
             assert download.call_count == 2
@@ -221,13 +221,11 @@ class AudioAnalysisTest(unittest.TestCase):
             search.return_value = {"entries": [source, {**fallback, "duration": 180}]}
             download.side_effect = None
             download.return_value = sections
-            assert playlist_sorter.SpotifyPlaylistSorter._analyze_track(track, cookie_text="")["status"] == "ready"
+            assert playlist_sorter.SpotifyPlaylistSorter._analyze_track(track)["status"] == "ready"
             download.assert_called_once()
             search.reset_mock()
             assert (
-                playlist_sorter.SpotifyPlaylistSorter._analyze_track({**track, "duration_ms": 1201000}, cookie_text="")[
-                    "status"
-                ]
+                playlist_sorter.SpotifyPlaylistSorter._analyze_track({**track, "duration_ms": 1201000})["status"]
                 == "unsupported"
             )
             search.assert_not_called()
@@ -238,7 +236,6 @@ class AudioAnalysisTest(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as directory,
             patch.object(playlist_sorter, "_CACHE_FILE", Path(directory) / "cache.json"),
-            patch.object(playlist_sorter, "configured_cookies", return_value=""),
         ):
             cache_file = playlist_sorter._CACHE_FILE
             cache_file.write_text('{"a": {"tempo": 120}}', encoding="utf-8")
@@ -284,7 +281,6 @@ class AudioAnalysisTest(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as directory,
             patch.object(playlist_sorter, "_CACHE_FILE", Path(directory) / "cache.json"),
-            patch.object(playlist_sorter, "configured_cookies", return_value=""),
         ):
             sorter = playlist_sorter.SpotifyPlaylistSorter("playlist", Mock())
 

@@ -25,7 +25,6 @@ from spotipy.exceptions import SpotifyOauthError
 
 from api.playlist_sorter import Profile, SpotifyPlaylistSorter
 from api.spotify_auth import get_all_playlists, get_auth_manager, get_redirect_uri, get_spotify_client, is_configured
-from api.youtube import SourceAccessError, access_status, validate_cookie_text
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -103,7 +102,6 @@ class Session:
     csrf: str = field(default_factory=lambda: secrets.token_urlsafe(32))
     user: dict[str, str] = field(default_factory=dict)
     job: Job | None = None
-    youtube_cookies: str | None = None
     lock: Lock = field(default_factory=Lock)
 
 
@@ -139,13 +137,6 @@ class SortRequest(PreviewRequest):
     placements: dict[Annotated[str, Field(min_length=1, max_length=512)], Annotated[int, Field(ge=0)]] = Field(
         default_factory=dict
     )
-
-
-class YouTubeSettings(BaseModel):
-    """Select only this session's cookie source, never arbitrary server paths or profiles."""
-
-    mode: Literal["server", "upload", "anonymous"]
-    cookies: Annotated[str, Field(max_length=262144)] = ""
 
 
 def _lookup_session(request: Request) -> Session | None:
@@ -351,8 +342,6 @@ def _run_job(job: Job, action: str, release: Callable[[], None]) -> None:
             job.view = job.view.model_copy(update={"tracks": tracks, **_analysis_counts(tracks)})
         job.view = job.view.model_copy(update={"status": "error", "error": message})
     finally:
-        if action == "analyze":
-            job.sorter.youtube_cookies = None
         release()
 
 
@@ -491,26 +480,6 @@ def job_info(session: CurrentSession) -> JobView | None:
     return session.job.view if session.job else None
 
 
-@router.get("/api/youtube")
-def youtube_access(session: CurrentSession) -> dict[str, Any]:
-    """Describe available YouTube setup without opening a browser cookie store."""
-    return access_status(session.youtube_cookies)
-
-
-@router.post("/api/youtube")
-def set_youtube_access(body: YouTubeSettings, session: CurrentSession) -> dict[str, Any]:
-    """Keep a YouTube-only cookie export in this session until replaced or signed out."""
-    with session.lock:
-        if session.job and session.job.view.status in {"analyzing", "sorting", "saving", "restoring"}:
-            raise HTTPException(409, "Wait for the current playlist action to finish before changing YouTube access.")
-        try:
-            cookies = validate_cookie_text(body.cookies) if body.mode == "upload" else ""
-        except SourceAccessError as error:
-            raise HTTPException(422, str(error)) from None
-        session.youtube_cookies = None if body.mode == "server" else cookies
-        return access_status(session.youtube_cookies)
-
-
 @router.post("/api/playlists/{playlist_id}/analyze", status_code=202)
 def analyze(playlist_id: SpotifyId, request: Request, session: CurrentSession, background: BackgroundTasks) -> JobView:
     """Analyze an editable playlist without blocking the response."""
@@ -525,7 +494,6 @@ def analyze(playlist_id: SpotifyId, request: Request, session: CurrentSession, b
             if info.get("owner", {}).get("id") != session.user["id"] and not info.get("collaborative"):
                 raise HTTPException(403, "Choose a playlist you can edit.")  # noqa: TRY301
             job = Job(SpotifyPlaylistSorter(playlist_id, sp), JobView(playlist_id=playlist_id))
-            job.sorter.youtube_cookies = session.youtube_cookies
             session.job = job
             background.add_task(_run_job, job, "analyze", request.app.state.analysis_lock.release)
         except Exception:

@@ -22,7 +22,6 @@ import {
   Music2,
   RefreshCw,
   Search,
-  Settings,
 } from "lucide-react"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { ModeToggle } from "@/components/mode-toggle"
@@ -30,14 +29,11 @@ import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/in
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { toast } from "@/components/ui/toast"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, ApiError, type Job, type Playlist, type Session, type YouTubeAccess } from "@/lib/api"
+import { api, ApiError, type Job, type Playlist, type Session } from "@/lib/api"
 
 // Warm the lazy route chunks on hover/focus so navigation feels instant.
 const preloadPlaylistPage = () => {
   void import("@/components/playlist-page")
-}
-const preloadYouTubeAccess = () => {
-  void import("@/components/youtube-access")
 }
 
 function Loading({ className = "min-h-dvh" }: { className?: string }) {
@@ -94,24 +90,6 @@ function Shell() {
             Playlist sorter
           </Link>
           <div className="flex items-center gap-1 max-sm:w-full max-sm:justify-end">
-            {session.user && (
-              <Tooltip>
-                <TooltipTrigger
-                  render={
-                    <Link
-                      to="/youtube"
-                      onMouseEnter={preloadYouTubeAccess}
-                      onFocus={preloadYouTubeAccess}
-                      className={buttonVariants({ variant: "ghost", size: "icon-sm" })}
-                      aria-label="Settings"
-                    />
-                  }
-                >
-                  <Settings aria-hidden="true" />
-                </TooltipTrigger>
-                <TooltipContent>Settings</TooltipContent>
-              </Tooltip>
-            )}
             <ModeToggle />
             {session.user && (
               <Tooltip>
@@ -350,20 +328,6 @@ export const router = createBrowserRouter([
             }),
           },
         ],
-      },
-      {
-        path: "youtube",
-        loader: async ({ request }) => {
-          try {
-            return await api<YouTubeAccess>("/youtube", { signal: request.signal })
-          } catch (error) {
-            if (error instanceof ApiError && error.status === 401) throw redirectDocument("/")
-            throw error
-          }
-        },
-        lazy: async () => ({
-          Component: (await import("@/components/youtube-access")).YouTubeAccessPage,
-        }),
       },
       {
         path: "*",

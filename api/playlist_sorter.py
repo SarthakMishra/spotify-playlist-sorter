@@ -34,7 +34,7 @@ from api.audio_analysis import (
     load_audio,
     section_plan,
 )
-from api.youtube import SHARED_FAILURES, SourceAccessError, configured_cookies, failure_reason, youtube_options
+from api.youtube import SHARED_FAILURES, SourceAccessError, failure_reason, youtube_options
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -939,7 +939,6 @@ class SpotifyPlaylistSorter:
         self.snapshot_id: str | None = None
         self.restore_order: list[str] = []
         self.audio_features: dict[str, dict[str, Any]] = {}
-        self.youtube_cookies: str | None = None
         self.cached_count = 0
         self.recording_count = 0
         self.arrangement_data: dict[str, Any] | None = None
@@ -1004,12 +1003,11 @@ class SpotifyPlaylistSorter:
         plan: tuple[str, float, float],
         duration: float,
         directory: Path,
-        cookie_text: str,
     ) -> np.ndarray:
         """Download and decode one sampled window, failing incomplete audio loudly."""
         label, start, end = plan
         options: dict[str, Any] = {
-            **youtube_options(cookie_text),
+            **youtube_options(),
             "format": "bestaudio",
             "check_formats": False,
             "outtmpl": str(directory / f"{label}.%(ext)s"),
@@ -1032,7 +1030,6 @@ class SpotifyPlaylistSorter:
     def _download_sections(
         source: dict[str, Any],
         *,
-        cookie_text: str = "",
         video_info: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> list[tuple[str, float, float, np.ndarray]]:
@@ -1049,7 +1046,7 @@ class SpotifyPlaylistSorter:
                     if attempt == 0 and video_info is not None:
                         video = video_info
                     else:
-                        with yt_dlp.YoutubeDL(youtube_options(cookie_text)) as downloader:
+                        with yt_dlp.YoutubeDL(youtube_options()) as downloader:
                             video = downloader.extract_info(source["url"], download=False)
                     if (
                         not video
@@ -1065,7 +1062,6 @@ class SpotifyPlaylistSorter:
                             plan_section,
                             duration,
                             Path(directory),
-                            cookie_text,
                         )
                         for plan_section in plan
                     ]
@@ -1095,10 +1091,10 @@ class SpotifyPlaylistSorter:
 
     @staticmethod
     def _find_recordings(
-        metadata: dict[str, Any], cookie_text: str, diagnostics: dict[str, Any]
+        metadata: dict[str, Any], diagnostics: dict[str, Any]
     ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
         """Search cheaply and hydrate only until one candidate already proves eligible."""
-        options: dict[str, Any] = {**youtube_options(cookie_text), "extract_flat": "in_playlist", "format": "bestaudio"}
+        options: dict[str, Any] = {**youtube_options(), "extract_flat": "in_playlist", "format": "bestaudio"}
         full: dict[str, dict[str, Any]] = {}
         ranked: list[dict[str, Any]] = []
         with yt_dlp.YoutubeDL(options) as search:
@@ -1146,9 +1142,9 @@ class SpotifyPlaylistSorter:
         return ranked, full, candidates
 
     @staticmethod
-    def _hydrate_candidate(candidate: dict[str, Any], cookie_text: str) -> dict[str, Any] | None:
+    def _hydrate_candidate(candidate: dict[str, Any]) -> dict[str, Any] | None:
         """Fetch one candidate's full music metadata without re-requesting known failures."""
-        options: dict[str, Any] = {**youtube_options(cookie_text), "extract_flat": "in_playlist", "format": "bestaudio"}
+        options: dict[str, Any] = {**youtube_options(), "extract_flat": "in_playlist", "format": "bestaudio"}
         try:
             with yt_dlp.YoutubeDL(options) as search:
                 options["logger"].reason = None
@@ -1180,7 +1176,6 @@ class SpotifyPlaylistSorter:
         source: dict[str, Any],
         video_info: dict[str, Any] | None,
         metadata: dict[str, Any],
-        cookies: str,
         notify: Callable[[str], None],
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, float]]:
         """Download sampled windows and measure them, or return the terminal failure result."""
@@ -1188,9 +1183,7 @@ class SpotifyPlaylistSorter:
         try:
             notify("downloading")
             step = perf_counter()
-            sections = SpotifyPlaylistSorter._download_sections(
-                source, cookie_text=cookies, video_info=video_info, metadata=metadata
-            )
+            sections = SpotifyPlaylistSorter._download_sections(source, video_info=video_info, metadata=metadata)
             timings["download_seconds"] = round(perf_counter() - step, 3)
             notify("analyzing")
             step = perf_counter()
@@ -1219,7 +1212,6 @@ class SpotifyPlaylistSorter:
         track: dict[str, Any],
         on_stage: Callable[[str], None] | None = None,
         *,
-        cookie_text: str | None = None,
         cache: dict[str, dict[str, Any]] | None = None,
         video_analyses: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
@@ -1252,9 +1244,8 @@ class SpotifyPlaylistSorter:
                 }
             )
         try:
-            cookies = configured_cookies() if cookie_text is None else cookie_text
             notify("matching")
-            ranked, full, candidates = SpotifyPlaylistSorter._find_recordings(metadata, cookies, diagnostics)
+            ranked, full, candidates = SpotifyPlaylistSorter._find_recordings(metadata, diagnostics)
             failure = {"status": "uncertain", "reason": "no_match", "message": "No matching recording found"}
 
             def hydrate() -> bool:
@@ -1262,7 +1253,7 @@ class SpotifyPlaylistSorter:
                 while candidates and not _select_recording(ranked):
                     candidate = candidates.pop(0)
                     diagnostics["candidates_checked"] += 1
-                    video = SpotifyPlaylistSorter._hydrate_candidate(candidate, cookies)
+                    video = SpotifyPlaylistSorter._hydrate_candidate(candidate)
                     if video:
                         full[video["id"]] = video
                         ranked.extend(_rank_recordings([video], metadata))
@@ -1287,7 +1278,7 @@ class SpotifyPlaylistSorter:
                         cache[track["id"]] = record
                     return finish(record)
                 record, next_failure, timings = SpotifyPlaylistSorter._measure_source(
-                    source, full.get(source["id"]), metadata, cookies, notify
+                    source, full.get(source["id"]), metadata, notify
                 )
                 diagnostics.update(timings)
                 if record is not None:
@@ -1328,13 +1319,6 @@ class SpotifyPlaylistSorter:
 
         stopped = Event()
         shared_failure: dict[str, Any] = {}
-        cookies = self.youtube_cookies
-        if len(results) < len(unique) and cookies is None:
-            try:
-                cookies = configured_cookies()
-            except SourceAccessError as error:
-                shared_failure = error.result()
-                stopped.set()
 
         videos = _video_index(cache)
         scale = _WorkerScale()
@@ -1344,7 +1328,7 @@ class SpotifyPlaylistSorter:
             nonlocal shared_failure
             if stopped.is_set():
                 return shared_failure.copy()
-            kwargs: dict[str, Any] = {"cookie_text": cookies, "cache": cache, "video_analyses": videos}
+            kwargs: dict[str, Any] = {"cache": cache, "video_analyses": videos}
             if record_callback is not None:
                 kwargs["on_stage"] = lambda stage: record_callback(track["id"], {"status": stage})
             with gate:

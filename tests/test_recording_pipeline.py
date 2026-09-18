@@ -132,7 +132,7 @@ class RecordingPipelineTest(unittest.TestCase):
             ),
             patch.object(playlist_sorter, "analyze_sections", return_value={"summary": {}}),
         ):
-            result = playlist_sorter.SpotifyPlaylistSorter._analyze_track(TRACK, cookie_text="")
+            result = playlist_sorter.SpotifyPlaylistSorter._analyze_track(TRACK)
             assert result["status"] == "ready", result
 
     def test_search_does_not_extract_every_video(self) -> None:
@@ -179,7 +179,7 @@ class RecordingPipelineTest(unittest.TestCase):
             ) as download,
             patch.object(playlist_sorter, "analyze_sections", return_value={"summary": {}}),
         ):
-            result = playlist_sorter.SpotifyPlaylistSorter._analyze_track(TRACK, cookie_text="")
+            result = playlist_sorter.SpotifyPlaylistSorter._analyze_track(TRACK)
             assert result["status"] == "ready", result
             assert len(hydrated) <= 3, f"Hydrated {len(hydrated)} candidates for one recording"
             assert download.call_count == 1
@@ -477,7 +477,7 @@ class RecordingPipelineTest(unittest.TestCase):
 
         with patch.object(yt_dlp.YoutubeDL, "extract_info", autospec=True, side_effect=extract):
             ranked, _full, _candidates = playlist_sorter.SpotifyPlaylistSorter._find_recordings(
-                {"id": "a", "title": "Dil Darbadar", "artists": ["Ankit Tiwari"], "duration_ms": 377045}, "", {}
+                {"id": "a", "title": "Dil Darbadar", "artists": ["Ankit Tiwari"], "duration_ms": 377045}, {}
             )
         searches = [query for query in queries if query.startswith("ytsearch")]
         assert len(searches) == 2, f"expected exactly two searches, got {searches}"
@@ -515,7 +515,7 @@ class RecordingPipelineTest(unittest.TestCase):
 
     def test_retry_sleep_functions_accept_keyword_counts(self) -> None:
         """yt-dlp calls retry sleep helpers with a keyword; a TypeError would crash every retry."""
-        functions = playlist_sorter.youtube_options("")["retry_sleep_functions"]
+        functions = playlist_sorter.youtube_options()["retry_sleep_functions"]
         for key in ("http", "fragment", "extractor"):
             with self.subTest(key=key):
                 assert functions[key](n=2) == 4
@@ -592,11 +592,11 @@ class RecordingPipelineTest(unittest.TestCase):
             ) as download,
             patch.object(playlist_sorter, "analyze_sections", return_value=reused_analysis),
         ):
-            first = playlist_sorter.SpotifyPlaylistSorter._analyze_track(track, cookie_text="", video_analyses={})
+            first = playlist_sorter.SpotifyPlaylistSorter._analyze_track(track, video_analyses={})
             assert first["status"] == "ready"
             assert download.call_count == 1
             second = playlist_sorter.SpotifyPlaylistSorter._analyze_track(
-                {**track, "id": "b"}, cookie_text="", video_analyses={str(video["id"]): first}
+                {**track, "id": "b"}, video_analyses={str(video["id"]): first}
             )
             assert second["status"] == "ready"
             assert second["analysis"] == reused_analysis
@@ -617,7 +617,6 @@ class RecordingPipelineTest(unittest.TestCase):
                 ) as extract,
             ):
                 sorter = playlist_sorter.SpotifyPlaylistSorter("playlist", Mock())
-                sorter.youtube_cookies = ""
                 result = sorter._fetch_audio_features_local(tracks)
                 assert all(item["status"] == "error" and item["reason"] == reason for item in result.values())
                 assert extract.call_count <= 2

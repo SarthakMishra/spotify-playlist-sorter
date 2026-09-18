@@ -8,9 +8,4 @@ services:
       - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
       - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
       - SPOTIFY_REDIRECT_URI=${SPOTIFY_REDIRECT_URI:-http://127.0.0.1:5178/api/auth/callback}
-      - YOUTUBE_COOKIES_FILE=${YOUTUBE_COOKIES_FILE:-}
-    # Optional YouTube cookies. The app only reads this file.
-    # volumes:
-    #   - ./cookies.txt:/tmp/cookies.txt:ro
-    # Set YOUTUBE_COOKIES_FILE=/tmp/cookies.txt in .env when using this mount.
     restart: unless-stopped

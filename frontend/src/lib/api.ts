@@ -126,12 +126,3 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
 export function isWorking(job: Job | null) {
   return !!job && ["analyzing", "sorting", "saving", "restoring"].includes(job.status)
 }
-
-export type YouTubeAccess = {
-  mode: "server" | "upload" | "anonymous"
-  server_source: "file" | "browser" | "anonymous"
-  browser: string | null
-  node_available: boolean
-  scripts_available: boolean
-  yt_dlp_version: string
-}
