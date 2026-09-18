@@ -6,10 +6,12 @@ import json
 import logging
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
+from time import perf_counter
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 from urllib.parse import urlsplit
 
@@ -23,8 +25,9 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from spotipy.exceptions import SpotifyOauthError
 
-from api.playlist_sorter import Profile, SpotifyPlaylistSorter
+from api.playlist_sorter import SpotifyPlaylistSorter
 from api.spotify_auth import get_all_playlists, get_auth_manager, get_redirect_uri, get_spotify_client, is_configured
+from api.youtube import SourceAccessError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -35,8 +38,20 @@ logger = logging.getLogger(__name__)
 SESSION_SECONDS = 24 * 60 * 60
 LOGIN_SECONDS = 10 * 60
 MAX_SESSIONS = 200
+REANALYZE_SECONDS = 150.0
+REANALYZE_MARGIN_SECONDS = 5.0
 COOKIE = "playlist_session"
 SpotifyId = Annotated[str, Field(pattern=r"^[A-Za-z0-9]{22}$")]
+
+
+class Recording(BaseModel):
+    """The YouTube recording this song's audio was measured from."""
+
+    video_id: str
+    title: str | None = None
+    channel: str | None = None
+    duration_seconds: float | None = None
+    confident: bool = False
 
 
 class Track(BaseModel):
@@ -54,6 +69,31 @@ class Track(BaseModel):
     key: str | None = None
     bpm: float | None = None
     energy: float | None = None
+    recording: Recording | None = None
+
+
+class Candidate(BaseModel):
+    """One searchable YouTube recording a listener could choose for a song."""
+
+    video_id: str
+    title: str
+    channel: str
+    duration_seconds: float | None
+    live: bool
+    suggested: bool
+
+
+class ListeningOptions(BaseModel):
+    """Plain-language listening choices the arrangement honors."""
+
+    preset: Literal["gentle", "steady", "buildup", "mixed"] = "steady"
+    pace: float = Field(default=0.5, ge=0, le=1)
+    energy: float = Field(default=0.5, ge=0, le=1)
+    variety: float = Field(default=0.5, ge=0, le=1)
+
+    def normalized(self) -> dict[str, Any]:
+        """Return the option values the sorter consumes."""
+        return self.model_dump()
 
 
 class JobView(BaseModel):
@@ -71,7 +111,7 @@ class JobView(BaseModel):
     recording_count: int = 0
     metadata_loaded: bool = False
     analyzed_count: int = 0
-    profile: Profile = "smooth"
+    options: ListeningOptions = Field(default_factory=ListeningOptions)
     first_occurrence: str | None = None
     last_occurrence: str | None = None
     placements: dict[str, int] = Field(default_factory=dict)
@@ -90,6 +130,7 @@ class Job:
     sorter: SpotifyPlaylistSorter
     view: JobView
     sorted_order: list[str] = field(default_factory=list)
+    rematch_cancelled: bool = False
 
 
 @dataclass
@@ -129,14 +170,20 @@ class PreviewRequest(BaseModel):
 
 
 class SortRequest(PreviewRequest):
-    """Select a listening profile, optional endpoint pins and unanalyzable-item placements."""
+    """Select listening options, optional endpoint pins and unanalyzable-item placements."""
 
-    profile: Profile = "smooth"
+    options: ListeningOptions = Field(default_factory=ListeningOptions)
     first_occurrence: Annotated[str, Field(min_length=1, max_length=512)] | None = None
     last_occurrence: Annotated[str, Field(min_length=1, max_length=512)] | None = None
     placements: dict[Annotated[str, Field(min_length=1, max_length=512)], Annotated[int, Field(ge=0)]] = Field(
         default_factory=dict
     )
+
+
+class MatchRequest(BaseModel):
+    """Choose one YouTube recording as the source for a song's audio analysis."""
+
+    video_id: Annotated[str, Field(pattern=r"^[A-Za-z0-9_-]{11}$")]
 
 
 def _lookup_session(request: Request) -> Session | None:
@@ -175,7 +222,14 @@ def _set_cookie(response: Response, session_id: str) -> None:
 
 def _tracks(frame: pd.DataFrame) -> list[Track]:
     """Serialize the entry identities assigned when the source playlist was loaded."""
-    columns = {"Track": "name", "Artist": "artist", "Camelot": "key", "BPM": "bpm", "Energy": "energy"}
+    columns = {
+        "Track": "name",
+        "Artist": "artist",
+        "Camelot": "key",
+        "BPM": "bpm",
+        "Energy": "energy",
+        "Recording": "recording",
+    }
     return [
         Track.model_validate(row) for row in json.loads(frame.rename(columns=columns).to_json(orient="records") or "[]")
     ]
@@ -187,6 +241,67 @@ def _analysis_counts(tracks: list[Track]) -> dict[str, int]:
         "analyzed_count": sum(track.analysis_status == "ready" for track in tracks),
         "kept_count": sum(track.fixed_reason is not None for track in tracks),
     }
+
+
+def _rematch_job(job: Job, occurrence: str, video_id: str, deadline: float) -> None:
+    """Reanalyze one occurrence with a listener-chosen recording and refresh the view."""
+    entry = next((item for item in job.sorter.original_items if item["occurrence"] == occurrence), None)
+    known = {track.occurrence for track in job.view.tracks}
+    if entry is None or occurrence not in known:
+        job.view = job.view.model_copy(update={"status": "error", "error": "This song isn't in the loaded playlist."})
+        return
+    progress_lock = Lock()
+
+    def record_progress(recording_id: str, result: dict[str, Any]) -> None:
+        if job.rematch_cancelled or recording_id != entry["id"]:
+            return
+        stage = result.get("status")
+        phase = {"matching": "matching", "downloading": "downloading", "analyzing": "analyzing"}.get(
+            str(stage), "ready"
+        )
+        with progress_lock:
+            tracks = [
+                track.model_copy(update={"analysis_status": phase}) if track.occurrence == occurrence else track
+                for track in job.view.tracks
+            ]
+            job.view = job.view.model_copy(update={"tracks": tracks})
+
+    success, message = job.sorter.reanalyze_track(entry, video_id, record_progress, deadline=deadline)
+    with progress_lock:
+        if job.rematch_cancelled:
+            return
+        if success:
+            tracks = [
+                _tracks(pd.DataFrame([item]))[0] if item["occurrence"] == occurrence else track
+                for item, track in zip(job.sorter.original_items, job.view.tracks, strict=True)
+            ]
+            job.view = job.view.model_copy(
+                update={
+                    "tracks": tracks,
+                    "sorted_tracks": [],
+                    "transitions": [],
+                    "review": None,
+                    "arrangement": None,
+                    "first_occurrence": None,
+                    "last_occurrence": None,
+                    "placements": {},
+                    "error": None,
+                    "status": "ready",
+                    "revision": secrets.token_urlsafe(16),
+                    "can_restore": job.sorter.can_restore,
+                    **_analysis_counts(tracks),
+                }
+            )
+        else:
+            tracks = [
+                track.model_copy(update={"analysis_status": "error", "fixed_reason": message})
+                if track.occurrence == occurrence
+                else track
+                for track in job.view.tracks
+            ]
+            job.view = job.view.model_copy(
+                update={"tracks": tracks, "status": "error", "error": message, **_analysis_counts(tracks)}
+            )
 
 
 def _analyze_job(job: Job) -> None:
@@ -276,7 +391,10 @@ def _run_job(job: Job, action: str, release: Callable[[], None]) -> None:
             _analyze_job(job)
         elif action == "sort":
             job.sorted_order = job.sorter.sort_playlist(
-                job.view.first_occurrence, job.view.last_occurrence, job.view.profile, job.view.placements
+                job.view.options.normalized(),
+                job.view.first_occurrence,
+                job.view.last_occurrence,
+                job.view.placements,
             )
             if not job.sorted_order:
                 job.view = job.view.model_copy(
@@ -293,7 +411,7 @@ def _run_job(job: Job, action: str, release: Callable[[], None]) -> None:
                     "arrangement": {
                         key: value
                         for key, value in job.sorter.arrangement_result.items()
-                        if key not in {"order", "profile", "first_occurrence", "last_occurrence", "placements"}
+                        if key not in {"order", "options", "first_occurrence", "last_occurrence", "placements"}
                     },
                     "status": "ready",
                 }
@@ -518,7 +636,7 @@ def begin_action(
             if options is None or len(movable) < 2:  # noqa: PLR2004
                 raise HTTPException(422, "At least two movable songs are needed to arrange this playlist.")
             error = job.sorter.choice_error(
-                options.first_occurrence, options.last_occurrence, options.profile, options.placements
+                options.options.normalized(), options.first_occurrence, options.last_occurrence, options.placements
             )
             if error:
                 raise HTTPException(422, error)
@@ -542,7 +660,10 @@ def begin_action(
             job.sorted_order = []
             job.view = job.view.model_copy(
                 update={
-                    **options.model_dump(exclude={"revision"}),
+                    "options": options.options,
+                    "first_occurrence": options.first_occurrence,
+                    "last_occurrence": options.last_occurrence,
+                    "placements": options.model_dump(exclude={"revision", "options"})["placements"],
                     "sorted_tracks": [],
                     "transitions": [],
                     "arrangement": None,
@@ -569,6 +690,112 @@ def save(body: PreviewRequest, session: CurrentSession, background: BackgroundTa
 def restore(body: PreviewRequest, session: CurrentSession, background: BackgroundTasks) -> JobView:
     """Restore the order preceding the most recent verified save in this session."""
     return begin_action(session, background, "restore", body.revision)
+
+
+def _match_entry(job: Job, occurrence: str) -> dict[str, Any]:
+    """Find the loaded occurrence, or reject the request with a clear reason."""
+    if job.view.status not in {"ready", "saved", "restored"}:
+        raise HTTPException(409, "Wait for the current step to finish first.")
+    entry = next((item for item in job.sorter.original_items if item["occurrence"] == occurrence), None)
+    if entry is None:
+        raise HTTPException(404, "This song isn't in the loaded playlist.")
+    if entry["id"] is None:
+        raise HTTPException(422, "This item has no Spotify recording to replace.")
+    return entry
+
+
+@router.get("/api/job/matches/{occurrence}")
+def match_candidates(occurrence: str, session: CurrentSession) -> list[Candidate]:
+    """Search YouTube so a listener can review or replace this song's recording."""
+    job = session.job
+    if not job or job.view.status not in {"ready", "saved", "restored"}:
+        raise HTTPException(409, "Analyze the playlist before checking recordings.")
+    entry = _match_entry(job, occurrence)
+    try:
+        candidates = job.sorter.search_recordings(entry)
+    except SourceAccessError as error:
+        raise HTTPException(502, str(error)) from error
+    except Exception:
+        logger.exception("Recording search failed for playlist %s", job.view.playlist_id)
+        raise HTTPException(502, "YouTube lookup failed. Try again later.") from None
+    return [Candidate.model_validate(candidate) for candidate in candidates]
+
+
+@router.post("/api/job/matches/{occurrence}", status_code=202)
+def apply_match(
+    occurrence: str, body: MatchRequest, request: Request, session: CurrentSession, background: BackgroundTasks
+) -> JobView:
+    """Reanalyze this song's audio from the chosen recording in the background."""
+    with session.lock:
+        job = session.job
+        if not job or job.view.status not in {"ready", "saved", "restored"}:
+            raise HTTPException(409, "Analyze the playlist before changing recordings.")
+        if job.view.status != "ready" and job.sorted_order and job.view.status == "saved":
+            raise HTTPException(409, "Analyze the playlist again before changing recordings.")
+        if request.app.state.analysis_lock.locked():
+            raise HTTPException(409, "We're busy with another playlist. Please try again shortly.")
+        if not request.app.state.analysis_lock.acquire(blocking=False):
+            raise HTTPException(409, "We're busy with another playlist. Please try again shortly.")
+        try:
+            _match_entry(job, occurrence)
+            tracks = [
+                track.model_copy(update={"analysis_status": "matching", "fixed_reason": None})
+                if track.occurrence == occurrence
+                else track
+                for track in job.view.tracks
+            ]
+            job.view = job.view.model_copy(
+                update={
+                    "status": "analyzing",
+                    "metadata_loaded": True,
+                    "completed": 0,
+                    "total": 1,
+                    "tracks": tracks,
+                    "sorted_tracks": [],
+                    "transitions": [],
+                    "review": None,
+                    "arrangement": None,
+                    "first_occurrence": None,
+                    "last_occurrence": None,
+                    "placements": {},
+                    "revision": secrets.token_urlsafe(16),
+                    **_analysis_counts(tracks),
+                }
+            )
+            background.add_task(_run_rematch, job, occurrence, body.video_id, request.app.state.analysis_lock.release)
+        except Exception:
+            request.app.state.analysis_lock.release()
+            raise
+        else:
+            return job.view
+
+
+def _run_rematch(job: Job, occurrence: str, video_id: str, release: Callable[[], None]) -> None:
+    """Run the single-recording reanalysis in the background and release the analysis lock."""
+    deadline = perf_counter() + REANALYZE_SECONDS
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(_rematch_job, job, occurrence, video_id, deadline)
+        try:
+            future.result(timeout=REANALYZE_SECONDS + REANALYZE_MARGIN_SECONDS)
+        except TimeoutError:
+            # The worker keeps running until its own stages finish; its late
+            # updates are ignored once the rematch is marked cancelled.
+            job.rematch_cancelled = True
+            job.view = job.view.model_copy(
+                update={
+                    "status": "error",
+                    "error": "This took too long. Try again shortly or choose another recording.",
+                }
+            )
+    except Exception:
+        logger.exception("Playlist %s failed during rematch", job.view.playlist_id)
+        job.view = job.view.model_copy(
+            update={"status": "error", "error": "Something went wrong. Please analyze the playlist again."}
+        )
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+        release()
 
 
 @router.api_route("/api", include_in_schema=False, methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])

@@ -5,7 +5,15 @@ export type Session = {
 }
 
 export type Playlist = { id: string; name: string; total: number; image: string | null }
-export type Profile = "smooth" | "variety"
+export type Preset = "gentle" | "steady" | "buildup" | "mixed"
+export type Options = { preset: Preset; pace: number; energy: number; variety: number }
+export type Recording = {
+  videoId: string
+  title: string | null
+  channel: string | null
+  durationSeconds: number | null
+  confident: boolean
+}
 export type Track = {
   occurrence: string
   original_position: number
@@ -27,6 +35,15 @@ export type Track = {
   key: string | null
   bpm: number | null
   energy: number | null
+  recording: Recording | null
+}
+export type Candidate = {
+  video_id: string
+  title: string
+  channel: string
+  duration_seconds: number | null
+  live: boolean
+  suggested: boolean
 }
 export type Transition = {
   index: number
@@ -62,7 +79,7 @@ export type Job = {
   recording_count: number
   metadata_loaded: boolean
   analyzed_count: number
-  profile: Profile
+  options: Options
   first_occurrence: string | null
   last_occurrence: string | null
   placements: Record<string, number>
@@ -70,13 +87,18 @@ export type Job = {
     version: number
     cost: number | null
     baseline_cost: number | null
-    terms: { transition: number; repetition: number; monotony: number } | null
+    terms: {
+      transition: number
+      repetition: number
+      monotony: number
+      pace: number
+      energy: number
+    } | null
     evaluations: number
     assessed_edges: number | null
     total_edges: number
     limited: boolean
     unchanged: boolean
-    same_as_other_profile: boolean | null
   } | null
   review: {
     original_assessed: number | null
@@ -125,4 +147,8 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
 
 export function isWorking(job: Job | null) {
   return !!job && ["analyzing", "sorting", "saving", "restoring"].includes(job.status)
+}
+
+export function isRematchStage(status: Track["analysis_status"]) {
+  return status === "matching" || status === "downloading" || status === "analyzing"
 }

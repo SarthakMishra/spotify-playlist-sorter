@@ -159,8 +159,9 @@ function Welcome() {
         <br />
         in a smoother order.
       </h1>
-      <p className="mt-5 max-w-sm text-base leading-7 text-muted-foreground">
-        Pick a playlist. Choose a smooth flow or more variety, then review the order before saving.
+      <p className="mt-5 max-w-lg text-base leading-7 text-muted-foreground">
+        Pick a playlist, check the song recordings, choose how it should flow, then review the order
+        before saving.
       </p>
       {session?.configured ? (
         <a
@@ -176,7 +177,6 @@ function Welcome() {
           <AlertDescription>Spotify isn't set up yet. Please try again later.</AlertDescription>
         </Alert>
       )}
-      <p className="mt-4 text-sm text-muted-foreground">You can analyze the order before saving.</p>
     </section>
   )
 }

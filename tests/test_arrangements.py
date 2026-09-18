@@ -110,13 +110,13 @@ class ArrangementTest(unittest.TestCase):
         credited = playlist_sorter._prepare_arrangement(sorter.original_items, sorter.audio_features)
         assert credited["artists"][0, 1]
 
-    def test_profiles_preserve_occurrences_and_improve_their_baseline(self) -> None:
+    def test_presets_preserve_occurrences_and_improve_their_baseline(self) -> None:
         """Soft artist spacing can separate duplicates while endpoint requirements remain hard."""
         sorter = fixture()
         original = sorter.current_order.copy()
-        for profile in ("smooth", "variety"):
-            with self.subTest(profile=profile):
-                order = sorter.sort_playlist(original[2], original[-1], profile)
+        for preset in ("steady", "mixed"):
+            with self.subTest(preset=preset):
+                order = sorter.sort_playlist({"preset": preset}, original[2], original[-1])
                 assert Counter(order) == Counter(original)
                 assert (order[0], order[-1]) == (original[2], original[-1])
                 assert sorter.valid_order(order)
@@ -127,7 +127,7 @@ class ArrangementTest(unittest.TestCase):
                 assert result["evaluations"] <= 5000
                 assert all(0 <= term <= 1 for term in result["terms"].values())
                 matrices = sorter.arrangement_data
-                assert sorter.sort_playlist(original[2], original[-1], profile) == order
+                assert sorter.sort_playlist({"preset": preset}, original[2], original[-1]) == order
                 assert sorter.arrangement_data is matrices
         assert len(sorter.arrangement_results) == 2
 
@@ -140,12 +140,46 @@ class ArrangementTest(unittest.TestCase):
         assert terms["transition"] == 0
         assert terms["repetition"] == 4 / 6
         assert terms["monotony"] == 1
-        assert abs(playlist_sorter._order_cost(order, data, "smooth") - 0.15) < 1e-12
-        assert abs(playlist_sorter._order_cost(order, data, "variety") - (0.25 * 4 / 6 + 0.15)) < 1e-12
+        assert terms["pace"] == 0
+        assert terms["energy"] == 0
+        steady = playlist_sorter._option_weights({"preset": "steady", "variety": 0.5, "pace": 0.5, "energy": 0.5})
+        assert abs(playlist_sorter._order_cost(order, data, steady) - (0.35 * 1.075 * 4 / 6 + 0.10)) < 1e-12
+        mixed = playlist_sorter._option_weights({"preset": "mixed", "variety": 0.5, "pace": 0.5, "energy": 0.5})
+        assert abs(playlist_sorter._order_cost(order, data, mixed) - (0.37625 * 4 / 6 + 0.15)) < 1e-12
         for record in sorter.audio_features.values():
             record["analysis"]["body"] = None
         missing = playlist_sorter._prepare_arrangement(sorter.original_items, sorter.audio_features)
         assert playlist_sorter._order_terms(order, missing)["monotony"] == 0
+
+    def test_tilt_terms_rank_measured_features_by_position(self) -> None:
+        """Pace and energy tilts grow toward unbalanced orders and vanish without measurements."""
+        sorter = fixture(2)
+        sorter.audio_features["a"]["analysis"]["summary"]["rms_db"] = -40.0
+        sorter.audio_features["b"]["analysis"]["summary"]["rms_db"] = 0.0
+        sorter.audio_features["a"]["analysis"]["summary"]["tempo"] = 90.0
+        sorter.audio_features["b"]["analysis"]["summary"]["tempo"] = 150.0
+        data = playlist_sorter._prepare_arrangement(sorter.original_items, sorter.audio_features)
+        calm_first = playlist_sorter._order_terms(np.array([0, 1]), data)
+        assert calm_first["energy"] > 0
+        assert calm_first["pace"] > 0
+        fast_first = playlist_sorter._order_terms(np.array([1, 0]), data)
+        assert fast_first["energy"] < 0
+        assert fast_first["pace"] < 0
+        weights = playlist_sorter._option_weights({"preset": "steady", "energy": 0.5, "pace": 0.5, "variety": 0.5})
+        assert playlist_sorter._order_cost(np.array([0, 1]), data, weights) == playlist_sorter._order_cost(
+            np.array([1, 0]), data, weights
+        )
+        ascending = playlist_sorter._option_weights({"preset": "steady", "energy": 1.0, "pace": 1.0, "variety": 0.5})
+        assert playlist_sorter._order_cost(np.array([1, 0]), data, ascending) < playlist_sorter._order_cost(
+            np.array([0, 1]), data, ascending
+        )
+        for record in sorter.audio_features.values():
+            record["analysis"]["summary"]["evidence"]["rms_db"] = 0.0
+            record["analysis"]["summary"]["evidence"]["onset"] = 0.0
+            record["analysis"]["summary"]["evidence"]["tempo"] = 0.0
+        unmeasured = playlist_sorter._prepare_arrangement(sorter.original_items, sorter.audio_features)
+        assert unmeasured["energy_values"].sum() == 0
+        assert unmeasured["pace_values"].sum() == 0
 
     def test_fixed_slots_invalid_pins_and_save_validation(self) -> None:
         """Fixed openers/closers cannot be displaced, including by a forged saved permutation."""
@@ -153,20 +187,20 @@ class ArrangementTest(unittest.TestCase):
         original = sorter.current_order.copy()
         sorter.original_items[0]["fixed_reason"] = "Unavailable"
         sorter.original_items[-1]["fixed_reason"] = "Local file"
-        assert sorter.sort_playlist(original[1]) == []
-        assert sorter.sort_playlist(None, original[1]) == []
-        assert sorter.sort_playlist("foreign:snapshot:0") == []
-        assert sorter.sort_playlist(original[1], original[1]) == []
+        assert sorter.sort_playlist(first_occurrence=original[1]) == []
+        assert sorter.sort_playlist(last_occurrence=original[1]) == []
+        assert sorter.sort_playlist(first_occurrence="foreign:snapshot:0") == []
+        assert sorter.sort_playlist(first_occurrence=original[1], last_occurrence=original[1]) == []
         order = sorter.sort_playlist()
         assert (order[0], order[-1]) == (original[0], original[-1])
         assert sorter.valid_order(order)
-        assert sorter.sort_playlist(original[0], original[-1]) == order
+        assert sorter.sort_playlist(first_occurrence=original[0], last_occurrence=original[-1]) == order
         transitions = sorter.get_transition_analysis(order)
         assert transitions[0]["score"] is None
         assert transitions[-1]["score"] is None
         assert all(value == 0 for value in transitions[0]["evidence"].values())
         other = fixture()
-        order = other.sort_playlist(other.current_order[2], other.current_order[-1])
+        order = other.sort_playlist(first_occurrence=other.current_order[2], last_occurrence=other.current_order[-1])
         other.snapshot_id = "snapshot"
         order[0], order[1] = order[1], order[0]
         assert other.valid_order(order)
@@ -193,12 +227,12 @@ class ArrangementTest(unittest.TestCase):
         ):
             with self.subTest(invalid=invalid):
                 assert sorter.sort_playlist(placements=invalid) == []
-        assert sorter.sort_playlist(original[0], None, "smooth", {original[0]: 2}) == []
-        assert sorter.sort_playlist(None, original[1], "smooth", {original[0]: 5}) == []
-        combined = sorter.sort_playlist(None, original[1], "smooth", {original[0]: 4})
+        assert sorter.sort_playlist(first_occurrence=original[0], placements={original[0]: 2}) == []
+        assert sorter.sort_playlist(last_occurrence=original[1], placements={original[0]: 5}) == []
+        combined = sorter.sort_playlist(last_occurrence=original[1], placements={original[0]: 4})
         assert (combined[4], combined[-1]) == (original[0], original[1])
         assert sorter.valid_order(combined)
-        reset = sorter.sort_playlist(original[0])
+        reset = sorter.sort_playlist(first_occurrence=original[0])
         assert reset[0] == original[0]
         assert sorter.valid_order(reset)
         again = sorter.sort_playlist(placements={original[0]: 4, original[2]: 0})
@@ -213,8 +247,7 @@ class ArrangementTest(unittest.TestCase):
         original = sorter.current_order.copy()
         assert sorter.sort_playlist() == original
         assert sorter.arrangement_result["unchanged"]
-        assert sorter.sort_playlist(profile="variety") == original
-        assert sorter.arrangement_result["same_as_other_profile"]
+        assert sorter.sort_playlist({"preset": "mixed"}) == original
         assert sorter.arrangement_result["terms"]["monotony"] == 1
         small = fixture(4)
         small.sort_playlist()
@@ -222,7 +255,9 @@ class ArrangementTest(unittest.TestCase):
         guarded = fixture()
         guarded.original_items[2]["fixed_reason"] = "Unavailable"
         with patch.object(playlist_sorter, "_MAX_MATRIX_ENTRIES", 3):
-            result = guarded.sort_playlist(guarded.current_order[4], guarded.current_order[0])
+            result = guarded.sort_playlist(
+                first_occurrence=guarded.current_order[4], last_occurrence=guarded.current_order[0]
+            )
         assert len(result) == 6
         assert guarded.valid_order(result)
         assert result[2] == guarded.current_order[2]
@@ -230,20 +265,27 @@ class ArrangementTest(unittest.TestCase):
         assert guarded.arrangement_result["cost"] is None
         assert guarded.arrangement_data is None
 
-    def test_profile_weights_trade_flow_for_variety(self) -> None:
+    def test_option_weights_trade_flow_for_variety(self) -> None:
         """Different priorities may produce different orders without changing normalization."""
         sorter = fixture()
         for section in sorter.audio_features["b"]["analysis"].values():
             section["rms_db"] = 0.0
         before = copy.deepcopy(sorter.audio_features)
-        smooth = sorter.sort_playlist()
+        steady = sorter.sort_playlist()
         data = sorter.arrangement_data
         assert data is not None
-        variety = sorter.sort_playlist(profile="variety")
-        assert smooth != variety
+        mixed = sorter.sort_playlist({"preset": "mixed", "variety": 0.8})
+        assert steady != mixed
         assert sorter.arrangement_data is data
         assert sorter.audio_features == before
-        assert not sorter.arrangement_result["same_as_other_profile"]
-        for profile, result in sorter.arrangement_results.items():
+        for options, result in sorter.arrangement_results.items():
             indices = np.array([int(occurrence.split(":")[-1]) for occurrence in result["order"]])
-            assert abs(playlist_sorter._order_cost(indices, data, profile) - result["cost"]) < 1e-12
+            weights = playlist_sorter._option_weights(
+                {
+                    "preset": options[0],
+                    "pace": float(options[1]),
+                    "energy": float(options[2]),
+                    "variety": float(options[3]),
+                }
+            )
+            assert abs(playlist_sorter._order_cost(indices, data, weights) - result["cost"]) < 1e-12

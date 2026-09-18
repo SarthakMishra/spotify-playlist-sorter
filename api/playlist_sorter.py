@@ -37,7 +37,7 @@ from api.audio_analysis import (
 from api.youtube import SHARED_FAILURES, SourceAccessError, failure_reason, youtube_options
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 logger = logging.getLogger(__name__)
 _CACHE_FILE = Path(__file__).resolve().parent.parent / ".analysis_cache.json"
@@ -362,6 +362,7 @@ def _rank_recordings(entries: list[dict[str, Any]], metadata: dict[str, Any]) ->
             "id": source_id,
             "url": f"https://www.youtube.com/watch?v={source_id}",
             "title": source_title,
+            "channel": channel,
             "duration": duration,
             "score": score,
             "evidence": {
@@ -488,9 +489,19 @@ def _with_intensity(records: dict[str, dict[str, Any]]) -> dict[str, dict[str, A
     return result
 
 
-Profile = Literal["smooth", "variety"]
-_PROFILE_WEIGHTS = {"smooth": (0.80, 0.15, 0.05), "variety": (0.60, 0.25, 0.15)}
+Preset = Literal["gentle", "steady", "buildup", "mixed"]
+# (transition, repetition, monotony) base weights per named flow preset.
+_PRESET_WEIGHTS: dict[str, tuple[float, float, float]] = {
+    "gentle": (0.85, 0.08, 0.07),
+    "steady": (0.70, 0.20, 0.10),
+    "buildup": (0.70, 0.15, 0.15),
+    "mixed": (0.55, 0.30, 0.15),
+}
+_ORDER_TERMS = ("transition", "repetition", "monotony", "pace", "energy")
+_TILT_EPSILON = 1e-9
 _VIDEO_REUSE_SECONDS = 2.0
+_TILT_STRENGTH = 0.5
+_TILT_FRACTION = 0.35
 _COMPONENTS = ("tempo", "intensity", "texture", "chroma")
 _SCORING_VERSION = 1
 _MAX_MATRIX_ENTRIES = 1000
@@ -691,6 +702,22 @@ def _prepare_arrangement(entries: list[dict[str, Any]], features: dict[str, dict
         shared[np.ix_(indices, indices)] = True
     assessed = sum(evidence.values()) > 0
     transition = sum(components[key] * weight for key, weight in zip(_COMPONENTS, (0.3, 0.3, 0.3, 0.1), strict=True))
+
+    def tilt_values(feature: str) -> np.ndarray:
+        """Center a summary feature so ordering sliders can tilt where it sits in the order."""
+        if feature == "tempo":
+            raw, quality = parts["summary"]["raw"][:, 0], parts["summary"]["quality"][:, 0]
+            valid = (quality > 0) & np.isfinite(raw) & (raw > 0)
+            measured = np.log2(np.where(valid, raw, 1.0))[valid]
+        else:
+            raw, quality = parts["summary"]["intensity"], parts["summary"]["intensity_quality"]
+            valid = (quality > 0) & np.isfinite(raw)
+            measured = raw[valid]
+        values = np.zeros(len(entries))
+        if measured.size > 1 and measured.std() > _TILT_EPSILON:
+            values[valid] = (measured - measured.mean()) / measured.std() * quality[valid]
+        return values
+
     return {
         "parts": parts,
         "components": components,
@@ -699,6 +726,8 @@ def _prepare_arrangement(entries: list[dict[str, Any]], features: dict[str, dict
         "transition": np.where(assessed, transition, 0.5),
         "body": (body["tempo"] + body["intensity"] + body["texture"]) / 3,
         "assessed": assessed,
+        "pace_values": tilt_values("tempo"),
+        "energy_values": tilt_values("energy"),
     }
 
 
@@ -714,31 +743,65 @@ def _order_terms(order: np.ndarray, data: dict[str, Any]) -> dict[str, float]:
         distances = data["body"][order[:-1], order[1:]]
         windows = np.convolve(distances, np.ones(_MONOTONY_WINDOW - 1) / (_MONOTONY_WINDOW - 1), mode="valid")
         monotony = float(np.maximum(0, 1 - windows / _MONOTONY_THRESHOLD).mean())
+    fractions = np.linspace(0, 1, len(order)) if len(order) > 1 else np.zeros(len(order))
     return {
         "transition": float(data["transition"][order[:-1], order[1:]].mean()) if len(order) > 1 else 0.0,
         "repetition": float(repeats.mean()) if len(order) else 0.0,
         "monotony": monotony,
+        "pace": float((fractions * data["pace_values"][order]).mean()) if len(order) else 0.0,
+        "energy": float((fractions * data["energy_values"][order]).mean()) if len(order) else 0.0,
     }
 
 
-def _order_cost(order: np.ndarray, data: dict[str, Any], profile: Profile) -> float:
-    """Combine bounded terms using the chosen profile's fixed initial weights."""
-    terms = _order_terms(order, data)
-    return sum(
-        terms[key] * weight
-        for key, weight in zip(("transition", "repetition", "monotony"), _PROFILE_WEIGHTS[profile], strict=True)
+def _normalized_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Validate listening options, keeping only recognized presets and bounded sliders."""
+    raw = options or {}
+
+    def slider(name: str) -> float:
+        value = raw.get(name, 0.5)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return 0.5
+        return number if 0.0 <= number <= 1.0 else 0.5
+
+    return {
+        "preset": raw.get("preset") if raw.get("preset") in _PRESET_WEIGHTS else "steady",
+        "pace": slider("pace"),
+        "energy": slider("energy"),
+        "variety": slider("variety"),
+    }
+
+
+def _option_weights(options: Mapping[str, Any]) -> tuple[float, float, float, float, float]:
+    """Translate listening options into cost weights for every ordered term."""
+    transition, _, monotony = _PRESET_WEIGHTS.get(options.get("preset") or "", _PRESET_WEIGHTS["steady"])
+    variety = float(options.get("variety", 0.5))
+    return (
+        transition,
+        _TILT_FRACTION * (0.15 + 1.85 * variety),
+        monotony * (0.75 + 0.5 * variety),
+        (float(options.get("pace", 0.5)) - 0.5) * _TILT_STRENGTH,
+        (float(options.get("energy", 0.5)) - 0.5) * _TILT_STRENGTH,
     )
 
 
+def _order_cost(order: np.ndarray, data: dict[str, Any], weights: tuple[float, ...]) -> float:
+    """Combine bounded terms using the chosen listening weights."""
+    terms = _order_terms(order, data)
+    return sum(terms[key] * weight for key, weight in zip(_ORDER_TERMS, weights, strict=True))
+
+
 def _greedy_order(
-    baseline: np.ndarray, free: np.ndarray, seed: int, data: dict[str, Any], profile: Profile
+    baseline: np.ndarray, free: np.ndarray, seed: int, data: dict[str, Any], weights: tuple[float, ...]
 ) -> np.ndarray:
     """Fill free slots using real adjacent boundaries and recent artist/texture history."""
     order = baseline.copy()
     remaining = np.zeros(len(order), dtype=bool)
     remaining[baseline[free]] = True
     free_set = set(free)
-    transition_weight, repeat_weight, monotony_weight = _PROFILE_WEIGHTS[profile]
+    transition_weight, repeat_weight, monotony_weight, pace_weight, energy_weight = weights
+    span = max(1, len(order) - 1)
     for position in free:
         candidates = np.flatnonzero(remaining)
         if position == free[0]:
@@ -757,6 +820,12 @@ def _greedy_order(
                 scores = scores + monotony_weight * np.maximum(
                     0, 1 - distances / (_MONOTONY_WINDOW - 1) / _MONOTONY_THRESHOLD
                 )
+            fraction = position / span
+            scores = (
+                scores
+                + (pace_weight * data["pace_values"][candidates] + energy_weight * data["energy_values"][candidates])
+                * fraction
+            )
             chosen = int(candidates[np.argmin(scores)])
         order[position] = chosen
         remaining[chosen] = False
@@ -764,7 +833,7 @@ def _greedy_order(
 
 
 def _improve_order(
-    candidate: tuple[np.ndarray, float], free: np.ndarray, data: dict[str, Any], profile: Profile, budget: int
+    candidate: tuple[np.ndarray, float], free: np.ndarray, data: dict[str, Any], weights: tuple[float, ...], budget: int
 ) -> tuple[np.ndarray, float, int]:
     """Try swaps and both relocation directions, rescoring all affected directed terms."""
     best, cost, evaluated = candidate[0].copy(), candidate[1], 0
@@ -783,7 +852,7 @@ def _improve_order(
                         trial[slots[0]], trial[slots[-1]] = trial[slots[-1]], trial[slots[0]]
                     else:
                         trial[slots] = np.roll(trial[slots], -1 if operation == "forward" else 1)
-                    trial_cost = _order_cost(trial, data, profile)
+                    trial_cost = _order_cost(trial, data, weights)
                     evaluated += 1
                     if trial_cost < cost - 1e-12:
                         best, cost, improved = trial, trial_cost, True
@@ -801,20 +870,19 @@ def _arrange(entries: list[dict[str, Any]], data: dict[str, Any] | None, choices
     evaluations = 0
     baseline_cost = cost = None
     terms = None
+    weights = _option_weights(choices["options"])
     if data is not None:
-        baseline_cost = cost = _order_cost(baseline, data, choices["profile"])
+        baseline_cost = cost = _order_cost(baseline, data, weights)
         evaluations = 1
         if len(free):
             starts = baseline[free][np.argsort(data["parts"]["summary"]["intensity"][baseline[free]], kind="stable")]
             for index in np.linspace(0, len(starts) - 1, min(4, len(starts)), dtype=int):
-                candidate = _greedy_order(baseline, free, int(starts[index]), data, choices["profile"])
-                candidate_cost = _order_cost(candidate, data, choices["profile"])
+                candidate = _greedy_order(baseline, free, int(starts[index]), data, weights)
+                candidate_cost = _order_cost(candidate, data, weights)
                 evaluations += 1
                 if candidate_cost < cost - 1e-12:
                     best, cost = candidate, candidate_cost
-            best, cost, extra = _improve_order(
-                (best, cost), free, data, choices["profile"], _MAX_EVALUATIONS - evaluations
-            )
+            best, cost, extra = _improve_order((best, cost), free, data, weights, _MAX_EVALUATIONS - evaluations)
             evaluations += extra
         terms = _order_terms(best, data)
     return {
@@ -943,7 +1011,7 @@ class SpotifyPlaylistSorter:
         self.recording_count = 0
         self.arrangement_data: dict[str, Any] | None = None
         self.arrangement_stamp: tuple[str, int] | None = None
-        self.arrangement_results: dict[Profile, dict[str, Any]] = {}
+        self.arrangement_results: dict[tuple[Any, ...], dict[str, Any]] = {}
         self.arrangement_result: dict[str, Any] = {}
 
     def _fetch_tracks_from_spotify(self) -> list[dict[str, Any]]:
@@ -1027,11 +1095,33 @@ class SpotifyPlaylistSorter:
         return audio
 
     @staticmethod
+    def _fresh_video(
+        source: dict[str, Any],
+        video_info: dict[str, Any] | None,
+        attempt: int,
+        *,
+        verify: bool,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Return current video details, confirming identity and requested-recording eligibility."""
+        if attempt == 0 and video_info is not None:
+            video = video_info
+        else:
+            with yt_dlp.YoutubeDL(youtube_options()) as downloader:
+                video = downloader.extract_info(source["url"], download=False)
+        if not video or video.get("id") != source["id"]:
+            raise SourceAccessError("recording_changed")  # noqa: EM101 - fixed reason code.
+        if verify and metadata is not None and _select_recording(_rank_recordings([video], metadata)) is None:
+            raise SourceAccessError("recording_changed") from None  # noqa: EM101 - fixed reason code.
+        return video
+
+    @staticmethod
     def _download_sections(
         source: dict[str, Any],
         *,
         video_info: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        verify: bool = True,
     ) -> list[tuple[str, float, float, np.ndarray]]:
         """Download sampled windows concurrently with a per-attempt deadline, retrying once with fresh metadata."""
         duration = float(source["duration"])
@@ -1043,17 +1133,9 @@ class SpotifyPlaylistSorter:
             sections: list[tuple[str, float, float, np.ndarray]] = []
             try:
                 with tempfile.TemporaryDirectory() as directory:
-                    if attempt == 0 and video_info is not None:
-                        video = video_info
-                    else:
-                        with yt_dlp.YoutubeDL(youtube_options()) as downloader:
-                            video = downloader.extract_info(source["url"], download=False)
-                    if (
-                        not video
-                        or video.get("id") != source["id"]
-                        or (metadata is not None and _select_recording(_rank_recordings([video], metadata)) is None)
-                    ):
-                        raise SourceAccessError("recording_changed")  # noqa: TRY301, EM101 - fixed reason code.
+                    video = SpotifyPlaylistSorter._fresh_video(
+                        source, video_info, attempt, verify=verify, metadata=metadata
+                    )
                     executor = ThreadPoolExecutor(max_workers=len(plan))
                     submitted: list[Future[np.ndarray]] = [
                         executor.submit(
@@ -1090,13 +1172,10 @@ class SpotifyPlaylistSorter:
         raise last_error
 
     @staticmethod
-    def _find_recordings(
-        metadata: dict[str, Any], diagnostics: dict[str, Any]
-    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
-        """Search cheaply and hydrate only until one candidate already proves eligible."""
+    def _search_entries(metadata: dict[str, Any], diagnostics: dict[str, Any]) -> list[dict[str, Any]]:
+        """Run one bounded YouTube search, retrying plainly when the audio hint yields junk."""
         options: dict[str, Any] = {**youtube_options(), "extract_flat": "in_playlist", "format": "bestaudio"}
-        full: dict[str, dict[str, Any]] = {}
-        ranked: list[dict[str, Any]] = []
+        entries: list[dict[str, Any]] = []
         with yt_dlp.YoutubeDL(options) as search:
             started = perf_counter()
             query = f"ytsearch10:{metadata['title']} {' '.join(metadata['artists'][:2])} audio"
@@ -1108,8 +1187,7 @@ class SpotifyPlaylistSorter:
                 ) from error
             diagnostics["search_seconds"] = round(perf_counter() - started, 3)
             entries = [entry for entry in (info.get("entries") or [info]) if entry]
-            candidates = _shortlist(entries, metadata)
-            if not candidates:
+            if not _shortlist(entries, metadata):
                 # Some queries return junk with the audio hint; retry plainly before giving up.
                 retry = f"ytsearch10:{metadata['title']} {metadata['artists'][0]}"
                 try:
@@ -1119,8 +1197,47 @@ class SpotifyPlaylistSorter:
                         failure_reason(str(error)) or options["logger"].reason or "source_failed"
                     ) from error
                 entries = [entry for entry in (info.get("entries") or [info]) if entry]
-                candidates = _shortlist(entries, metadata)
             diagnostics["search_results"] = len(entries)
+        return entries
+
+    @staticmethod
+    def search_recordings(track: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return flat YouTube candidates so a listener can choose this song's recording."""
+        metadata = _metadata(track)
+        duration_ms = _positive_number(metadata["duration_ms"])
+        if duration_ms is None or not metadata["artists"] or not all(metadata["artists"]):
+            return []
+        diagnostics: dict[str, Any] = {}
+        entries = SpotifyPlaylistSorter._search_entries(metadata, diagnostics)
+        suggested = {str(entry["id"]) for entry in _shortlist(entries, metadata)}
+        candidates: list[dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", str(entry.get("id") or "")):
+                continue
+            candidates.append(
+                {
+                    "video_id": entry["id"],
+                    "title": str(entry.get("title") or ""),
+                    "channel": str(entry.get("channel") or entry.get("uploader") or ""),
+                    "duration_seconds": _positive_number(entry.get("duration")),
+                    "live": bool(entry.get("is_live")),
+                    "suggested": entry["id"] in suggested,
+                }
+            )
+        candidates.sort(key=lambda item: (not item["suggested"], item["title"]))
+        return candidates
+
+    @staticmethod
+    def _find_recordings(
+        metadata: dict[str, Any], diagnostics: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+        """Search cheaply and hydrate only until one candidate already proves eligible."""
+        options: dict[str, Any] = {**youtube_options(), "extract_flat": "in_playlist", "format": "bestaudio"}
+        full: dict[str, dict[str, Any]] = {}
+        ranked: list[dict[str, Any]] = []
+        with yt_dlp.YoutubeDL(options) as search:
+            entries = SpotifyPlaylistSorter._search_entries(metadata, diagnostics)
+            candidates = _shortlist(entries, metadata)
             diagnostics["candidates_checked"] = 0
             while candidates and not _select_recording(ranked):
                 candidate = candidates.pop(0)
@@ -1177,13 +1294,17 @@ class SpotifyPlaylistSorter:
         video_info: dict[str, Any] | None,
         metadata: dict[str, Any],
         notify: Callable[[str], None],
+        *,
+        verify: bool = True,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, float]]:
         """Download sampled windows and measure them, or return the terminal failure result."""
         timings: dict[str, float] = {}
         try:
             notify("downloading")
             step = perf_counter()
-            sections = SpotifyPlaylistSorter._download_sections(source, video_info=video_info, metadata=metadata)
+            sections = SpotifyPlaylistSorter._download_sections(
+                source, video_info=video_info, metadata=metadata, verify=verify
+            )
             timings["download_seconds"] = round(perf_counter() - step, 3)
             notify("analyzing")
             step = perf_counter()
@@ -1198,13 +1319,21 @@ class SpotifyPlaylistSorter:
 
     @staticmethod
     def _record_for(source: dict[str, Any], metadata: dict[str, Any], analysis: dict[str, Any]) -> dict[str, Any]:
-        """Bind fresh metadata and a fingerprint to measurements, ready for the cache."""
+        """Bind fresh metadata, a fingerprint and listener-facing recording details to measurements."""
+        score = _positive_number(source.get("score"))
         return {
             "status": "ready",
             "metadata": metadata,
             "source": source,
             "source_fingerprint": _source_fingerprint(source),
             "analysis": analysis,
+            "recording": {
+                "video_id": source.get("id"),
+                "title": source.get("title"),
+                "channel": source.get("channel"),
+                "duration_seconds": source.get("duration"),
+                "confident": score is not None and score >= _MATCH_SCORE,
+            },
         }
 
     @staticmethod
@@ -1372,6 +1501,58 @@ class SpotifyPlaylistSorter:
                 _save_cache(cache)
         return _with_intensity(results)
 
+    def reanalyze_track(
+        self,
+        entry: dict[str, Any],
+        video_id: str,
+        record_callback: Callable[[str, dict[str, Any]], None] | None = None,
+        deadline: float | None = None,
+    ) -> tuple[bool, str]:
+        """Reanalyze one occurrence with a listener-chosen recording and update cached state."""
+
+        def expired() -> bool:
+            return deadline is not None and perf_counter() > deadline
+
+        if entry["id"] is None:
+            return False, "This item has no Spotify recording to replace."
+        notify = record_callback or (lambda _key, _result: None)
+        notify(entry["id"], {"status": "matching"})
+        video = SpotifyPlaylistSorter._hydrate_candidate({"id": video_id})
+        if video is None or video.get("id") != video_id:
+            return False, "Couldn't load that recording. Try another one."
+        if expired():
+            return False, "This took too long. Try again shortly."
+        metadata = _metadata(entry)
+        record, failure, _timings = SpotifyPlaylistSorter._measure_source(
+            video, video, metadata, lambda stage: notify(entry["id"], {"status": stage}), verify=False
+        )
+        if record is None:
+            return False, str(
+                failure.get("message") or "Couldn't analyze this recording."
+            ) if failure else "Couldn't analyze this recording."
+        if expired():
+            return False, "This took too long. Try again shortly."
+        cache = _load_cache()
+        cache[entry["id"]] = record
+        _save_cache(cache)
+        processed = _with_intensity({**self.audio_features, entry["id"]: record})
+        self.audio_features = processed
+        features = processed.get(entry["id"], {})
+        entry["analysis_status"] = "ready"
+        entry["fixed_reason"] = None
+        entry.update(BPM=features.get("tempo"), Energy=features.get("energy"), Camelot=features.get("camelot"))
+        entry["Recording"] = features.get("recording")
+        self.tracks_data = pd.DataFrame(self.original_items)
+        if not self.tracks_data.empty:
+            self.tracks_data = self.tracks_data.set_index("occurrence", drop=False)
+        self.arrangement_data = None
+        self.arrangement_stamp = None
+        self.arrangement_results.clear()
+        self.arrangement_result = {}
+        self.invalidate_save()
+        notify(entry["id"], {"status": "ready"})
+        return True, "Recording updated."
+
     def load_playlist(
         self,
         progress_callback: Callable[[int, int], None] | None = None,
@@ -1418,6 +1599,7 @@ class SpotifyPlaylistSorter:
                 BPM=features.get("tempo"),
                 Energy=features.get("energy"),
                 Camelot=features.get("camelot"),
+                Recording=features.get("recording"),
             )
             if entry["fixed_reason"] is None and features.get("status") != "ready":
                 entry["fixed_reason"] = features.get("message", "Couldn't analyze this song")
@@ -1446,26 +1628,28 @@ class SpotifyPlaylistSorter:
 
     def choice_error(
         self,
+        options: Mapping[str, Any] | None = None,
         first: str | None = None,
         last: str | None = None,
-        profile: Profile = "smooth",
         placements: dict[str, int] | None = None,
     ) -> str | None:
-        """Reject foreign profiles or pins that conflict with complete-entry constraints."""
-        if profile not in _PROFILE_WEIGHTS:
-            return "Choose Smooth or More variety."
+        """Reject foreign options or pins that conflict with complete-entry constraints."""
+        options = _normalized_options(options)
+        if options["preset"] not in _PRESET_WEIGHTS:
+            return "Choose a flow style."
         return _pin_error(self.original_items, first, last, placements)
 
     def sort_playlist(
         self,
+        options: Mapping[str, Any] | None = None,
         first_occurrence: str | None = None,
         last_occurrence: str | None = None,
-        profile: Profile = "smooth",
         placements: dict[str, int] | None = None,
     ) -> list[str]:
         """Arrange complete occurrences using cached directed measurements and optional endpoints."""
         chosen_placements = dict(placements or {})
-        if self.choice_error(first_occurrence, last_occurrence, profile, chosen_placements):
+        chosen_options = _normalized_options(options)
+        if self.choice_error(chosen_options, first_occurrence, last_occurrence, chosen_placements):
             return []
         self.placements = chosen_placements
         stamp = (ANALYSIS_VERSION, _SCORING_VERSION)
@@ -1479,15 +1663,24 @@ class SpotifyPlaylistSorter:
             self.arrangement_results.clear()
             self.arrangement_stamp = stamp
         choices = {
-            "profile": profile,
+            "options": chosen_options,
             "first_occurrence": first_occurrence,
             "last_occurrence": last_occurrence,
             "placements": chosen_placements,
         }
-        result = self.arrangement_results.get(profile)
-        if result is None or any(result[key] != value for key, value in choices.items()):
+        key = (
+            chosen_options["preset"],
+            f"{chosen_options['pace']:.3f}",
+            f"{chosen_options['energy']:.3f}",
+            f"{chosen_options['variety']:.3f}",
+            first_occurrence or "",
+            last_occurrence or "",
+            tuple(sorted(chosen_placements.items())),
+        )
+        result = self.arrangement_results.get(key)
+        if result is None:
             result = _arrange(self.original_items, self.arrangement_data, choices)
-            self.arrangement_results[profile] = result
+            self.arrangement_results[key] = result
         order = result["order"]
         if (
             not self.valid_order(order)
@@ -1495,14 +1688,9 @@ class SpotifyPlaylistSorter:
             or (last_occurrence and order[-1] != last_occurrence)
         ):
             return []
-        other = self.arrangement_results.get("variety" if profile == "smooth" else "smooth")
-        comparable = other is not None and all(
-            other[key] == choices[key] for key in ("first_occurrence", "last_occurrence", "placements")
-        )
         self.arrangement_result = {
             **result,
             "unchanged": order == self.current_order,
-            "same_as_other_profile": other["order"] == order if comparable else None,
         }
         return list(order)
 

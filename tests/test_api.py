@@ -20,6 +20,7 @@ from spotipy.exceptions import SpotifyOauthError
 
 from api.app import COOKIE, Session, create_app
 from api.playlist_sorter import SpotifyPlaylistSorter
+from api.youtube import SourceAccessError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -346,9 +347,9 @@ class MigrationTest(unittest.TestCase):
         original = sorter.current_order.copy()
         order = sorter.sort_playlist(last_occurrence=original[3])
         assert order == [original[i] for i in (0, 1, 2, 4, 3)]
-        assert sorter.sort_playlist("foreign:snapshot:0") == []
-        assert sorter.sort_playlist(original[4]) == []
-        assert sorter.sort_playlist(original[0], original[3]) == order
+        assert sorter.sort_playlist(first_occurrence="foreign:snapshot:0") == []
+        assert sorter.sort_playlist(first_occurrence=original[4]) == []
+        assert sorter.sort_playlist(first_occurrence=original[0], last_occurrence=original[3]) == order
         transitions = sorter.get_transition_analysis(order)
         assert [t["score"] is None for t in transitions] == [True, True, True, False]
         assert (transitions[-1]["track1_occurrence"], transitions[-1]["track2_occurrence"]) == tuple(order[-2:])
@@ -366,8 +367,8 @@ class MigrationTest(unittest.TestCase):
                 assert not sorter.update_spotify_playlist(invalid)[0]
         sp.playlist_reorder_items.assert_not_called()
 
-    def test_profiles_optional_pins_and_noop_previews(self) -> None:
-        """Bind profile/pin choices to a revision without reanalyzing or saving unchanged orders."""
+    def test_options_optional_pins_and_noop_previews(self) -> None:
+        """Bind option/pin choices to a revision without reanalyzing or saving unchanged orders."""
         sp = Mock()
         sp.playlist.return_value = {"name": "Evening", "snapshot_id": "snapshot", "owner": {"id": "listener"}}
         sp.playlist_items.return_value = {
@@ -391,7 +392,7 @@ class MigrationTest(unittest.TestCase):
                 client.post("/api/job/sort", headers=headers, json={"revision": loaded["revision"]}).status_code == 202
             )
             original = client.get("/api/job").json()
-            assert original["profile"] == "smooth"
+            assert original["options"]["preset"] == "steady"
             assert original["first_occurrence"] is None
             assert original["last_occurrence"] is None
             assert original["arrangement"]["unchanged"]
@@ -402,7 +403,7 @@ class MigrationTest(unittest.TestCase):
             )
             first = original["tracks"][0]["occurrence"]
             for invalid in (
-                {"profile": "workout"},
+                {"options": {"preset": "workout"}},
                 {"first_occurrence": "foreign"},
                 {"first_occurrence": first, "last_occurrence": first},
                 {"last_occurrence": original["tracks"][1]["occurrence"]},
@@ -419,25 +420,25 @@ class MigrationTest(unittest.TestCase):
                     headers=headers,
                     json={
                         "revision": original["revision"],
-                        "profile": "variety",
+                        "options": {"preset": "mixed", "pace": 0.2, "energy": 0.9, "variety": 0.6},
                         "last_occurrence": first,
                     },
                 ).status_code
                 == 202
             )
-            variety = client.get("/api/job").json()
-            assert variety["profile"] == "variety"
-            assert variety["first_occurrence"] is None
-            assert variety["last_occurrence"] == first
-            assert [entry["id"] for entry in variety["sorted_tracks"]] == [SECOND, None, FIRST]
-            assert not variety["arrangement"]["unchanged"]
-            assert variety["arrangement"]["cost"] <= variety["arrangement"]["baseline_cost"]
-            fixed = variety["tracks"][1]["occurrence"]
+            mixed = client.get("/api/job").json()
+            assert mixed["options"] == {"preset": "mixed", "pace": 0.2, "energy": 0.9, "variety": 0.6}
+            assert mixed["first_occurrence"] is None
+            assert mixed["last_occurrence"] == first
+            assert [entry["id"] for entry in mixed["sorted_tracks"]] == [SECOND, None, FIRST]
+            assert not mixed["arrangement"]["unchanged"]
+            assert mixed["arrangement"]["cost"] <= mixed["arrangement"]["baseline_cost"]
+            fixed = mixed["tracks"][1]["occurrence"]
             assert (
                 client.post(
                     "/api/job/sort",
                     headers=headers,
-                    json={"revision": variety["revision"], "placements": {first: 0}},
+                    json={"revision": mixed["revision"], "placements": {first: 0}},
                 ).status_code
                 == 422
             )
@@ -445,7 +446,7 @@ class MigrationTest(unittest.TestCase):
                 client.post(
                     "/api/job/sort",
                     headers=headers,
-                    json={"revision": variety["revision"], "placements": {fixed: 0}},
+                    json={"revision": mixed["revision"], "placements": {fixed: 0}},
                 ).status_code
                 == 202
             )
@@ -564,6 +565,158 @@ class MigrationTest(unittest.TestCase):
                 client.post("/api/job/save", headers=headers, json={"revision": failed["revision"]}).status_code == 409
             )
             sp.playlist_reorder_items.assert_not_called()
+
+    def test_match_review_searches_and_applies_a_chosen_recording(self) -> None:
+        """Expose candidates per occurrence and reanalyze one song with a listener-chosen video."""
+        sp = Mock()
+        sp.playlist.return_value = {"name": "Check", "snapshot_id": "snapshot", "owner": {"id": "listener"}}
+        sp.playlist_items.return_value = {
+            "items": [spotify_item(FIRST, "First"), spotify_item(SECOND, "Second")],
+            "next": None,
+        }
+        features = {key: {"status": "ready", "tempo": 120.0, "camelot": None, "energy": 0.5} for key in (FIRST, SECOND)}
+        candidates = [
+            {
+                "video_id": "d" * 11,
+                "title": "First (audio)",
+                "channel": "Topic",
+                "duration_seconds": 200.0,
+                "live": False,
+                "suggested": True,
+            },
+            {
+                "video_id": "e" * 11,
+                "title": "First live",
+                "channel": "Channel",
+                "duration_seconds": 220.0,
+                "live": True,
+                "suggested": False,
+            },
+        ]
+        app = create_app()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("api.playlist_sorter._CACHE_FILE", Path(directory) / "cache.json"),
+            patch("api.app.get_spotify_client", return_value=sp),
+            patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features),
+            TestClient(app) as client,
+        ):
+            session = Session(auth=Mock(), state="", user={"id": "listener"})
+            app.state.sessions["test-session"] = session
+            client.cookies.set(COOKIE, "test-session")
+            headers = {"X-CSRF-Token": session.csrf}
+            client.post(f"/api/playlists/{PLAYLIST}/analyze", headers=headers)
+            loaded = client.get("/api/job").json()
+            occurrence = loaded["tracks"][0]["occurrence"]
+            with patch.object(SpotifyPlaylistSorter, "search_recordings", return_value=candidates) as search:
+                listed = client.get(f"/api/job/matches/{occurrence}", headers=headers)
+                assert listed.status_code == 200
+                assert [item["video_id"] for item in listed.json()] == ["d" * 11, "e" * 11]
+                search.assert_called_once()
+            with patch.object(
+                SpotifyPlaylistSorter,
+                "search_recordings",
+                side_effect=SourceAccessError("source_failed"),
+            ):
+                assert client.get(f"/api/job/matches/{occurrence}", headers=headers).status_code == 502
+            assert (
+                client.post(
+                    f"/api/job/matches/{occurrence}",
+                    headers=headers,
+                    json={"video_id": "bad id"},
+                ).status_code
+                == 422
+            )
+            with patch.object(
+                SpotifyPlaylistSorter,
+                "reanalyze_track",
+                side_effect=[(True, "Recording updated."), (False, "Couldn't analyze this recording.")],
+            ):
+                first = client.post(f"/api/job/matches/{occurrence}", headers=headers, json={"video_id": "d" * 11})
+                assert first.status_code == 202
+                updated = client.get("/api/job").json()
+                assert updated["status"] == "ready"
+                assert updated["sorted_tracks"] == []
+                assert updated["arrangement"] is None
+                assert updated["revision"] != loaded["revision"]
+                assert updated["tracks"][0]["analysis_status"] == "ready"
+                second = client.post(f"/api/job/matches/{occurrence}", headers=headers, json={"video_id": "e" * 11})
+                assert second.status_code == 202
+                failed_match = client.get("/api/job").json()
+                assert failed_match["status"] == "error"
+                assert failed_match["tracks"][0]["fixed_reason"] == "Couldn't analyze this recording."
+            assert (
+                client.post(
+                    f"/api/job/matches/{occurrence}",
+                    headers=headers,
+                    json={"video_id": "d" * 11},
+                ).status_code
+                == 409
+            )
+        sp.playlist_reorder_items.assert_not_called()
+
+    def test_rematch_times_out_and_ignores_late_results(self) -> None:
+        """A stuck reanalysis is cancelled by the deadline and late completions lose the race."""
+        sp = Mock()
+        sp.playlist.return_value = {"name": "Check", "snapshot_id": "snapshot", "owner": {"id": "listener"}}
+        sp.playlist_items.return_value = {
+            "items": [spotify_item(FIRST, "First"), spotify_item(SECOND, "Second")],
+            "next": None,
+        }
+        features = {key: {"status": "ready", "tempo": 120.0, "camelot": None, "energy": 0.5} for key in (FIRST, SECOND)}
+        release_worker = Event()
+        worker_done = Event()
+        app = create_app()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("api.playlist_sorter._CACHE_FILE", Path(directory) / "cache.json"),
+            patch("api.app.get_spotify_client", return_value=sp),
+            patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features),
+            patch("api.app.REANALYZE_SECONDS", 0.1),
+            patch("api.app.REANALYZE_MARGIN_SECONDS", 0.1),
+            TestClient(app) as client,
+        ):
+            session = Session(auth=Mock(), state="", user={"id": "listener"})
+            app.state.sessions["test-session"] = session
+            client.cookies.set(COOKIE, "test-session")
+            headers = {"X-CSRF-Token": session.csrf}
+            client.post(f"/api/playlists/{PLAYLIST}/analyze", headers=headers)
+            loaded = client.get("/api/job").json()
+            occurrence = loaded["tracks"][0]["occurrence"]
+
+            def stuck_reanalyze(
+                _entry: dict[str, Any],
+                _video_id: str,
+                _notify: Callable[[str, dict[str, Any]], None],
+                *,
+                deadline: float | None = None,  # noqa: ARG001 - signature mirrors reanalyze_track
+            ) -> tuple[bool, str]:
+                assert release_worker.wait(5), "test never released the stuck reanalysis"
+                worker_done.set()
+                return True, "Recording updated."
+
+            with patch.object(SpotifyPlaylistSorter, "reanalyze_track", side_effect=stuck_reanalyze):
+                assert (
+                    client.post(
+                        f"/api/job/matches/{occurrence}", headers=headers, json={"video_id": "d" * 11}
+                    ).status_code
+                    == 202
+                )
+                timed_out = client.get("/api/job").json()
+                assert timed_out["status"] == "error"
+                assert "took too long" in timed_out["error"]
+                assert timed_out["tracks"][0]["analysis_status"] == "matching"
+                # The deadline also blocks further attempts while the worker runs.
+                assert (
+                    client.post(
+                        f"/api/job/matches/{occurrence}", headers=headers, json={"video_id": "e" * 11}
+                    ).status_code
+                    == 409
+                )
+                release_worker.set()
+                assert worker_done.wait(5)
+                assert client.get("/api/job").json()["status"] == "error"
+        sp.playlist_reorder_items.assert_not_called()
 
     def test_revoked_login_clears_the_browser_session(self) -> None:
         """A revoked refresh token must not leave the browser stuck in a login loop."""
