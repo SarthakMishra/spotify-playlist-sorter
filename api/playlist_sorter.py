@@ -1645,21 +1645,64 @@ class SpotifyPlaylistSorter:
         self.snapshot_id = None
         self.restore_order = []
 
-    def _order_matches(self, order: list[str]) -> bool:
-        """Read every page between matching snapshots and compare the complete sequence."""
-        if (
-            not self.snapshot_id
-            or self.sp.playlist(self.playlist_id, fields="snapshot_id")["snapshot_id"] != self.snapshot_id
-        ):
-            return False
+    def _read_snapshot(self) -> str | None:
+        """Return the snapshot id Spotify currently reports for the playlist."""
+        snapshot = self.sp.playlist(self.playlist_id, fields="snapshot_id")
+        reported = snapshot.get("snapshot_id") if snapshot else None
+        return reported if isinstance(reported, str) else None
+
+    def _read_identities(self) -> list[tuple[Any, ...]]:
+        """Read every page and list item identities in current playlist order."""
         observed = []
         results = self.sp.playlist_items(self.playlist_id)
         while results:
             observed.extend(self._item_identity(item or {}) for item in results["items"])
             results = self.sp.next(results) if results.get("next") else None
+        return observed
+
+    def _expected_identities(self, order: list[str]) -> list[tuple[Any, ...]]:
+        """Translate an occurrence order into identities recorded when the playlist loaded."""
         identities = {entry["occurrence"]: entry["spotify_identity"] for entry in self.original_items}
-        latest = self.sp.playlist(self.playlist_id, fields="snapshot_id")["snapshot_id"]
-        return latest == self.snapshot_id and observed == [identities[occurrence] for occurrence in order]
+        return [identities[occurrence] for occurrence in order]
+
+    def _log_mismatch(self, phase: str, observed: list[tuple[Any, ...]], expected: list[tuple[Any, ...]]) -> None:
+        """Point at the first differing position without logging track details."""
+        detail = f"{len(observed)} items instead of {len(expected)}"
+        if len(observed) == len(expected):
+            for position, (seen, wanted) in enumerate(zip(observed, expected, strict=True)):
+                if seen != wanted:
+                    detail = f"position {position} differs"
+                    break
+        logger.warning("Playlist %s item readback %s does not match the write (%s)", self.playlist_id, phase, detail)
+
+    def _order_matches(self, order: list[str]) -> bool:
+        """Require an unchanged snapshot around a complete readback before writing."""
+        if not self.snapshot_id or self._read_snapshot() != self.snapshot_id:
+            logger.info("Playlist %s snapshot is missing or stale before the write", self.playlist_id)
+            return False
+        expected = self._expected_identities(order)
+        observed = self._read_identities()
+        if self._read_snapshot() != self.snapshot_id:
+            logger.warning("Playlist %s snapshot moved while reading items before the write", self.playlist_id)
+            return False
+        if observed != expected:
+            self._log_mismatch("before writing", observed, expected)
+            return False
+        return True
+
+    def _confirm_order(self, order: list[str]) -> bool:
+        """Trust the item readback over snapshots Spotify may echo or update late after a write."""
+        expected = self._expected_identities(order)
+        observed = self._read_identities()
+        if observed != expected:
+            self._log_mismatch("after writing", observed, expected)
+            return False
+        fresh = self._read_snapshot()
+        if fresh:
+            self.snapshot_id = fresh
+        else:
+            logger.warning("Playlist %s readback matched but Spotify reported no snapshot id", self.playlist_id)
+        return True
 
     def update_spotify_playlist(self, order: list[str]) -> tuple[bool, str]:
         """Apply the exact complete preview using range moves, never replacement."""
@@ -1697,10 +1740,13 @@ class SpotifyPlaylistSorter:
                 )
                 self.snapshot_id = result["snapshot_id"]
                 if not isinstance(self.snapshot_id, str) or not self.snapshot_id:
+                    logger.warning(
+                        "Playlist %s move to position %s returned no snapshot id", self.playlist_id, destination
+                    )
                     self.invalidate_save()
                     return False, unverified
                 current.insert(destination, current.pop(source))
-            if not self._order_matches(order):
+            if not self._confirm_order(order):
                 self.invalidate_save()
                 return False, unverified
         except Exception:

@@ -100,7 +100,8 @@ class PlaylistWritesTest(unittest.TestCase):
     def test_source_order_must_match_before_writing(self) -> None:
         """A stale or incomplete initial read cannot be used to calculate provider moves."""
         self.items.pop()
-        assert not self.sorter.update_spotify_playlist(self.target)[0]
+        with self.assertLogs("api.playlist_sorter", level="WARNING"):
+            assert not self.sorter.update_spotify_playlist(self.target)[0]
         assert self.sorter.snapshot_id is None
         assert not self.sorter.can_restore
         self.sp.playlist_reorder_items.assert_not_called()
@@ -174,7 +175,8 @@ class PlaylistWritesTest(unittest.TestCase):
             return response
 
         self.sp.playlist_reorder_items.side_effect = lose_response
-        assert not self.sorter.update_spotify_playlist(self.target)[0]
+        with self.assertLogs("api.playlist_sorter", level="WARNING"):
+            assert not self.sorter.update_spotify_playlist(self.target)[0]
         assert self.items != self.original
         assert self.sorter.current_order == self.order
         assert self.sorter.snapshot_id is None
@@ -189,14 +191,15 @@ class PlaylistWritesTest(unittest.TestCase):
         """Never continue a multi-move write without its next snapshot constraint."""
         self.sp.playlist_reorder_items.return_value = {"snapshot_id": None}
         self.sp.playlist_reorder_items.side_effect = None
-        assert not self.sorter.update_spotify_playlist(self.target)[0]
+        with self.assertLogs("api.playlist_sorter", level="WARNING"):
+            assert not self.sorter.update_spotify_playlist(self.target)[0]
         self.sp.playlist_reorder_items.assert_called_once()
         assert self.sorter.snapshot_id is None
         assert not self.sorter.can_restore
 
     def test_changed_or_incorrect_readback_never_confirms_a_save(self) -> None:
         """Even a successful move response cannot confirm a torn, incomplete or wrong read."""
-        for fault in ("snapshot", "missing", "duplicate", "fixed", "response"):
+        for fault in ("missing", "duplicate", "fixed", "response"):
             with self.subTest(fault=fault):
                 self.setUp()
 
@@ -231,20 +234,53 @@ class PlaylistWritesTest(unittest.TestCase):
                     session = Session(auth=Mock(), state="", user={"id": "listener"}, job=job)
                     app.state.sessions["test"] = session
                     client.cookies.set(COOKIE, "test")
-                    assert (
-                        client.post(
-                            "/api/job/save",
-                            json={"revision": job.view.revision},
-                            headers={"X-CSRF-Token": session.csrf},
-                        ).status_code
-                        == 202
-                    )
+                    with self.assertLogs("api.playlist_sorter", level="WARNING"):
+                        assert (
+                            client.post(
+                                "/api/job/save",
+                                json={"revision": job.view.revision},
+                                headers={"X-CSRF-Token": session.csrf},
+                            ).status_code
+                            == 202
+                        )
                     failed = client.get("/api/job").json()
                     assert failed["status"] == "error"
                     assert not failed["can_restore"]
                     assert "Some songs may have moved" in failed["error"]
                     assert self.sorter.snapshot_id is None
                 self.tearDown()
+
+    def test_late_snapshot_update_still_confirms_a_matching_save(self) -> None:
+        """Spotify can bump the snapshot during the readback while the items already match."""
+
+        def lag_snapshot(*_: object) -> dict[str, Any]:
+            if self.version:
+                self.sp.next.side_effect = None
+                self.version += 1
+            return {"items": self.items[3:], "next": None}
+
+        self.sp.next.side_effect = lag_snapshot
+        with self.assertNoLogs("api.playlist_sorter", level="WARNING"):
+            assert self.sorter.update_spotify_playlist(self.target)[0]
+        assert self.sorter.snapshot_id == str(self.version)
+        assert self.items == [self.original[i] for i in (2, 1, 0, 3, 4, 5, 6)]
+
+    def test_echoed_move_snapshot_still_confirms_a_matching_save(self) -> None:
+        """A reorder response repeating its input snapshot cannot fail a matching readback."""
+        moves = 0
+
+        def echo_last_response(playlist: str, source: int, destination: int, **kwargs: object) -> dict[str, str]:
+            nonlocal moves
+            result = self.move(playlist, source, destination, **kwargs)
+            moves += 1
+            return result if moves < 2 else {"snapshot_id": str(kwargs["snapshot_id"])}
+
+        self.sp.playlist_reorder_items.side_effect = echo_last_response
+        with self.assertNoLogs("api.playlist_sorter", level="WARNING"):
+            assert self.sorter.update_spotify_playlist(self.target)[0]
+        assert self.sp.playlist_reorder_items.call_count == 2
+        assert self.sorter.snapshot_id == str(self.version)
+        assert self.items == [self.original[i] for i in (2, 1, 0, 3, 4, 5, 6)]
 
     def test_restore_failure_and_new_analysis_remove_eligibility(self) -> None:
         """A fresh check loses history; an uncertain restore cannot be retried."""
