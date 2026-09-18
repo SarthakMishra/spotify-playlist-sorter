@@ -7,7 +7,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
 from time import sleep
 from typing import Any
 from unittest.mock import Mock, patch
@@ -657,6 +657,28 @@ class RecordingPipelineTest(unittest.TestCase):
             ]
             extract.assert_not_called()
             assert download.call_count == 3
+
+    def test_sections_download_concurrently_in_plan_order(self) -> None:
+        """Overlapping section downloads cut wall time while results stay in plan order."""
+        source = {**SOURCE, "url": "https://www.youtube.com/watch?v=abcdefghijk"}
+        info = {**SOURCE, "formats": []}
+        barrier = Barrier(3)
+        marker = {"intro": 1.0, "body": 2.0, "outro": 3.0}
+
+        def section(_video: dict[str, Any], plan_section: tuple[str, float, float], *_args: object) -> np.ndarray:
+            barrier.wait(timeout=5)  # a sequential download cannot reach three simultaneous arrivals
+            sleep(0.05 if plan_section[0] == "intro" else 0.0)
+            return np.full(20 * 22050, marker[plan_section[0]], dtype=np.float32)
+
+        with patch.object(playlist_sorter.SpotifyPlaylistSorter, "_download_section", side_effect=section):
+            sections = playlist_sorter.SpotifyPlaylistSorter._download_sections(source, video_info=info)
+
+        assert [(label, start, end) for label, start, end, _audio in sections] == [
+            ("intro", 0.0, 20.0),
+            ("body", 80.0, 100.0),
+            ("outro", 160.0, 180.0),
+        ]
+        assert [float(sections[index][3][0]) for index in range(3)] == [1.0, 2.0, 3.0]
 
     def test_expired_download_is_retried_with_fresh_audio_metadata(self) -> None:
         """A 403 must refresh the video extraction rather than repeat the expired media URL."""

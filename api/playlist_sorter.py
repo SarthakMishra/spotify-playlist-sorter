@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -12,7 +13,7 @@ import secrets
 import tempfile
 import unicodedata
 from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
 from itertools import pairwise
 from pathlib import Path
@@ -1034,7 +1035,7 @@ class SpotifyPlaylistSorter:
         video_info: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> list[tuple[str, float, float, np.ndarray]]:
-        """Download only boundary and middle windows, retrying once with fresh audio metadata."""
+        """Download sampled windows concurrently, retrying once with fresh audio metadata."""
         duration = float(source["duration"])
         plan = section_plan(duration)
         last_error = SourceAccessError("download_failed")
@@ -1055,12 +1056,22 @@ class SpotifyPlaylistSorter:
                         or (metadata is not None and _select_recording(_rank_recordings([video], metadata)) is None)
                     ):
                         raise SourceAccessError("recording_changed")  # noqa: TRY301, EM101 - fixed reason code.
-                    for plan_section in plan:
-                        audio = SpotifyPlaylistSorter._download_section(
-                            video, plan_section, duration, Path(directory), cookie_text
+                    with ThreadPoolExecutor(max_workers=len(plan)) as executor:
+                        submitted: list[Future[np.ndarray]] = [
+                            executor.submit(
+                                SpotifyPlaylistSorter._download_section,
+                                copy.deepcopy(video),
+                                plan_section,
+                                duration,
+                                Path(directory),
+                                cookie_text,
+                            )
+                            for plan_section in plan
+                        ]
+                        sections.extend(
+                            (label, start, end, future.result())
+                            for (label, start, end), future in zip(plan, submitted, strict=True)
                         )
-                        label, start, end = plan_section
-                        sections.append((label, start, end, audio))
             except SourceAccessError:
                 raise
             except Exception as error:
