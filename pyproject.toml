@@ -9,7 +9,6 @@ dependencies = [
     "pandas>=3.0.5",
     "pydantic>=2.13.5",
     "python-dotenv>=1.2.3",
-    "secretstorage>=3.3.3 ; sys_platform == 'linux'",
     "soundfile>=0.14.0",
     "spotipy>=2.26.0",
     "uvicorn>=0.52.4",

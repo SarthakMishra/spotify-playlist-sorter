@@ -19,7 +19,7 @@ from itertools import pairwise
 from pathlib import Path
 from threading import Condition, Event
 from time import perf_counter, sleep
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
@@ -489,7 +489,6 @@ def _with_intensity(records: dict[str, dict[str, Any]]) -> dict[str, dict[str, A
     return result
 
 
-Preset = Literal["gentle", "steady", "buildup", "mixed"]
 # (transition, repetition, monotony) base weights per named flow preset.
 _PRESET_WEIGHTS: dict[str, tuple[float, float, float]] = {
     "gentle": (0.85, 0.08, 0.07),
