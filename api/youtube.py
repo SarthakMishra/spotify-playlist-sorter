@@ -163,7 +163,7 @@ def youtube_options(cookie_text: str = "") -> dict[str, Any]:
         "retries": 2,
         "extractor_retries": 1,
         "fragment_retries": 2,
-        "retry_sleep_functions": {key: lambda attempt: min(2**attempt, 8) for key in ("http", "fragment", "extractor")},
+        "retry_sleep_functions": {key: lambda n: min(2**n, 8) for key in ("http", "fragment", "extractor")},
         "skip_unavailable_fragments": False,
     }
     if cookie_text:

@@ -33,6 +33,15 @@ def recording(track: dict[str, Any], **_kwargs: object) -> dict[str, Any]:
     }
 
 
+def full_sections(wave: np.ndarray, sr: int = audio_analysis.SAMPLE_RATE) -> list[tuple[str, float, float, np.ndarray]]:
+    """Wrap a waveform in the sections a recording download would produce."""
+    return [
+        (*plan, wave)
+        for label, start, end in audio_analysis.section_plan(len(wave) / sr)
+        for plan in [(label, start, end)]
+    ]
+
+
 class AudioAnalysisTest(unittest.TestCase):
     """Check measured audio values rather than merely successful extraction."""
 
@@ -41,7 +50,7 @@ class AudioAnalysisTest(unittest.TestCase):
         with self.subTest(signal="440 Hz"):
             sr = 22050
             tone = np.sin(2 * np.pi * 440 * np.arange(sr * 2) / sr).astype(np.float32)
-            analysis = audio_analysis.analyze_audio(tone, sr)
+            analysis = audio_analysis.analyze_sections(full_sections(tone), sr)
             assert int(np.argmax(analysis["intro"]["chroma"])) == 9
             assert analysis["summary"]["camelot"] is None
         with tempfile.TemporaryDirectory() as directory, self.subTest(signal="constant level"):
@@ -58,17 +67,16 @@ class AudioAnalysisTest(unittest.TestCase):
         wave = np.concatenate(
             [amplitude * np.sin(2 * np.pi * hz * np.arange(seconds * sr) / sr) for seconds, hz, amplitude in phases]
         ).astype(np.float32)
-        result = audio_analysis.analyze_audio(wave)
+        result = audio_analysis.analyze_sections(full_sections(wave))
         assert result["duration"] == 40
         assert (result["intro"]["start"], result["intro"]["end"]) == (0, 15)
         assert (result["body"]["start"], result["body"]["end"]) == (15, 25)
         assert (result["outro"]["start"], result["outro"]["end"]) == (25, 40)
         assert result["outro"]["rms_db"] - result["intro"]["rms_db"] > 15
         assert result["outro"]["centroid"] > result["intro"]["centroid"] * 3
-        assert len(result["trajectory"]) == 8
         for length in (100, sr):
             with self.subTest(samples=length):
-                silent = audio_analysis.analyze_audio(np.zeros(length, dtype=np.float32))
+                silent = audio_analysis.analyze_sections(full_sections(np.zeros(length, dtype=np.float32)))
                 assert silent["summary"]["tempo"] is None
                 assert silent["summary"]["camelot"] is None
                 assert silent["summary"]["chroma"] is None
@@ -78,7 +86,7 @@ class AudioAnalysisTest(unittest.TestCase):
                 assert silent["outro"]["end"] == length / sr
                 json.dumps(silent, allow_nan=False)
         with self.assertRaises(ValueError):
-            audio_analysis.analyze_audio(np.array([np.nan], dtype=np.float32))
+            audio_analysis.analyze_sections([("full", 0.0, 1.0, np.array([np.nan], dtype=np.float32))])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "long.wav"
             with sf.SoundFile(path, mode="w", samplerate=sr, channels=1, subtype="PCM_16") as output:
@@ -95,12 +103,37 @@ class AudioAnalysisTest(unittest.TestCase):
         click = np.exp(-samples / 150) * np.sin(2 * np.pi * 900 * samples / sr)
         for start in range(0, len(wave) - len(click), sr // 2):
             wave[start : start + len(click)] += click
-        summary = audio_analysis.analyze_audio(wave)["summary"]
+        summary = audio_analysis.analyze_sections(full_sections(wave))["summary"]
         assert abs(summary["tempo"] - 120) < 3
         assert any(abs(candidate["bpm"] - 60) < 3 for candidate in summary["tempo_candidates"])
         assert 0 < summary["evidence"]["tempo"] < 0.8
         noise = np.random.default_rng(7).normal(0, 0.1, sr * 15).astype(np.float32)
-        assert audio_analysis.analyze_audio(noise)["summary"]["tempo"] is None
+        assert audio_analysis.analyze_sections(full_sections(noise))["summary"]["tempo"] is None
+
+    def test_sampled_sections_cover_boundaries_and_merge(self) -> None:
+        """Long tracks download three windows; the merge keeps energy weighting and honest evidence."""
+        sr = audio_analysis.SAMPLE_RATE
+        assert audio_analysis.section_plan(60.0) == [("full", 0.0, 60.0)]
+        plan = audio_analysis.section_plan(240.0)
+        assert [(label, round(start, 3), round(end, 3)) for label, start, end in plan] == [
+            ("intro", 0.0, 20.0),
+            ("body", 110.0, 130.0),
+            ("outro", 220.0, 240.0),
+        ]
+        quiet = (0.02 * np.sin(2 * np.pi * 220 * np.arange(20 * sr) / sr)).astype(np.float32)
+        loud = (0.4 * np.sin(2 * np.pi * 440 * np.arange(20 * sr) / sr)).astype(np.float32)
+        merged = audio_analysis.analyze_sections(
+            [("intro", 0.0, 20.0, quiet), ("body", 110.0, 130.0, loud), ("outro", 220.0, 240.0, quiet)]
+        )
+        assert merged["duration"] == 240.0
+        assert (merged["intro"]["start"], merged["intro"]["end"]) == (0, 15)
+        assert (merged["outro"]["start"], merged["outro"]["end"]) == (5, 20)
+        assert merged["body"]["start"] == 0
+        quiet_db, loud_db = merged["intro"]["rms_db"], merged["body"]["rms_db"]
+        assert quiet_db < merged["summary"]["rms_db"] < loud_db  # two quiet windows outweigh one loud one
+        assert merged["summary"]["evidence"]["rms_db"] == 1.0
+        assert merged["summary"]["camelot"] is None  # pure tones never name a key
+        json.dumps(merged, allow_nan=False)
 
     def test_recording_match_rejects_wrong_sources_and_accepts_best_effort_ties(self) -> None:
         """Single results and popular wrong versions face the same eligibility rules."""
@@ -163,16 +196,17 @@ class AudioAnalysisTest(unittest.TestCase):
         track = {"id": "a", "Track": "Example", "Artist": "Artist", "duration_ms": 180000}
         source = {"id": "abcdefghijk", "title": "Artist - Example", "duration": 180}
         fallback = {**source, "id": "lmnopqrstuv", "duration": 182}
+        sections = [("full", 0.0, 180.0, np.zeros(1))]
         with (
             patch.object(
                 playlist_sorter.yt_dlp.YoutubeDL, "extract_info", return_value={"entries": [source, fallback]}
             ) as search,
             patch.object(
                 playlist_sorter.SpotifyPlaylistSorter,
-                "_download_and_load",
-                side_effect=[OSError("Download failed"), (np.zeros(182), 1)],
+                "_download_sections",
+                side_effect=[OSError("Download failed"), sections],
             ) as download,
-            patch.object(playlist_sorter, "analyze_audio", return_value={"summary": {}}),
+            patch.object(playlist_sorter, "analyze_sections", return_value={"summary": {}}),
         ):
             search.side_effect = lambda url, **_: (
                 search.return_value
@@ -186,7 +220,7 @@ class AudioAnalysisTest(unittest.TestCase):
             download.reset_mock()
             search.return_value = {"entries": [source, {**fallback, "duration": 180}]}
             download.side_effect = None
-            download.return_value = (np.zeros(180), 1)
+            download.return_value = sections
             assert playlist_sorter.SpotifyPlaylistSorter._analyze_track(track, cookie_text="")["status"] == "ready"
             download.assert_called_once()
             search.reset_mock()

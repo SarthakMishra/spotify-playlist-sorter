@@ -24,17 +24,20 @@ MIN_KEY_PITCHES = 3
 MIN_CHROMA_WEIGHT, MIN_CHROMA_SPREAD = 0.1, 0.01
 MIN_KEY_CORRELATION, MIN_KEY_MARGIN = 0.6, 0.1
 SILENCE_RMS = 1e-5
+SECTION_SECONDS = 20
+FULL_TRACK_SECONDS = 60
 SETTINGS = {
     "sample_rate": SAMPLE_RATE,
     "mono": True,
     "fft_size": FFT_SIZE,
     "hop": HOP,
-    "trajectory_seconds": 5,
     "boundary_seconds": 15,
+    "section_seconds": SECTION_SECONDS,
+    "full_track_seconds": FULL_TRACK_SECONDS,
     "max_seconds": MAX_SECONDS,
     "decode_block_seconds": 5,
 }
-ANALYSIS_VERSION = f"librosa-{version('librosa')}-segments-3"
+ANALYSIS_VERSION = f"librosa-{version('librosa')}-sections-4"
 
 # Mapping from (pitch_class, mode) -> Camelot key
 # pitch_class: 0=C, 1=C#, 2=D, ... 11=B  |  mode: 0=minor, 1=major
@@ -225,25 +228,122 @@ def _segment(audio: np.ndarray, frames: dict[str, np.ndarray], sr: int, bounds: 
     return result
 
 
-def analyze_audio(audio: np.ndarray, sr: int = SAMPLE_RATE) -> dict[str, Any]:
-    """Measure complete local audio using bounded transforms and five-second summaries."""
-    if sr != SAMPLE_RATE or audio.ndim != 1 or not len(audio) or not np.isfinite(audio).all():
-        message = "Expected finite mono audio at the analysis sample rate"
+def section_plan(duration: float) -> list[tuple[str, float, float]]:
+    """Plan sampled windows: exact boundaries plus one middle window for longer tracks."""
+    if not 0 < duration <= MAX_SECONDS:
+        message = "Recording duration is outside the supported range"
         raise ValueError(message)
-    duration = len(audio) / sr
-    if duration > MAX_SECONDS:
-        message = "Recording exceeds twenty minutes"
+    if duration <= FULL_TRACK_SECONDS:
+        return [("full", 0.0, duration)]
+    middle = duration * 0.5
+    return [
+        ("intro", 0.0, SECTION_SECONDS),
+        ("body", middle - SECTION_SECONDS / 2, middle + SECTION_SECONDS / 2),
+        ("outro", duration - SECTION_SECONDS, duration),
+    ]
+
+
+def _weighted(pairs: list[tuple[float, float]]) -> float | None:
+    """Average optional scalar measurements by window length."""
+    total = sum(weight for _, weight in pairs)
+    return sum(value * weight for value, weight in pairs) / total if total > 0 and pairs else None
+
+
+def _merge_windows(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge sampled window summaries with energy weighting and honest evidence."""
+    weights = [max(0.0, part["end"] - part["start"]) for part in parts]
+    powers = [10 ** (part["rms_db"] / 10) * weight for part, weight in zip(parts, weights, strict=True)]
+    total = sum(weights)
+    merged: dict[str, Any] = {
+        "start": 0.0,
+        "end": total,
+        "rms_db": float(10 * np.log10(max(sum(powers) / total, 1e-10))),
+        "onset": _weighted([(p["onset"], w) for p, w in zip(parts, weights, strict=True) if p["onset"] is not None]),
+        "tempo": None,
+        "tempo_candidates": [],
+        "centroid": _weighted(
+            [(p["centroid"], w) for p, w in zip(parts, weights, strict=True) if p["centroid"] is not None]
+        ),
+        "contrast": None,
+        "chroma": None,
+        "camelot": None,
+        "evidence": dict.fromkeys(("rms_db", "onset", "tempo", "centroid", "contrast", "chroma", "key"), 0.0),
+    }
+    for field in ("rms_db", "onset", "centroid", "contrast", "chroma", "tempo"):
+        merged["evidence"][field] = (
+            _weighted(
+                [(p["evidence"][field], w) for p, w in zip(parts, weights, strict=True) if p["evidence"][field] > 0]
+            )
+            or 0.0
+        )
+    contrasts = [(p["contrast"], w) for p, w in zip(parts, weights, strict=True) if p["contrast"] is not None]
+    if contrasts:
+        contrast_values, contrast_weights = zip(*contrasts, strict=True)
+        merged["contrast"] = np.average(contrast_values, axis=0, weights=contrast_weights).tolist()
+    chromas = [(p["chroma"], w) for p, w in zip(parts, weights, strict=True) if p["chroma"] is not None]
+    if chromas:
+        chroma_values, chroma_weights = zip(*chromas, strict=True)
+        chroma = np.average(chroma_values, axis=0, weights=chroma_weights)
+        chroma = chroma / max(float(chroma.sum()), 1e-9)
+        merged["chroma"] = chroma.tolist()
+        merged["camelot"], key_strength = _key(chroma)
+        merged["evidence"]["key"] = merged["evidence"]["chroma"] * key_strength
+    candidates: dict[float, dict[str, float]] = {}
+    for part in parts:
+        for candidate in part["tempo_candidates"]:
+            key = round(candidate["bpm"], 1)
+            known = candidates.get(key)
+            if known is None or candidate["strength"] > known["strength"]:
+                candidates[key] = {**candidate, "bpm": key}
+    merged["tempo_candidates"] = sorted(candidates.values(), key=lambda candidate: -candidate["strength"])
+    if merged["tempo_candidates"]:
+        best = merged["tempo_candidates"][0]
+        if best["strength"] >= MIN_PERIODICITY:
+            merged["tempo"] = best["bpm"]
+            merged["evidence"]["tempo"] = max(merged["evidence"]["tempo"], min(0.8, best["strength"]))
+    return merged
+
+
+def analyze_sections(sections: list[tuple[str, float, float, np.ndarray]], sr: int = SAMPLE_RATE) -> dict[str, Any]:
+    """Measure sampled recording windows: exact boundaries, a middle window and their merge."""
+    if sr != SAMPLE_RATE:
+        message = "Expected audio at the analysis sample rate"
         raise ValueError(message)
-    frames = _frame_features(audio, sr)
-    boundary = min(float(BOUNDARY_SECONDS), duration)
+    windows: dict[str, tuple[np.ndarray, dict[str, np.ndarray], float, dict[str, Any]]] = {}
+    span = 0.0
+    for label, _start, end, audio in sections:
+        if audio.ndim != 1 or not len(audio) or not np.isfinite(audio).all():
+            message = "Expected finite mono audio at the analysis sample rate"
+            raise ValueError(message)
+        duration = len(audio) / sr
+        span = max(span, end)
+        frames = _frame_features(audio, sr)
+        windows[label] = (audio, frames, duration, _segment(audio, frames, sr, (0.0, duration)))
+    full = windows.get("full")
+    if full is not None:
+        audio, frames, duration, window = full
+        boundary = min(float(BOUNDARY_SECONDS), duration)
+        return {
+            "duration": span,
+            "summary": window,
+            "intro": _segment(audio, frames, sr, (0.0, boundary)),
+            "body": _segment(audio, frames, sr, (15.0, duration - 15.0)) if duration > 2 * BOUNDARY_SECONDS else None,
+            "outro": _segment(audio, frames, sr, (duration - boundary, duration)),
+        }
+    intro_audio, intro_frames, intro_duration, _ = windows["intro"]
+    outro_audio, outro_frames, outro_duration, _ = windows["outro"]
+    merged = [
+        windows["intro"][3],
+        windows["outro"][3],
+    ]
+    body = None
+    if (body_window := windows.get("body")) is not None:
+        body = body_window[3]
+        merged.append(body)
     return {
-        "duration": duration,
-        "summary": _segment(audio, frames, sr, (0.0, duration)),
-        "intro": _segment(audio, frames, sr, (0.0, boundary)),
-        "body": _segment(audio, frames, sr, (15.0, duration - 15.0)) if duration > 2 * BOUNDARY_SECONDS else None,
-        "outro": _segment(audio, frames, sr, (duration - boundary, duration)),
-        "trajectory": [
-            _segment(audio, frames, sr, (float(start), min(start + 5.0, duration)))
-            for start in range(0, int(np.ceil(duration)), 5)
-        ],
+        "duration": span,
+        "summary": _merge_windows(merged),
+        "intro": _segment(intro_audio, intro_frames, sr, (0.0, min(float(BOUNDARY_SECONDS), intro_duration))),
+        "body": body,
+        "outro": _segment(outro_audio, outro_frames, sr, (max(0.0, outro_duration - BOUNDARY_SECONDS), outro_duration)),
     }

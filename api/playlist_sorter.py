@@ -6,15 +6,17 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import secrets
 import tempfile
 import unicodedata
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
+from itertools import pairwise
 from pathlib import Path
-from threading import Event
+from threading import Condition, Event
 from time import perf_counter, sleep
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -23,7 +25,14 @@ import pandas as pd
 import spotipy
 import yt_dlp
 
-from api.audio_analysis import ANALYSIS_VERSION, MAX_SECONDS, SETTINGS, analyze_audio, load_audio
+from api.audio_analysis import (
+    ANALYSIS_VERSION,
+    MAX_SECONDS,
+    SETTINGS,
+    analyze_sections,
+    load_audio,
+    section_plan,
+)
 from api.youtube import SHARED_FAILURES, SourceAccessError, configured_cookies, failure_reason, youtube_options
 
 if TYPE_CHECKING:
@@ -35,8 +44,11 @@ _CACHE_SCHEMA = 2
 _RESOLVER_VERSION = 3
 _MATCH_SCORE = 0.75
 _STRUCTURED_TITLE_SIMILARITY = 0.85
-_VERIFIED_TITLE_SIMILARITY = 0.9
 _SHORTLIST_SIMILARITY = 0.65
+_UNATTRIBUTED_PENALTY = 0.05
+_EDITION_OMISSION_PENALTY = 0.10
+_SHORTLIST_LIMIT = 3
+_FALLBACK_SHORTLIST = 2
 _CACHE_CHECKPOINT = 10
 _VARIANTS = {
     "live": r"\b(?:live|concert)\b",
@@ -107,6 +119,42 @@ def _title_text(title: str) -> str:
     return _normalize_text(title)
 
 
+_GENERIC_QUALIFIERS = {"version", "audio", "video", "song", "full", "lyric", "lyrics", "official"}
+_SPELLING_FUZZ = 0.85
+_RECALL_THRESHOLD = 0.75
+
+
+def _edition_group(title: str) -> frozenset[str]:
+    """All words of a title's trailing parenthetical or dash group, when it looks like an edition."""
+    text = re.sub(r"\s*[-([]\s*from\s+.*", "", title, flags=re.IGNORECASE)
+    text = re.sub(r"\s*[-([]\s*(?:album version|original version|original mix)\b.*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[([]\s*(?:feat\.?|ft\.?|featuring)\s+[^)\]]+[)\]]", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:feat\.?|ft\.?|featuring)\s+[^([\-]*", "", text, flags=re.IGNORECASE)
+    if paren := re.search(r"\(([^()]*)\)\s*$", text):
+        return frozenset(_normalize_text(paren.group(1)).split())
+    if " - " in text:
+        tail = frozenset(_normalize_text(text.rsplit(" - ", 1)[-1]).split())
+        if len(tail - _GENERIC_QUALIFIERS) == 1:  # single-word tails read as editions, not movie names
+            return tail
+    return frozenset[str]()
+
+
+def _qualifier_tokens(title: str) -> frozenset[str]:
+    """Edition words a recording claims in its trailing group; uploads must not silently drop them."""
+    return frozenset(word for word in _edition_group(title) if word not in _GENERIC_QUALIFIERS)
+
+
+def _base_tokens(title: str) -> list[str]:
+    """Requested title words outside the edition group, for decoration-tolerant recall."""
+    group = _edition_group(title)
+    return [word for word in _normalize_text(title).split() if word not in group]
+
+
+def _token_close(word: str, tokens: list[str]) -> bool:
+    """Treat a requested word as present when an upload spells it nearly the same way."""
+    return any(word == token or SequenceMatcher(None, word, token).ratio() >= _SPELLING_FUZZ for token in tokens)
+
+
 def _candidate_title(entry: dict[str, Any], artists: list[str]) -> str:
     """Keep structured track names intact; strip artists only from upload-title prefixes."""
     if entry.get("track"):
@@ -124,8 +172,15 @@ def _title_similarity(entry: dict[str, Any], metadata: dict[str, Any]) -> float:
     title = _title_text(metadata["title"])
     candidate = _candidate_title(entry, artists)
     similarity = SequenceMatcher(None, title, candidate).ratio()
-    if not entry.get("track") and title and f" {title} " in f" {candidate} ":
-        similarity = max(similarity, 0.94)
+    base = _base_tokens(metadata["title"])
+    if base:
+        if not entry.get("track") and f" {_title_text(' '.join(base))} " in f" {candidate} ":
+            similarity = max(similarity, 0.94)
+        # Decorated upload titles keep the requested words; measure word recall, not string distance.
+        candidate_tokens = candidate.split()
+        recall = sum(_token_close(word, candidate_tokens) for word in base) / len(base)
+        if recall >= _RECALL_THRESHOLD:
+            similarity = max(similarity, recall)
     return similarity
 
 
@@ -135,19 +190,24 @@ def _artist_present(artist: str, evidence: str) -> bool:
     if f" {artist} " in f" {evidence} ":
         return True
     compact = artist.replace(" ", "")
-    return evidence.replace(" ", "") in {compact, compact + "vevo", compact + "topic"}
+    if evidence.replace(" ", "") in {compact, compact + "vevo", compact + "topic"}:
+        return True
+    # Separator variants such as K.K. normalize to separated letters; match squeezed adjacent tokens.
+    return compact in {a + b for a, b in pairwise(evidence.split())}
 
 
 def _duration_tolerance(seconds: float) -> float:
     """Allow modest upload padding for best-effort matches without accepting much longer cuts."""
-    return max(3.0, min(20.0, seconds * 0.08))
+    return max(3.0, min(25.0, seconds * 0.08))
 
 
 def _shortlist(entries: list[dict[str, Any]], metadata: dict[str, Any]) -> list[dict[str, Any]]:
-    """Filter flat search metadata before spending requests on at most three videos."""
+    """Filter flat search metadata before spending requests on at most five videos."""
     artists = [_normalize_text(artist) for artist in metadata["artists"]]
     expected = float(metadata["duration_ms"]) / 1000
-    candidates = {}
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    fallback: list[dict[str, Any]] = []
+    chosen: set[str] = set()
     for entry in entries[:10]:
         if not isinstance(entry, dict) or not isinstance(entry.get("title"), str):
             continue
@@ -162,11 +222,82 @@ def _shortlist(entries: list[dict[str, Any]], metadata: dict[str, Any]) -> list[
             continue
         similarity = _title_similarity(entry, metadata)
         if similarity < _SHORTLIST_SIMILARITY:
+            # Titles in other scripts often reveal plain names after hydration; keep them as fallbacks.
+            fallback.append(entry)
             continue
         channel = _normalize_text(str(entry.get("channel") or entry.get("uploader") or ""))
         provenance = channel.endswith(" topic") or bool(entry.get("channel_is_verified"))
-        candidates[source_id] = (similarity + 0.1 * provenance, entry)
-    return [item[1] for item in sorted(candidates.values(), key=lambda item: -item[0])[:3]]
+        ranked.append((similarity + 0.1 * provenance, entry))
+    shortlist = [entry for _, entry in sorted(ranked, key=lambda item: -item[0])[:_SHORTLIST_LIMIT]]
+    chosen.update(candidate["id"] for candidate in shortlist)
+    # Uploads whose flat titles could not be scored still deserve hydration when time agrees.
+    for entry in fallback:
+        if len(shortlist) >= _SHORTLIST_LIMIT + _FALLBACK_SHORTLIST:
+            break
+        if str(entry.get("id")) not in chosen:
+            chosen.add(str(entry["id"]))
+            shortlist.append(entry)
+    return shortlist
+
+
+def _credit_introduces_strangers(artist_credits: list[str], artists: list[str]) -> bool:
+    """Detect credited names the request never names, spelled differently or not at all."""
+    for credited_artist in artist_credits:
+        text = _normalize_text(str(credited_artist))
+        if not text:
+            continue
+        if any(_artist_present(artist, " " + text + " ") for artist in artists):
+            continue
+        if max((SequenceMatcher(None, text, artist).ratio() for artist in artists), default=0.0) >= _SPELLING_FUZZ:
+            continue
+        return True
+    return False
+
+
+def _identity_conflicts(entry: dict[str, Any], artists: list[str], requested_title: str) -> bool:
+    """Reject uploads whose credits, channel or claimed edition contradict the requested recording."""
+    artist_credits = _credited_names(entry)
+    credited = " " + _normalize_text(" ".join(artist_credits)) + " "
+    channel_text = _normalize_text(str(entry.get("channel") or entry.get("uploader") or ""))
+    # Structured credits can misspell or rename artists; the owning channel is independent evidence.
+    if (
+        credited.strip()
+        and not any(_artist_present(artist, credited) for artist in artists)
+        and not any(_artist_present(artist, channel_text) for artist in artists)
+    ):
+        return True
+    # An upload claiming an edition the request never asked for is a different recording.
+    claimed = _qualifier_tokens(str(entry.get("title") or ""))
+    requested_text = _normalize_text(requested_title)
+    return bool(claimed) and not claimed <= set(requested_text.split())
+
+
+def _edition_missing(source_title: str, credited: str, album: str, requested_title: str) -> bool:
+    """Check whether an upload silently drops the edition the request declares."""
+    required = _qualifier_tokens(requested_title)
+    carrier = _normalize_text(source_title + " " + credited + " " + album)
+    return bool(required) and not required <= set(carrier.split())
+
+
+def _credited_names(entry: dict[str, Any]) -> list[str]:
+    """Read structured artist credits tolerantly, falling back to a single artist field."""
+    names = entry.get("artists") or [entry.get("artist") or ""]
+    if isinstance(names, str):
+        names = [names]
+    return [str(name) for name in names]
+
+
+def _eligible_duration(entry: object, expected: float) -> float | None:
+    """Validate a hydrated entry's shape, identity and timing before deeper comparisons."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("title"), str):
+        return None
+    source_id = entry.get("id", "")
+    duration = _positive_number(entry.get("duration"))
+    if not isinstance(source_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", source_id) or duration is None:
+        return None
+    if abs(duration - expected) > _duration_tolerance(expected):
+        return None
+    return duration
 
 
 def _rank_recordings(entries: list[dict[str, Any]], metadata: dict[str, Any]) -> list[dict[str, Any]]:
@@ -180,11 +311,8 @@ def _rank_recordings(entries: list[dict[str, Any]], metadata: dict[str, Any]) ->
     title = _title_text(metadata["title"])
     eligible: dict[str, dict[str, Any]] = {}
     for entry in entries[:10]:
-        if not isinstance(entry, dict) or not isinstance(entry.get("title"), str):
-            continue
-        source_id = entry.get("id", "")
-        duration = _positive_number(entry.get("duration"))
-        if not isinstance(source_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", source_id) or duration is None:
+        duration = _eligible_duration(entry, expected)
+        if duration is None:
             continue
         tolerance = _duration_tolerance(expected)
         difference = abs(duration - expected)
@@ -192,35 +320,35 @@ def _rank_recordings(entries: list[dict[str, Any]], metadata: dict[str, Any]) ->
         candidate_title = _candidate_title(entry, artists)
         # Upload labels can contradict otherwise clean structured music metadata.
         upload_title = _candidate_title({"title": source_title}, artists)
-        if (
-            difference > tolerance
-            or _variants(candidate_title) != _variants(title)
-            or _variants(upload_title) != _variants(title)
-        ):
+        if _variants(candidate_title) != _variants(title) or _variants(upload_title) != _variants(title):
             continue
-        artist_credits = entry.get("artists") or [entry.get("artist") or ""]
-        if isinstance(artist_credits, str):
-            artist_credits = [artist_credits]
-        credited = " " + _normalize_text(" ".join(str(artist) for artist in artist_credits)) + " "
-        if credited.strip() and not any(_artist_present(artist, credited) for artist in artists):
+        source_id = str(entry.get("id") or "")
+        artist_credits = _credited_names(entry)
+        credited = " " + _normalize_text(" ".join(artist_credits)) + " "
+        channel = str(entry.get("channel") or entry.get("uploader") or "")
+        channel_text = _normalize_text(channel)
+        if _identity_conflicts(entry, artists, metadata["title"]):
+            continue
+        # An unlabeled upload can still be the requested edition; strangers among its
+        # credits (another singer's take) or a missing edition both argue against it.
+        edition_missing = _edition_missing(source_title, credited, str(entry.get("album") or ""), metadata["title"])
+        if edition_missing and _credit_introduces_strangers(artist_credits, artists):
             continue
         evidence = (
-            " "
-            + _normalize_text(
-                source_title + " " + credited + " " + str(entry.get("uploader") or entry.get("channel") or "")
-            )
-            + " "
+            " " + _normalize_text(source_title + " " + credited + " " + str(entry.get("uploader") or channel)) + " "
         )
         similarity = _title_similarity(entry, metadata)
         if entry.get("track") and similarity < _STRUCTURED_TITLE_SIMILARITY:
             continue
-        channel = str(entry.get("channel") or entry.get("uploader") or "")
         artist_fraction = sum(
-            _artist_present(artist, evidence) or _artist_present(artist, channel) for artist in artists
+            _artist_present(artist, evidence) or _artist_present(artist, channel_text) for artist in artists
         ) / len(artists)
-        if not artist_fraction and not (entry.get("channel_is_verified") and similarity >= _VERIFIED_TITLE_SIMILARITY):
-            continue
         score = 0.5 * similarity + 0.25 + 0.05 * artist_fraction + 0.2 * (1 - difference / tolerance)
+        # Uploads without any artist evidence need a clearly stronger title to avoid same-name covers.
+        if not artist_fraction and not entry.get("channel_is_verified"):
+            score -= _UNATTRIBUTED_PENALTY
+        if edition_missing:
+            score -= _EDITION_OMISSION_PENALTY
         music_metadata = bool(
             entry.get("track")
             and candidate_title == title
@@ -360,6 +488,7 @@ def _with_intensity(records: dict[str, dict[str, Any]]) -> dict[str, dict[str, A
 
 Profile = Literal["smooth", "variety"]
 _PROFILE_WEIGHTS = {"smooth": (0.80, 0.15, 0.05), "variety": (0.60, 0.25, 0.15)}
+_VIDEO_REUSE_SECONDS = 2.0
 _COMPONENTS = ("tempo", "intensity", "texture", "chroma")
 _SCORING_VERSION = 1
 _MAX_MATRIX_ENTRIES = 1000
@@ -398,30 +527,71 @@ def _audio_note(transition: dict[str, Any]) -> tuple[float, str] | None:
     return max(notes, key=lambda note: note[0]) if notes else None
 
 
-def _pin_error(entries: list[dict[str, Any]], first: str | None, last: str | None) -> str | None:
-    """Validate absolute endpoint requirements against the loaded occurrences."""
-    identities = {entry["occurrence"]: index for index, entry in enumerate(entries)}
-    if not entries or len(identities) != len(entries):
-        return "Check the playlist again before arranging it."
-    if first is not None and first == last:
-        return "Choose different entries for the first and last songs."
-    for position, chosen in ((0, first), (len(entries) - 1, last)):
+def _placement_targets(
+    entries: list[dict[str, Any]], placements: dict[str, int] | None
+) -> tuple[dict[str, int], str | None]:
+    """Resolve the required slot for every fixed entry, rejecting invalid placement choices."""
+    chosen = placements or {}
+    targets: dict[str, int] = {}
+    for entry in entries:
+        if entry["fixed_reason"] is None:
+            continue
+        requested = chosen.get(entry["occurrence"])
+        slot: int = int(entry["original_position"]) if requested is None else requested
+        if not 0 <= slot < len(entries):
+            return {}, "Choose a position within the playlist."
+        if slot in targets.values():
+            return {}, "Choose a different position for each item."
+        targets[entry["occurrence"]] = slot
+    if placements is not None and any(occurrence not in targets for occurrence in placements):
+        return {}, "Only items that cannot be analyzed can be placed."
+    return targets, None
+
+
+def _endpoint_error(
+    identities: dict[str, int], targets: dict[str, int], first: str | None, last: str | None, total: int
+) -> str | None:
+    """Reject pins that clash with placed unanalyzable entries."""
+    for position, chosen in ((0, first), (total - 1, last)):
         if chosen is None:
             continue
         if chosen not in identities:
             return "Choose a song from this playlist."
-        source = identities[chosen]
-        if source != position and (entries[source]["fixed_reason"] or entries[position]["fixed_reason"]):
-            return "A song kept in place cannot move or give its position to another song."
+        if chosen in targets and targets[chosen] != position:
+            return "Choose a different position for this item or a different song."
+        if chosen not in targets and position in targets.values():
+            return "An item that cannot be analyzed already uses that position."
     return None
 
 
+def _pin_error(
+    entries: list[dict[str, Any]], first: str | None, last: str | None, placements: dict[str, int] | None = None
+) -> str | None:
+    """Validate absolute endpoint and placement requirements against the loaded occurrences."""
+    identities = {entry["occurrence"]: index for index, entry in enumerate(entries)}
+    if not entries or len(identities) != len(entries):
+        return "Analyze the playlist again before arranging it."
+    if first is not None and first == last:
+        return "Choose different entries for the first and last songs."
+    targets, error = _placement_targets(entries, placements)
+    if error:
+        return error
+    return _endpoint_error(identities, targets, first, last, len(entries))
+
+
 def _feasible_order(
-    entries: list[dict[str, Any]], first: str | None, last: str | None
+    entries: list[dict[str, Any]],
+    first: str | None,
+    last: str | None,
+    placements: dict[str, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Place endpoints and fill remaining movable slots in their original relative order."""
     identities = {entry["occurrence"]: index for index, entry in enumerate(entries)}
-    locked = {i: i for i, entry in enumerate(entries) if entry["fixed_reason"]}
+    locked = {
+        (placements or {}).get(entry["occurrence"], entry["original_position"]): index
+        for index, entry in enumerate(entries)
+        if entry["fixed_reason"]
+    }
     for position, chosen in ((0, first), (len(entries) - 1, last)):
         if chosen is not None:
             locked[position] = identities[chosen]
@@ -622,7 +792,9 @@ def _improve_order(
 
 def _arrange(entries: list[dict[str, Any]], data: dict[str, Any] | None, choices: dict[str, Any]) -> dict[str, Any]:
     """Return the best bounded-search result, retaining the feasible original on ties."""
-    baseline, free = _feasible_order(entries, choices["first_occurrence"], choices["last_occurrence"])
+    baseline, free = _feasible_order(
+        entries, choices["first_occurrence"], choices["last_occurrence"], choices.get("placements")
+    )
     best = baseline
     evaluations = 0
     baseline_cost = cost = None
@@ -657,6 +829,90 @@ def _arrange(entries: list[dict[str, Any]], data: dict[str, Any] | None, choices
     }
 
 
+class _WorkerScale:
+    """Bound recording concurrency by machine capacity, download speed and YouTube feedback."""
+
+    MAX_WORKERS = 4
+    MIN_CPUS = 4
+    MIN_MEMORY_GB = 2.0
+    FALLBACK_MEMORY_GB = 4.0
+    SLOW_DOWNLOAD_SECONDS = 15.0
+    SUCCESSES_PER_GROWTH = 8
+
+    def __init__(self) -> None:
+        self.limit = self._machine_limit()
+        self.target = min(2, self.limit)
+        self.successes = 0
+        self.recent: deque[float] = deque(maxlen=3)
+
+    @staticmethod
+    def _machine_limit() -> int:
+        """Prefer four workers only when CPUs and memory can hold their in-flight recordings."""
+        cpus = os.cpu_count() or 2
+        try:
+            memory = next(
+                int(line.split()[1])
+                for line in Path("/proc/meminfo").read_text().splitlines()
+                if "MemAvailable" in line
+            )
+            memory_gb = memory / 1024 / 1024
+        except (OSError, StopIteration, ValueError):
+            memory_gb = _WorkerScale.FALLBACK_MEMORY_GB
+        return (
+            _WorkerScale.MAX_WORKERS if cpus >= _WorkerScale.MIN_CPUS and memory_gb >= _WorkerScale.MIN_MEMORY_GB else 2
+        )
+
+    def adjust(self, result: dict[str, Any]) -> None:
+        """React to finished recordings: growth needs sustained fast successes, limits stop growth."""
+        if result.get("reason") == "rate_limit":
+            self.target = 1
+            self.successes = 0
+            self.recent.clear()
+            return
+        if result.get("status") != "ready":
+            self.successes = 0
+            return
+        download_seconds = (result.get("diagnostics") or {}).get("download_seconds")
+        if download_seconds is not None:
+            self.recent.append(download_seconds)
+        self.successes += 1
+        throttled = any(second > self.SLOW_DOWNLOAD_SECONDS for second in self.recent)
+        if self.successes >= self.SUCCESSES_PER_GROWTH and self.target < self.limit and not throttled:
+            self.target += 1
+            self.successes = 0
+
+
+class _DynamicGate:
+    """Admission control whose target concurrency can change while a job is running."""
+
+    def __init__(self, target: int) -> None:
+        self._condition = Condition()
+        self._in_flight = 0
+        self.target = target
+
+    def __enter__(self) -> None:
+        with self._condition:
+            while self._in_flight >= self.target:
+                self._condition.wait()
+            self._in_flight += 1
+
+    def __exit__(self, *_exc: object) -> None:
+        with self._condition:
+            self._in_flight -= 1
+            self._condition.notify()
+
+
+def _video_index(cache: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Index ready measurements by YouTube video so shared uploads are measured once."""
+    index: dict[str, dict[str, Any]] = {}
+    for record in cache.values():
+        if record.get("status") == "ready" and isinstance(record.get("source"), dict):
+            video_id = record["source"].get("id")
+            if isinstance(video_id, str) and video_id not in index:
+                index[video_id] = record
+    return index
+
+
 class SpotifyPlaylistSorter:
     """Class for sorting Spotify playlists based on musical compatibility.
 
@@ -677,6 +933,7 @@ class SpotifyPlaylistSorter:
         self.playlist_name: str | None = None
         self.original_items: list[dict[str, Any]] = []
         self.current_order: list[str] = []
+        self.placements: dict[str, int] = {}
         self.snapshot_id: str | None = None
         self.restore_order: list[str] = []
         self.audio_features: dict[str, dict[str, Any]] = {}
@@ -692,6 +949,7 @@ class SpotifyPlaylistSorter:
         """Retain every occurrence and return catalog tracks eligible for analysis."""
         self.original_items = []
         self.restore_order = []
+        self.placements = {}
         self.arrangement_stamp = None
         self.arrangement_results.clear()
         self.arrangement_result = {}
@@ -739,58 +997,89 @@ class SpotifyPlaylistSorter:
         }
 
     @staticmethod
-    def _download_and_load(
+    def _download_section(
+        video: dict[str, Any],
+        plan: tuple[str, float, float],
+        duration: float,
+        directory: Path,
+        cookie_text: str,
+    ) -> np.ndarray:
+        """Download and decode one sampled window, failing incomplete audio loudly."""
+        label, start, end = plan
+        options: dict[str, Any] = {
+            **youtube_options(cookie_text),
+            "format": "bestaudio",
+            "check_formats": False,
+            "outtmpl": str(directory / f"{label}.%(ext)s"),
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
+            "postprocessor_args": {"ffmpeg_o": ["-ar", "22050", "-ac", "1"]},
+        }
+        if end - start < duration - 0.5:
+            options["download_ranges"] = lambda _info, _ytdl, first=start, last=end: [
+                {"start_time": first, "end_time": last}
+            ]
+            options["force_keyframes_at_cuts"] = True
+        with yt_dlp.YoutubeDL(options) as downloader:
+            downloader.process_ie_result(video, download=True)
+        audio, sr = load_audio(str(directory / f"{label}.wav"))
+        if abs(len(audio) / sr - (end - start)) > max(1.0, (end - start) * 0.05):
+            raise SourceAccessError("download_failed")  # noqa: EM101 - fixed reason code.
+        return audio
+
+    @staticmethod
+    def _download_sections(
         source: dict[str, Any],
         *,
         cookie_text: str = "",
         video_info: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> tuple[np.ndarray, int]:
-        """Retry a failed download once with fresh audio metadata, then allow another candidate."""
+    ) -> list[tuple[str, float, float, np.ndarray]]:
+        """Download only boundary and middle windows, retrying once with fresh audio metadata."""
+        duration = float(source["duration"])
+        plan = section_plan(duration)
         last_error = SourceAccessError("download_failed")
         for attempt in range(2):
             if attempt:
                 sleep(1)
-            with tempfile.TemporaryDirectory() as directory:
-                options: dict[str, Any] = {
-                    **youtube_options(cookie_text),
-                    "format": "bestaudio",
-                    "check_formats": False,
-                    "outtmpl": str(Path(directory) / "audio.%(ext)s"),
-                    "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}],
-                    "postprocessor_args": {"ffmpeg_o": ["-ar", "22050", "-ac", "1"]},
-                }
-                try:
-                    with yt_dlp.YoutubeDL(options) as downloader:
-                        video = (
-                            video_info
-                            if attempt == 0 and video_info is not None
-                            else downloader.extract_info(source["url"], download=False)
+            sections: list[tuple[str, float, float, np.ndarray]] = []
+            try:
+                with tempfile.TemporaryDirectory() as directory:
+                    if attempt == 0 and video_info is not None:
+                        video = video_info
+                    else:
+                        with yt_dlp.YoutubeDL(youtube_options(cookie_text)) as downloader:
+                            video = downloader.extract_info(source["url"], download=False)
+                    if (
+                        not video
+                        or video.get("id") != source["id"]
+                        or (metadata is not None and _select_recording(_rank_recordings([video], metadata)) is None)
+                    ):
+                        raise SourceAccessError("recording_changed")  # noqa: TRY301, EM101 - fixed reason code.
+                    for plan_section in plan:
+                        audio = SpotifyPlaylistSorter._download_section(
+                            video, plan_section, duration, Path(directory), cookie_text
                         )
-                        if (
-                            not video
-                            or video.get("id") != source["id"]
-                            or (metadata is not None and _select_recording(_rank_recordings([video], metadata)) is None)
-                        ):
-                            raise SourceAccessError("recording_changed")  # noqa: TRY301, EM101 - fixed reason code.
-                        downloader.process_ie_result(video, download=True)
-                    return load_audio(str(Path(directory) / "audio.wav"))
-                except SourceAccessError:
-                    raise
-                except Exception as error:
-                    reason = failure_reason(str(error)) or options["logger"].reason or "download_failed"
-                    last_error = SourceAccessError(reason)
-                    if reason in SHARED_FAILURES:
-                        raise last_error from error
+                        label, start, end = plan_section
+                        sections.append((label, start, end, audio))
+            except SourceAccessError:
+                raise
+            except Exception as error:
+                reason = failure_reason(str(error)) or "download_failed"
+                last_error = SourceAccessError(reason)
+                if reason in SHARED_FAILURES:
+                    raise last_error from error
+            else:
+                return sections
         raise last_error
 
     @staticmethod
     def _find_recordings(
         metadata: dict[str, Any], cookie_text: str, diagnostics: dict[str, Any]
-    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-        """Search cheaply, then validate a bounded set using full music metadata."""
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+        """Search cheaply and hydrate only until one candidate already proves eligible."""
         options: dict[str, Any] = {**youtube_options(cookie_text), "extract_flat": "in_playlist", "format": "bestaudio"}
         full: dict[str, dict[str, Any]] = {}
+        ranked: list[dict[str, Any]] = []
         with yt_dlp.YoutubeDL(options) as search:
             started = perf_counter()
             query = f"ytsearch10:{metadata['title']} {' '.join(metadata['artists'][:2])} audio"
@@ -803,30 +1092,115 @@ class SpotifyPlaylistSorter:
             diagnostics["search_seconds"] = round(perf_counter() - started, 3)
             entries = [entry for entry in (info.get("entries") or [info]) if entry]
             candidates = _shortlist(entries, metadata)
+            if not candidates:
+                # Some queries return junk with the audio hint; retry plainly before giving up.
+                retry = f"ytsearch10:{metadata['title']} {metadata['artists'][0]}"
+                try:
+                    info = search.extract_info(retry, download=False) or {}
+                except Exception as error:
+                    raise SourceAccessError(
+                        failure_reason(str(error)) or options["logger"].reason or "source_failed"
+                    ) from error
+                entries = [entry for entry in (info.get("entries") or [info]) if entry]
+                candidates = _shortlist(entries, metadata)
             diagnostics["search_results"] = len(entries)
             diagnostics["candidates_checked"] = 0
-            started = perf_counter()
-            last_error = None
-            for candidate in candidates:
+            while candidates and not _select_recording(ranked):
+                candidate = candidates.pop(0)
                 diagnostics["candidates_checked"] += 1
                 try:
                     options["logger"].reason = None
                     video = search.extract_info(f"https://www.youtube.com/watch?v={candidate['id']}", download=False)
                     if video and video.get("id") == candidate["id"]:
                         full[candidate["id"]] = video
+                        ranked = _rank_recordings(list(full.values()), metadata)
                 except Exception as error:
                     reason = failure_reason(str(error)) or options["logger"].reason or "source_failed"
                     if reason in SHARED_FAILURES:
                         raise SourceAccessError(reason) from error
-                    last_error = SourceAccessError(reason)
-            diagnostics["metadata_seconds"] = round(perf_counter() - started, 3)
-            if not full and (last_error or options["logger"].reason):
-                raise last_error or SourceAccessError(options["logger"].reason or "source_failed")
-        return _rank_recordings(list(full.values()), metadata), full
+                    if not candidates and not full:
+                        raise SourceAccessError(reason) from error
+            if not full and (last_reason := options["logger"].reason):
+                raise SourceAccessError(last_reason)
+        return ranked, full, candidates
+
+    @staticmethod
+    def _hydrate_candidate(candidate: dict[str, Any], cookie_text: str) -> dict[str, Any] | None:
+        """Fetch one candidate's full music metadata without re-requesting known failures."""
+        options: dict[str, Any] = {**youtube_options(cookie_text), "extract_flat": "in_playlist", "format": "bestaudio"}
+        try:
+            with yt_dlp.YoutubeDL(options) as search:
+                options["logger"].reason = None
+                video = search.extract_info(f"https://www.youtube.com/watch?v={candidate['id']}", download=False)
+        except Exception as error:
+            reason = failure_reason(str(error)) or options["logger"].reason or "source_failed"
+            if reason in SHARED_FAILURES:
+                raise SourceAccessError(reason) from error
+            return None
+        return video if video and video.get("id") == candidate["id"] else None
+
+    @staticmethod
+    def _cached_record(
+        video_analyses: dict[str, dict[str, Any]] | None, source: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return a prior measurement for the same upload when its length still agrees."""
+        cached = video_analyses.get(source["id"]) if video_analyses is not None else None
+        cached_duration = _positive_number(cached["source"].get("duration")) if cached else None
+        if (
+            cached is not None
+            and cached_duration is not None
+            and abs(cached_duration - source["duration"]) <= _VIDEO_REUSE_SECONDS
+        ):
+            return cached
+        return None
+
+    @staticmethod
+    def _measure_source(
+        source: dict[str, Any],
+        video_info: dict[str, Any] | None,
+        metadata: dict[str, Any],
+        cookies: str,
+        notify: Callable[[str], None],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, float]]:
+        """Download sampled windows and measure them, or return the terminal failure result."""
+        timings: dict[str, float] = {}
+        try:
+            notify("downloading")
+            step = perf_counter()
+            sections = SpotifyPlaylistSorter._download_sections(
+                source, cookie_text=cookies, video_info=video_info, metadata=metadata
+            )
+            timings["download_seconds"] = round(perf_counter() - step, 3)
+            notify("analyzing")
+            step = perf_counter()
+            analysis = analyze_sections(sections)
+            timings["analysis_seconds"] = round(perf_counter() - step, 3)
+        except SourceAccessError as error:
+            return None, error.result(), timings
+        except Exception:  # noqa: BLE001 - retain another independently eligible source as a fallback.
+            return None, SourceAccessError("analysis_failed").result(), timings
+        record = SpotifyPlaylistSorter._record_for(source, metadata, analysis)
+        return record, None, timings
+
+    @staticmethod
+    def _record_for(source: dict[str, Any], metadata: dict[str, Any], analysis: dict[str, Any]) -> dict[str, Any]:
+        """Bind fresh metadata and a fingerprint to measurements, ready for the cache."""
+        return {
+            "status": "ready",
+            "metadata": metadata,
+            "source": source,
+            "source_fingerprint": _source_fingerprint(source),
+            "analysis": analysis,
+        }
 
     @staticmethod
     def _analyze_track(  # noqa: C901, PLR0911 - bounded retries and terminal progress outcomes.
-        track: dict[str, Any], on_stage: Callable[[str], None] | None = None, *, cookie_text: str | None = None
+        track: dict[str, Any],
+        on_stage: Callable[[str], None] | None = None,
+        *,
+        cookie_text: str | None = None,
+        cache: dict[str, dict[str, Any]] | None = None,
+        video_analyses: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Resolve exact recording evidence and retain safe stage timings for diagnosis."""
         metadata = _metadata(track)
@@ -859,39 +1233,52 @@ class SpotifyPlaylistSorter:
         try:
             cookies = configured_cookies() if cookie_text is None else cookie_text
             notify("matching")
-            ranked, full = SpotifyPlaylistSorter._find_recordings(metadata, cookies, diagnostics)
+            ranked, full, candidates = SpotifyPlaylistSorter._find_recordings(metadata, cookies, diagnostics)
             failure = {"status": "uncertain", "reason": "no_match", "message": "No matching recording found"}
-            while source := _select_recording(ranked):
-                try:
-                    notify("downloading")
-                    step = perf_counter()
-                    audio, sr = SpotifyPlaylistSorter._download_and_load(
-                        source, cookie_text=cookies, video_info=full[source["id"]], metadata=metadata
-                    )
-                    diagnostics["download_seconds"] = round(perf_counter() - step, 3)
-                    if abs(len(audio) / sr - source["duration"]) > max(3.0, source["duration"] * 0.02):
-                        raise SourceAccessError("download_failed")  # noqa: TRY301, EM101 - fixed reason code.
+
+            def hydrate() -> bool:
+                """Extend the ranked pool lazily; only failures force additional candidate requests."""
+                while candidates and not _select_recording(ranked):
+                    candidate = candidates.pop(0)
+                    diagnostics["candidates_checked"] += 1
+                    video = SpotifyPlaylistSorter._hydrate_candidate(candidate, cookies)
+                    if video:
+                        full[video["id"]] = video
+                        ranked.extend(_rank_recordings([video], metadata))
+                        ranked.sort(
+                            key=lambda item: (
+                                -item["evidence"]["music_metadata"],
+                                -item["score"],
+                                -item["evidence"]["verified_channel"],
+                                item["id"],
+                            )
+                        )
+                return bool(_select_recording(ranked))
+
+            while hydrate():
+                source = _select_recording(ranked)
+                if source is None:  # pragma: no cover - hydrate() guarantees a source here.
+                    break
+                if (cached := SpotifyPlaylistSorter._cached_record(video_analyses or {}, source)) is not None:
                     notify("analyzing")
-                    step = perf_counter()
-                    analysis = analyze_audio(audio, sr)
-                    diagnostics["analysis_seconds"] = round(perf_counter() - step, 3)
-                    return finish(
-                        {
-                            "status": "ready",
-                            "metadata": metadata,
-                            "source": source,
-                            "source_fingerprint": _source_fingerprint(source),
-                            "analysis": analysis,
-                        }
-                    )
-                except SourceAccessError as error:
-                    if error.reason in SHARED_FAILURES:
-                        return finish(error.result())
-                    failure = error.result()
-                    ranked.remove(source)
-                except Exception:  # noqa: BLE001 - retain another independently eligible source as a fallback.
-                    failure = SourceAccessError("analysis_failed").result()
-                    ranked.remove(source)
+                    record = SpotifyPlaylistSorter._record_for(source, metadata, cached["analysis"])
+                    if cache is not None:
+                        cache[track["id"]] = record
+                    return finish(record)
+                record, next_failure, timings = SpotifyPlaylistSorter._measure_source(
+                    source, full.get(source["id"]), metadata, cookies, notify
+                )
+                diagnostics.update(timings)
+                if record is not None:
+                    if cache is not None:
+                        cache[track["id"]] = record
+                    if video_analyses is not None:
+                        video_analyses[source["id"]] = record
+                    return finish(record)
+                if next_failure and next_failure.get("reason") in SHARED_FAILURES:
+                    return finish(next_failure)
+                failure = next_failure or failure
+                ranked.remove(source)
             return finish(failure)
         except SourceAccessError as error:
             return finish(error.result())
@@ -928,14 +1315,19 @@ class SpotifyPlaylistSorter:
                 shared_failure = error.result()
                 stopped.set()
 
+        videos = _video_index(cache)
+        scale = _WorkerScale()
+        gate = _DynamicGate(scale.target)
+
         def analyze_one(track: dict[str, Any]) -> dict[str, Any]:
             nonlocal shared_failure
             if stopped.is_set():
                 return shared_failure.copy()
-            kwargs: dict[str, Any] = {"cookie_text": cookies}
+            kwargs: dict[str, Any] = {"cookie_text": cookies, "cache": cache, "video_analyses": videos}
             if record_callback is not None:
                 kwargs["on_stage"] = lambda stage: record_callback(track["id"], {"status": stage})
-            result = self._analyze_track(track, **kwargs)
+            with gate:
+                result = self._analyze_track(track, **kwargs)
             if result.get("reason") in SHARED_FAILURES:
                 shared_failure = result
                 stopped.set()
@@ -943,8 +1335,8 @@ class SpotifyPlaylistSorter:
 
         dirty = 0
         try:
-            # ponytail: two full recordings in memory; use streaming decode if measured memory requires it.
-            with ThreadPoolExecutor(max_workers=2) as executor:
+            # ponytail: several sampled windows per worker stay small; measure memory before raising limits.
+            with ThreadPoolExecutor(max_workers=scale.limit) as executor:
                 futures = {
                     executor.submit(analyze_one, track): key for key, track in unique.items() if key not in results
                 }
@@ -960,6 +1352,8 @@ class SpotifyPlaylistSorter:
                         }
                     results[key] = result
                     report_record(key, result)
+                    scale.adjust(result)
+                    gate.target = scale.target
                     if result.get("status") == "ready":
                         cache[key] = result
                         dirty += 1
@@ -1027,33 +1421,48 @@ class SpotifyPlaylistSorter:
             self.tracks_data = self.tracks_data.set_index("occurrence", drop=False)
         return self.tracks_data
 
+    def _required_slot(self, entry: dict[str, Any]) -> int:
+        """Return the slot a fixed entry must occupy in every valid order."""
+        chosen = self.placements.get(entry["occurrence"])
+        return int(entry["original_position"]) if chosen is None else chosen
+
     def valid_order(self, order: list[str]) -> bool:
-        """Require every loaded occurrence once and keep fixed entries in their slots."""
+        """Require every loaded occurrence once and keep fixed entries in their placed slots."""
         original = [entry["occurrence"] for entry in self.original_items]
         return (
             bool(original)
             and Counter(order) == Counter(original)
             and all(
-                order[index] == entry["occurrence"]
-                for index, entry in enumerate(self.original_items)
+                order[self._required_slot(entry)] == entry["occurrence"]
+                for entry in self.original_items
                 if entry["fixed_reason"] is not None
             )
         )
 
     def choice_error(
-        self, first: str | None = None, last: str | None = None, profile: Profile = "smooth"
+        self,
+        first: str | None = None,
+        last: str | None = None,
+        profile: Profile = "smooth",
+        placements: dict[str, int] | None = None,
     ) -> str | None:
         """Reject foreign profiles or pins that conflict with complete-entry constraints."""
         if profile not in _PROFILE_WEIGHTS:
             return "Choose Smooth or More variety."
-        return _pin_error(self.original_items, first, last)
+        return _pin_error(self.original_items, first, last, placements)
 
     def sort_playlist(
-        self, first_occurrence: str | None = None, last_occurrence: str | None = None, profile: Profile = "smooth"
+        self,
+        first_occurrence: str | None = None,
+        last_occurrence: str | None = None,
+        profile: Profile = "smooth",
+        placements: dict[str, int] | None = None,
     ) -> list[str]:
         """Arrange complete occurrences using cached directed measurements and optional endpoints."""
-        if self.choice_error(first_occurrence, last_occurrence, profile):
+        chosen_placements = dict(placements or {})
+        if self.choice_error(first_occurrence, last_occurrence, profile, chosen_placements):
             return []
+        self.placements = chosen_placements
         stamp = (ANALYSIS_VERSION, _SCORING_VERSION)
         if self.arrangement_stamp != stamp:
             # ponytail: cap quadratic pair matrices; larger playlists retain every entry in a feasible baseline.
@@ -1064,7 +1473,12 @@ class SpotifyPlaylistSorter:
             )
             self.arrangement_results.clear()
             self.arrangement_stamp = stamp
-        choices = {"profile": profile, "first_occurrence": first_occurrence, "last_occurrence": last_occurrence}
+        choices = {
+            "profile": profile,
+            "first_occurrence": first_occurrence,
+            "last_occurrence": last_occurrence,
+            "placements": chosen_placements,
+        }
         result = self.arrangement_results.get(profile)
         if result is None or any(result[key] != value for key, value in choices.items()):
             result = _arrange(self.original_items, self.arrangement_data, choices)
@@ -1078,7 +1492,7 @@ class SpotifyPlaylistSorter:
             return []
         other = self.arrangement_results.get("variety" if profile == "smooth" else "smooth")
         comparable = other is not None and all(
-            other[key] == choices[key] for key in ("first_occurrence", "last_occurrence")
+            other[key] == choices[key] for key in ("first_occurrence", "last_occurrence", "placements")
         )
         self.arrangement_result = {
             **result,
@@ -1229,7 +1643,7 @@ class SpotifyPlaylistSorter:
     def update_spotify_playlist(self, order: list[str]) -> tuple[bool, str]:
         """Apply the exact complete preview using range moves, never replacement."""
         if not self.snapshot_id or not self.valid_order(order) or Counter(self.current_order) != Counter(order):
-            return False, "Check the playlist again before saving."
+            return False, "Analyze the playlist again before saving."
         first, last = self.arrangement_result.get("first_occurrence"), self.arrangement_result.get("last_occurrence")
         if (first is not None and order[0] != first) or (last is not None and order[-1] != last):
             return False, "Arrange the playlist again before saving."
@@ -1247,11 +1661,11 @@ class SpotifyPlaylistSorter:
         current = self.current_order.copy()
         self.restore_order = []
         operation = "Restore" if restore else "Saving"
-        unverified = f"{operation} couldn't be verified. Some songs may have moved. Check the playlist again."
+        unverified = f"{operation} couldn't be verified. Some songs may have moved. Analyze the playlist again."
         try:
             if not self._order_matches(current):
                 self.invalidate_save()
-                return False, "This playlist changed on Spotify. Check it again before saving or restoring."
+                return False, "This playlist changed on Spotify. Analyze it again before saving or restoring."
             # ponytail: one request per moved song; batch adjacent moves if save time becomes a problem.
             for destination, occurrence in enumerate(order):
                 source = current.index(occurrence)
@@ -1271,7 +1685,7 @@ class SpotifyPlaylistSorter:
         except Exception:
             logger.exception("Could not finish reordering playlist %s", self.playlist_id)
             self.invalidate_save()
-            return False, f"{operation} stopped. Some songs may have moved. Check the playlist again."
+            return False, f"{operation} stopped. Some songs may have moved. Analyze the playlist again."
         else:
             self.current_order = current
             self.restore_order = [] if restore else previous

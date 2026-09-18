@@ -7,6 +7,8 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Event, Thread
+from time import sleep
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -123,8 +125,12 @@ class RecordingPipelineTest(unittest.TestCase):
 
         with (
             patch.object(yt_dlp.YoutubeDL, "extract_info", side_effect=extract),
-            patch.object(playlist_sorter.SpotifyPlaylistSorter, "_download_and_load", return_value=(np.zeros(180), 1)),
-            patch.object(playlist_sorter, "analyze_audio", return_value={"summary": {}}),
+            patch.object(
+                playlist_sorter.SpotifyPlaylistSorter,
+                "_download_sections",
+                return_value=[("full", 0.0, 180.0, np.zeros(1))],
+            ),
+            patch.object(playlist_sorter, "analyze_sections", return_value={"summary": {}}),
         ):
             result = playlist_sorter.SpotifyPlaylistSorter._analyze_track(TRACK, cookie_text="")
             assert result["status"] == "ready", result
@@ -166,12 +172,17 @@ class RecordingPipelineTest(unittest.TestCase):
 
         with (
             patch.object(yt_dlp.YoutubeDL, "extract_info", autospec=True, side_effect=extract),
-            patch.object(playlist_sorter.SpotifyPlaylistSorter, "_download_and_load", return_value=(np.zeros(180), 1)),
-            patch.object(playlist_sorter, "analyze_audio", return_value={"summary": {}}),
+            patch.object(
+                playlist_sorter.SpotifyPlaylistSorter,
+                "_download_sections",
+                return_value=[("full", 0.0, 180.0, np.zeros(1))],
+            ) as download,
+            patch.object(playlist_sorter, "analyze_sections", return_value={"summary": {}}),
         ):
             result = playlist_sorter.SpotifyPlaylistSorter._analyze_track(TRACK, cookie_text="")
             assert result["status"] == "ready", result
             assert len(hydrated) <= 3, f"Hydrated {len(hydrated)} candidates for one recording"
+            assert download.call_count == 1
 
     def test_structured_metadata_keeps_credits_and_version_conflicts(self) -> None:
         """Ignore featured-artist display suffixes only when full credits support the match."""
@@ -212,6 +223,386 @@ class RecordingPipelineTest(unittest.TestCase):
             is not None
         )
 
+    def test_channel_evidence_rescues_credit_spelling_and_unattributed_uploads(self) -> None:
+        """Live-observed uploads: misspelled credits, absent credits and decorated titles still match."""
+        # Kanha Unplugged: YouTube credits misspell the artist; the official channel supplies evidence.
+        kanha = {
+            "id": "abcdefghijk",
+            "title": 'Kanha Unplugged (From "Shubh Mangal Saavdhan")',
+            "track": 'Kanha Unplugged (From "Shubh Mangal Saavdhan")',
+            "artists": ["Ayushman Khurrana"],
+            "duration": 176,
+            "channel": "Ayushmann Khurrana",
+        }
+        kanha_meta = {
+            "id": "a",
+            "title": "Kanha Unplugged",
+            "artists": ["Tanishk-Vayu", "Ayushmann Khurrana"],
+            "duration_ms": 176000,
+        }
+        assert playlist_sorter._select_recording(playlist_sorter._rank_recordings([kanha], kanha_meta)) is not None
+        # Saudebazi (Encore): exact title and duration with no credits and no verification.
+        encore = {"id": "abcdefghijk", "title": "SAUDEBAZI (ENCORE)", "duration": 354}
+        encore_meta = {
+            "id": "b",
+            "title": "Saudebazi (Encore)",
+            "artists": ["Pritam", "Javed Ali"],
+            "duration_ms": 354000,
+        }
+        assert playlist_sorter._select_recording(playlist_sorter._rank_recordings([encore], encore_meta)) is not None
+        # In Dino Refresh: word recall finds the requested title inside a decorated upload title.
+        refresh = {
+            "id": "abcdefghijk",
+            "title": "In Dino - Mohammed Irfan | Sony Music Refresh | Ajay Singha",
+            "duration": 254,
+            "channel": "Sony Music India",
+        }
+        refresh_meta = {
+            "id": "c",
+            "title": "In Dino - Refresh Version",
+            "artists": ["Mohammed Irfan"],
+            "duration_ms": 256000,
+        }
+        assert playlist_sorter._select_recording(playlist_sorter._rank_recordings([refresh], refresh_meta)) is not None
+        # Mera Pehla Pehla Pyaar: K.K. versus KK is the same artist; adjacent tokens squeeze to one.
+        initials = {
+            "id": "abcdefghijk",
+            "title": "Mera Pehla Pehla Pyaar",
+            "track": "Mera Pehla Pehla Pyaar",
+            "artists": ["K.K.", "Vipin Mishra"],
+            "duration": 271,
+            "channel": "Kay Kay - Topic",
+        }
+        initials_meta = {"id": "d", "title": "Mera Pehla Pehla Pyaar", "artists": ["KK"], "duration_ms": 271025}
+        assert (
+            playlist_sorter._select_recording(playlist_sorter._rank_recordings([initials], initials_meta)) is not None
+        )
+        # A labeled cover conflicts on the edition tag regardless of everything else.
+        cover = {"id": "abcdefghijk", "title": "Example (Cover)", "duration": 180, "channel": "Random Covers"}
+        cover_meta = {"id": "e", "title": "Example", "artists": ["Artist"], "duration_ms": 180000}
+        assert playlist_sorter._rank_recordings([cover], cover_meta) == []
+
+    def test_requested_edition_words_are_required_evidence(self) -> None:
+        """When the requested title declares an edition, uploads that omit it are different recordings."""
+        # Trailing parenthetical: the default upload must not stand in for the reprise.
+        reprise_meta = {
+            "id": "a",
+            "title": "Zindagi Kuch Toh Bata (Reprise)",
+            "artists": ["Jubin Nautiyal"],
+            "duration_ms": 258000,
+        }
+        original = {
+            "id": "abcdefghijk",
+            "title": "Zindagi Kuch Toh Bata",
+            "track": "Zindagi Kuch Toh Bata",
+            "artists": ["Rahat Fateh Ali Khan"],
+            "duration": 262,
+            "channel": "Pritam",
+            "channel_is_verified": True,
+        }
+        assert playlist_sorter._rank_recordings([original], reprise_meta) == []
+        labeled = {
+            **original,
+            "track": "Zindagi Kuch Toh Bata (Reprise)",
+            "artists": ["Jubin Nautiyal"],
+            "title": "Zindagi Kuch Toh Bata (Reprise)",
+        }
+        assert playlist_sorter._rank_recordings([labeled], reprise_meta) != []
+        # Trailing dash groups count too, and the qualifier may appear anywhere in the upload text.
+        refresh_meta = {
+            "id": "b",
+            "title": "In Dino - Refresh Version",
+            "artists": ["Mohammed Irfan"],
+            "duration_ms": 256000,
+        }
+        decorated = {
+            "id": "abcdefghijk",
+            "title": "In Dino - Mohammed Irfan | Sony Music Refresh | Ajay Singha",
+            "duration": 254,
+            "channel": "Sony Music India",
+        }
+        assert (
+            playlist_sorter._select_recording(playlist_sorter._rank_recordings([decorated], refresh_meta)) is not None
+        )
+        unlabeled = {**decorated, "id": "lmnopqrstuv", "title": "In Dino - Mohammed Irfan | Ajay Singha"}
+        ranked = playlist_sorter._rank_recordings([decorated, unlabeled], refresh_meta)
+        assert ranked, "edition evidence must rank the decorated upload"
+        assert ranked[0]["id"] == decorated["id"]  # edition evidence outranks the unlabeled copy
+        assert ranked[1]["score"] < ranked[0]["score"]
+        # From-movie groups never act as version requirements.
+        from_meta = {
+            "id": "c",
+            "title": 'Dil Cheez Tujhe Dedi (From "Airlift")',
+            "artists": ["Arijit Singh"],
+            "duration_ms": 300000,
+        }
+        plain = {"id": "abcdefghijk", "title": "Dil Cheez Tujhe Dedi", "duration": 300, "artist": "Arijit Singh"}
+        assert playlist_sorter._rank_recordings([plain], from_meta) != []
+
+    def test_edition_omissions_accept_unlabeled_official_uploads(self) -> None:
+        """Unlabeled default uploads satisfy edition requests unless credits name another singer."""
+        cases = [
+            (
+                {
+                    "id": "a",
+                    "title": "Te Amo (Duet)",
+                    "artists": ["Pritam", "Ash King", "Sunidhi Chauhan"],
+                    "duration_ms": 284723,
+                },
+                {
+                    "id": "abcdefghijk",
+                    "title": "Te Amo",
+                    "track": "Te Amo",
+                    "artists": ["Pritam"],
+                    "duration": 284,
+                    "channel": "Pritam",
+                    "channel_is_verified": True,
+                },
+            ),
+            (
+                {
+                    "id": "b",
+                    "title": "Pani Da Rang - Male",
+                    "artists": ["Ayushmann Khurrana", "Rochak Kohli"],
+                    "duration_ms": 240786,
+                },
+                {
+                    "id": "abcdefghijk",
+                    "title": "Pani Da Rang - Lyrical Video | Vicky Donor | Ayushmann Khurrana | Yami Gautam",
+                    "duration": 238,
+                    "channel": "Sony Music India",
+                    "channel_is_verified": True,
+                },
+            ),
+            (
+                {
+                    "id": "c",
+                    "title": "Har Kisi Ko (Female)",
+                    "artists": ["Arijit Singh", "Neeti Mohan", "Chirantan Bhatt"],
+                    "duration_ms": 337046,
+                },
+                {
+                    "id": "abcdefghijk",
+                    "title": "Arijit Singh, Neeti Mohan - Har Kisi Ko (Lyrics)",
+                    "duration": 338,
+                    "channel": "D-Muze India",
+                },
+            ),
+            (
+                {
+                    "id": "d",
+                    "title": "Yaariyaan - Male",
+                    "artists": ["Pritam", "Mohan Kannan", "Shilpa Rao"],
+                    "duration_ms": 374173,
+                },
+                {
+                    "id": "abcdefghijk",
+                    "title": "Yaariyaan (Lyrics) - Cocktail | Mohan Kanan, Shilpa Rao",
+                    "duration": 375,
+                    "channel": "Geet Mantra",
+                },
+            ),
+        ]
+        for metadata, upload in cases:
+            with self.subTest(title=metadata["title"]):
+                assert (
+                    playlist_sorter._select_recording(playlist_sorter._rank_recordings([upload], metadata)) is not None
+                )
+        # The default upload of a different singer stays rejected even without its edition label.
+        reprise_meta = {
+            "id": "e",
+            "title": "Zindagi Kuch Toh Bata (Reprise)",
+            "artists": ["Pritam", "Jubin Nautiyal", "Neelesh Misra"],
+            "duration_ms": 258877,
+        }
+        original = {
+            "id": "abcdefghijk",
+            "title": "Zindagi Kuch Toh Bata",
+            "track": "Zindagi Kuch Toh Bata",
+            "artists": ["Pritam", "Rahat Fateh Ali Khan", "Rekha Bhardwaj", "Neelesh Misra"],
+            "duration": 263,
+            "channel": "Pritam",
+            "channel_is_verified": True,
+        }
+        assert playlist_sorter._rank_recordings([original], reprise_meta) == []
+        # An upload claiming an edition the request never asked for stays rejected.
+        claimed = {
+            "id": "abcdefghijk",
+            "title": "Lagan Laagi Re (Reprise)",
+            "track": "Lagan Laagi Re (Reprise)",
+            "artists": ["Amit Trivedi"],
+            "duration": 279,
+            "channel": "Amit Trivedi",
+        }
+        plain_meta = {
+            "id": "f",
+            "title": "Lagan Laagi Re",
+            "artists": ["Amit Trivedi", "Shreya Ghoshal"],
+            "duration_ms": 278653,
+        }
+        assert playlist_sorter._rank_recordings([claimed], plain_meta) == []
+
+    def test_fuzzy_token_recall_tolerates_spelling_variants(self) -> None:
+        """Saathiyaa/Sathiya-class spelling differences no longer hide the right upload."""
+        metadata = {"id": "a", "title": "Saathiyaa", "artists": ["Shreya Ghoshal", "Ajay"], "duration_ms": 310924}
+        upload = {
+            "id": "abcdefghijk",
+            "title": "Sathiya Lyrics | Shreya Ghoshal | Ajay- Atul | Kajal Agarwal",
+            "duration": 310,
+            "channel": "RB Lyrics Lover",
+        }
+        assert playlist_sorter._shortlist([upload], metadata)
+        selected = playlist_sorter._select_recording(playlist_sorter._rank_recordings([upload], metadata))
+        assert selected is not None
+
+    def test_flat_search_retry_drops_failed_hints(self) -> None:
+        """When the audio-hinted query returns junk, the plain query still finds the official upload."""
+        official = {
+            "id": "abcdefghijk",
+            "title": "Dil Darbadar",
+            "duration": 378,
+            "channel": "Ankit Tiwari",
+        }
+        queries = []
+
+        def extract(_ydl: yt_dlp.YoutubeDL, url: str, **_kwargs: object) -> dict[str, Any]:
+            queries.append(url)
+            if url.startswith("ytsearch"):
+                if "audio" in url:
+                    return {
+                        "entries": [{"id": "junkid0x", "title": "Dil Darbadar Ankit Tiwari audio", "duration": None}]
+                    }
+                return {"entries": [official]}
+            return official
+
+        with patch.object(yt_dlp.YoutubeDL, "extract_info", autospec=True, side_effect=extract):
+            ranked, _full, _candidates = playlist_sorter.SpotifyPlaylistSorter._find_recordings(
+                {"id": "a", "title": "Dil Darbadar", "artists": ["Ankit Tiwari"], "duration_ms": 377045}, "", {}
+            )
+        searches = [query for query in queries if query.startswith("ytsearch")]
+        assert len(searches) == 2, f"expected exactly two searches, got {searches}"
+        assert "audio" in searches[0]
+        assert "audio" not in searches[1]
+        assert playlist_sorter._select_recording(ranked) is not None
+
+    def test_fallback_shortlist_hydrates_other_script_titles(self) -> None:
+        """Duration-compatible uploads in other scripts hydrate and reveal plain English names."""
+        metadata = {
+            "id": "a",
+            "title": "Zindagi Kuch Toh Bata (Reprise)",
+            "artists": ["Pritam", "Jubin Nautiyal"],
+            "duration_ms": 258877,
+        }
+        hindi = {"id": "abcdefghijk", "title": "ज़िन्दगी कुछ तो बता (रिप्राइज) पूरा ऑडियो गाना", "duration": 259}
+        english = {"id": "lmnopqrstuv", "title": "Wrong song entirely", "duration": 259}
+
+        def extract(_ydl: yt_dlp.YoutubeDL, url: str, **_kwargs: object) -> dict[str, Any]:
+            if url.startswith("ytsearch"):
+                return {"entries": [hindi, english]}
+            return hindi if url.endswith(str(hindi["id"])) else english
+
+        def hydrated_extract(ydl: yt_dlp.YoutubeDL, url: str, **_kwargs: object) -> dict[str, Any]:
+            if url.startswith("ytsearch"):
+                return extract(ydl, url)
+            video = dict(hindi if url.endswith(str(hindi["id"])) else english)
+            if video is hindi:
+                video["title"] = "Zindagi Kuch Toh Bata (Reprise) Full AUDIO Song Pritam"
+            return video
+
+        with patch.object(yt_dlp.YoutubeDL, "extract_info", autospec=True, side_effect=hydrated_extract):
+            candidates = playlist_sorter._shortlist([hindi, english], metadata)
+            assert [c["id"] for c in candidates] == [hindi["id"], english["id"]]  # both survive the shortlist
+
+    def test_retry_sleep_functions_accept_keyword_counts(self) -> None:
+        """yt-dlp calls retry sleep helpers with a keyword; a TypeError would crash every retry."""
+        functions = playlist_sorter.youtube_options("")["retry_sleep_functions"]
+        for key in ("http", "fragment", "extractor"):
+            with self.subTest(key=key):
+                assert functions[key](n=2) == 4
+
+    def test_worker_scale_limits_growth_by_machine_and_bandwidth(self) -> None:
+        """Start conservatively, grow after fast successes to the machine cap, and back off on rate limits."""
+        with patch.object(playlist_sorter._WorkerScale, "_machine_limit", return_value=4):
+            scale = playlist_sorter._WorkerScale()
+        assert scale.target == 2  # conservative start regardless of capacity
+        fast = {"status": "ready", "diagnostics": {"download_seconds": 2.0}}
+        for _ in range(8):
+            scale.adjust(fast)
+        assert scale.target == 3
+        for _ in range(8):
+            scale.adjust(fast)
+        assert scale.target == 4  # machine cap reached and held
+        for _ in range(8):
+            scale.adjust(fast)
+        assert scale.target == 4
+        scale.adjust({"status": "ready", "diagnostics": {"download_seconds": 30.0}})
+        assert scale.target == 4  # already at cap; slow downloads matter below it
+        scale.adjust({"status": "error", "reason": "rate_limit"})
+        assert scale.target == 1
+        with patch.object(playlist_sorter._WorkerScale, "_machine_limit", return_value=2):
+            scale = playlist_sorter._WorkerScale()
+        assert scale.target == 2
+        for _ in range(16):
+            scale.adjust(fast)
+        assert scale.target == 2  # machine cap
+        with patch.object(playlist_sorter._WorkerScale, "_machine_limit", return_value=4):
+            scale = playlist_sorter._WorkerScale()
+        for _ in range(8):
+            scale.adjust(fast)
+        assert scale.target == 3
+        scale.adjust({"status": "ready", "diagnostics": {"download_seconds": 30.0}})
+        assert scale.target == 3  # slow download blocks growth
+
+    def test_dynamic_gate_tracks_target_changes(self) -> None:
+        """Only the target's worth of workers proceed; the rest wait for a slot."""
+        gate = playlist_sorter._DynamicGate(1)
+        entered = []
+        release = Event()
+
+        def worker() -> None:
+            with gate:
+                entered.append(1)
+                release.wait(2)
+
+        threads = [Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        sleep(0.2)
+        assert entered == [1]  # a second worker cannot pass a target of one
+        release.set()
+        for thread in threads:
+            thread.join(2)
+        assert entered == [1, 1]
+
+    def test_shared_video_measurements_are_reused_within_a_job(self) -> None:
+        """Two Spotify entries resolving to one upload download and decode only once."""
+        track = {"id": "a", "Track": "Example", "Artist": "Artist", "duration_ms": 180000}
+        video = {**SOURCE, "title": "Artist - Example", "artist": "Artist"}
+
+        def extract(_ydl: yt_dlp.YoutubeDL, url: str, **_kwargs: object) -> dict[str, Any]:
+            return {"entries": [video]} if url.startswith("ytsearch") else video
+
+        reused_analysis = {"summary": {"rms_db": -12.0}}
+        with (
+            patch.object(yt_dlp.YoutubeDL, "extract_info", autospec=True, side_effect=extract),
+            patch.object(
+                playlist_sorter.SpotifyPlaylistSorter,
+                "_download_sections",
+                return_value=[("full", 0.0, 180.0, np.zeros(1))],
+            ) as download,
+            patch.object(playlist_sorter, "analyze_sections", return_value=reused_analysis),
+        ):
+            first = playlist_sorter.SpotifyPlaylistSorter._analyze_track(track, cookie_text="", video_analyses={})
+            assert first["status"] == "ready"
+            assert download.call_count == 1
+            second = playlist_sorter.SpotifyPlaylistSorter._analyze_track(
+                {**track, "id": "b"}, cookie_text="", video_analyses={str(video["id"]): first}
+            )
+            assert second["status"] == "ready"
+            assert second["analysis"] == reused_analysis
+            assert download.call_count == 1
+            assert second["source_fingerprint"] == first["source_fingerprint"]
+
     def test_source_access_failures_stop_the_queue_without_uncertain_labels(self) -> None:
         """Do not spend another request on every song after shared sign-in/rate-limit failure."""
         tracks = [{**TRACK, "id": str(index)} for index in range(20)]
@@ -220,6 +611,7 @@ class RecordingPipelineTest(unittest.TestCase):
                 self.subTest(reason=reason),
                 tempfile.TemporaryDirectory() as directory,
                 patch.object(playlist_sorter, "_CACHE_FILE", Path(directory) / "cache.json"),
+                patch.object(playlist_sorter._WorkerScale, "_machine_limit", return_value=2),
                 patch.object(
                     yt_dlp.YoutubeDL, "extract_info", side_effect=yt_dlp.utils.DownloadError(message)
                 ) as extract,
@@ -253,16 +645,18 @@ class RecordingPipelineTest(unittest.TestCase):
                 yt_dlp.YoutubeDL, "extract_info", side_effect=AssertionError("Unexpected extraction")
             ) as extract,
             patch.object(yt_dlp.YoutubeDL, "process_info", autospec=True, side_effect=process) as download,
-            patch.object(playlist_sorter, "load_audio", return_value=(np.zeros(180), 1)),
+            patch.object(playlist_sorter, "load_audio", return_value=(np.zeros(20 * 22050), 22050)),
         ):
-            assert (
-                playlist_sorter.SpotifyPlaylistSorter._download_and_load(
-                    {**SOURCE, "url": "https://www.youtube.com/watch?v=abcdefghijk"}, video_info=info
-                )[1]
-                == 1
+            sections = playlist_sorter.SpotifyPlaylistSorter._download_sections(
+                {**SOURCE, "url": "https://www.youtube.com/watch?v=abcdefghijk"}, video_info=info
             )
+            assert [(label, start, end) for label, start, end, _audio in sections] == [
+                ("intro", 0.0, 20.0),
+                ("body", 80.0, 100.0),
+                ("outro", 160.0, 180.0),
+            ]
             extract.assert_not_called()
-            download.assert_called_once()
+            assert download.call_count == 3
 
     def test_expired_download_is_retried_with_fresh_audio_metadata(self) -> None:
         """A 403 must refresh the video extraction rather than repeat the expired media URL."""
@@ -283,9 +677,9 @@ class RecordingPipelineTest(unittest.TestCase):
         with (
             patch.object(yt_dlp.YoutubeDL, "process_ie_result", autospec=True, side_effect=process),
             patch.object(yt_dlp.YoutubeDL, "extract_info", return_value={**info, "fresh": True}) as extract,
-            patch.object(playlist_sorter, "load_audio", return_value=(np.zeros(180), 1)),
+            patch.object(playlist_sorter, "load_audio", return_value=(np.zeros(20 * 22050), 22050)),
             patch.object(playlist_sorter, "sleep"),
         ):
-            assert playlist_sorter.SpotifyPlaylistSorter._download_and_load(source, video_info=info)[1] == 1
+            assert playlist_sorter.SpotifyPlaylistSorter._download_sections(source, video_info=info)
             extract.assert_called_once_with(source["url"], download=False)
             assert calls[-1]["fresh"]

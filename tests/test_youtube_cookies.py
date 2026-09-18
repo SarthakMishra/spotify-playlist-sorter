@@ -71,7 +71,7 @@ class YoutubeCookiesTest(unittest.TestCase):
                 patch.object(playlist_sorter.yt_dlp.YoutubeDL, "extract_info", autospec=True, side_effect=extract),
                 patch.object(playlist_sorter.yt_dlp.YoutubeDL, "process_ie_result", autospec=True, side_effect=process),
                 patch.object(playlist_sorter, "load_audio", return_value=(playlist_sorter.np.zeros(1), 1)),
-                patch.object(playlist_sorter, "analyze_audio", return_value={}),
+                patch.object(playlist_sorter, "analyze_sections", return_value={}),
             ):
                 result = playlist_sorter.SpotifyPlaylistSorter._analyze_track(
                     {"id": "test", "Track": "Test", "Artist": "Artist", "duration_ms": 1000}
