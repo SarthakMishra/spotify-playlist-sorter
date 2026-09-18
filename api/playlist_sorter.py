@@ -51,6 +51,7 @@ _EDITION_OMISSION_PENALTY = 0.10
 _SHORTLIST_LIMIT = 3
 _FALLBACK_SHORTLIST = 2
 _CACHE_CHECKPOINT = 10
+_DOWNLOAD_ATTEMPT_SECONDS = 15.0
 _VARIANTS = {
     "live": r"\b(?:live|concert)\b",
     "remix": r"\bremix(?:ed)?\b",
@@ -1035,7 +1036,7 @@ class SpotifyPlaylistSorter:
         video_info: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> list[tuple[str, float, float, np.ndarray]]:
-        """Download sampled windows concurrently, retrying once with fresh audio metadata."""
+        """Download sampled windows concurrently with a per-attempt deadline, retrying once with fresh metadata."""
         duration = float(source["duration"])
         plan = section_plan(duration)
         last_error = SourceAccessError("download_failed")
@@ -1056,22 +1057,31 @@ class SpotifyPlaylistSorter:
                         or (metadata is not None and _select_recording(_rank_recordings([video], metadata)) is None)
                     ):
                         raise SourceAccessError("recording_changed")  # noqa: TRY301, EM101 - fixed reason code.
-                    with ThreadPoolExecutor(max_workers=len(plan)) as executor:
-                        submitted: list[Future[np.ndarray]] = [
-                            executor.submit(
-                                SpotifyPlaylistSorter._download_section,
-                                copy.deepcopy(video),
-                                plan_section,
-                                duration,
-                                Path(directory),
-                                cookie_text,
-                            )
-                            for plan_section in plan
-                        ]
+                    executor = ThreadPoolExecutor(max_workers=len(plan))
+                    submitted: list[Future[np.ndarray]] = [
+                        executor.submit(
+                            SpotifyPlaylistSorter._download_section,
+                            copy.deepcopy(video),
+                            plan_section,
+                            duration,
+                            Path(directory),
+                            cookie_text,
+                        )
+                        for plan_section in plan
+                    ]
+                    deadline = perf_counter() + _DOWNLOAD_ATTEMPT_SECONDS
+                    try:
                         sections.extend(
-                            (label, start, end, future.result())
+                            (label, start, end, future.result(timeout=deadline - perf_counter()))
                             for (label, start, end), future in zip(plan, submitted, strict=True)
                         )
+                    except TimeoutError:
+                        logger.warning(
+                            "Download attempt exceeded %.0fs; retrying with fresh metadata", _DOWNLOAD_ATTEMPT_SECONDS
+                        )
+                        raise
+                    finally:
+                        executor.shutdown(wait=False, cancel_futures=True)
             except SourceAccessError:
                 raise
             except Exception as error:

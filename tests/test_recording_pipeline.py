@@ -680,6 +680,34 @@ class RecordingPipelineTest(unittest.TestCase):
         ]
         assert [float(sections[index][3][0]) for index in range(3)] == [1.0, 2.0, 3.0]
 
+    def test_deadline_abandons_slow_attempt_and_retries_fresh(self) -> None:
+        """A wedged section attempt cannot hold its worker slot; the retry re-extracts fresh URLs."""
+        source = {**SOURCE, "url": "https://www.youtube.com/watch?v=abcdefghijk"}
+        info = {**SOURCE, "formats": []}
+        calls: list[str] = []
+
+        def section(_video: dict[str, Any], plan_section: tuple[str, float, float], *_args: object) -> np.ndarray:
+            calls.append(plan_section[0])
+            if len(calls) <= 3:
+                sleep(0.25)
+            return np.full(20 * 22050, float(len(calls)), dtype=np.float32)
+
+        with (
+            patch.object(playlist_sorter, "_DOWNLOAD_ATTEMPT_SECONDS", 0.05),
+            patch.object(playlist_sorter.SpotifyPlaylistSorter, "_download_section", side_effect=section),
+            patch.object(yt_dlp.YoutubeDL, "extract_info", return_value={**info, "fresh": True}) as extract,
+            patch.object(playlist_sorter, "sleep"),
+        ):
+            sections = playlist_sorter.SpotifyPlaylistSorter._download_sections(source, video_info=info)
+
+        assert [(label, start, end) for label, start, end, _audio in sections] == [
+            ("intro", 0.0, 20.0),
+            ("body", 80.0, 100.0),
+            ("outro", 160.0, 180.0),
+        ]
+        assert len(calls) == 6
+        extract.assert_called_once_with(source["url"], download=False)
+
     def test_expired_download_is_retried_with_fresh_audio_metadata(self) -> None:
         """A 403 must refresh the video extraction rather than repeat the expired media URL."""
         source = {**SOURCE, "url": "https://www.youtube.com/watch?v=abcdefghijk"}
