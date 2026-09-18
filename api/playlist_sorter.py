@@ -22,7 +22,6 @@ from time import perf_counter, sleep
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import pandas as pd
 import spotipy
 import yt_dlp
 
@@ -112,13 +111,17 @@ def _positive_number(value: object) -> float | None:
     return result if math.isfinite(result) and result > 0 else None
 
 
-def _title_text(title: str) -> str:
-    """Normalize recording titles while retaining version qualifiers and genuine title words."""
+def _strip_decorations(title: str) -> str:
+    """Drop "from ..." tails, declared editions and artist credits before comparisons."""
     title = re.sub(r"\s*[-([]\s*from\s+.*", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\s*[-([]\s*(?:album version|original version|original mix)\b.*", "", title, flags=re.IGNORECASE)
     title = re.sub(r"[([]\s*(?:feat\.?|ft\.?|featuring)\s+[^)\]]+[)\]]", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\b(?:feat\.?|ft\.?|featuring)\s+[^([\-]*", "", title, flags=re.IGNORECASE)
-    return _normalize_text(title)
+    return re.sub(r"\b(?:feat\.?|ft\.?|featuring)\s+[^([\-]*", "", title, flags=re.IGNORECASE)
+
+
+def _title_text(title: str) -> str:
+    """Normalize recording titles while retaining version qualifiers and genuine title words."""
+    return _normalize_text(_strip_decorations(title))
 
 
 _GENERIC_QUALIFIERS = {"version", "audio", "video", "song", "full", "lyric", "lyrics", "official"}
@@ -128,10 +131,7 @@ _RECALL_THRESHOLD = 0.75
 
 def _edition_group(title: str) -> frozenset[str]:
     """All words of a title's trailing parenthetical or dash group, when it looks like an edition."""
-    text = re.sub(r"\s*[-([]\s*from\s+.*", "", title, flags=re.IGNORECASE)
-    text = re.sub(r"\s*[-([]\s*(?:album version|original version|original mix)\b.*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"[([]\s*(?:feat\.?|ft\.?|featuring)\s+[^)\]]+[)\]]", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\b(?:feat\.?|ft\.?|featuring)\s+[^([\-]*", "", text, flags=re.IGNORECASE)
+    text = _strip_decorations(title)
     if paren := re.search(r"\(([^()]*)\)\s*$", text):
         return frozenset(_normalize_text(paren.group(1)).split())
     if " - " in text:
@@ -302,6 +302,16 @@ def _eligible_duration(entry: object, expected: float) -> float | None:
     return duration
 
 
+def _rank_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    """Order ranked recordings: full music metadata first, then score, verification, stable id."""
+    return (
+        -item["evidence"]["music_metadata"],
+        -item["score"],
+        -item["evidence"]["verified_channel"],
+        item["id"],
+    )
+
+
 def _rank_recordings(entries: list[dict[str, Any]], metadata: dict[str, Any]) -> list[dict[str, Any]]:
     """Validate full recording metadata, distinguishing music credits from upload text."""
     # ponytail: metadata cannot prove audio identity; add authorized fingerprints if reviewed false matches warrant it.
@@ -375,15 +385,7 @@ def _rank_recordings(entries: list[dict[str, Any]], metadata: dict[str, Any]) ->
                 "verified_channel": bool(entry.get("channel_is_verified")),
             },
         }
-    return sorted(
-        eligible.values(),
-        key=lambda item: (
-            -item["evidence"]["music_metadata"],
-            -item["score"],
-            -item["evidence"]["verified_channel"],
-            item["id"],
-        ),
-    )
+    return sorted(eligible.values(), key=_rank_key)
 
 
 def _select_recording(ranked: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -998,7 +1000,6 @@ class SpotifyPlaylistSorter:
         """
         self.playlist_id = playlist_id
         self.sp = sp
-        self.tracks_data: pd.DataFrame | None = None
         self.playlist_name: str | None = None
         self.original_items: list[dict[str, Any]] = []
         self.current_order: list[str] = []
@@ -1174,29 +1175,25 @@ class SpotifyPlaylistSorter:
     def _search_entries(metadata: dict[str, Any], diagnostics: dict[str, Any]) -> list[dict[str, Any]]:
         """Run one bounded YouTube search, retrying plainly when the audio hint yields junk."""
         options: dict[str, Any] = {**youtube_options(), "extract_flat": "in_playlist", "format": "bestaudio"}
-        entries: list[dict[str, Any]] = []
-        with yt_dlp.YoutubeDL(options) as search:
-            started = perf_counter()
-            query = f"ytsearch10:{metadata['title']} {' '.join(metadata['artists'][:2])} audio"
+
+        def flat_search(query: str) -> list[dict[str, Any]]:
             try:
-                info = search.extract_info(query, download=False) or {}
+                with yt_dlp.YoutubeDL(options) as search:
+                    info = search.extract_info(query, download=False) or {}
             except Exception as error:
                 raise SourceAccessError(
                     failure_reason(str(error)) or options["logger"].reason or "source_failed"
                 ) from error
-            diagnostics["search_seconds"] = round(perf_counter() - started, 3)
-            entries = [entry for entry in (info.get("entries") or [info]) if entry]
-            if not _shortlist(entries, metadata):
-                # Some queries return junk with the audio hint; retry plainly before giving up.
-                retry = f"ytsearch10:{metadata['title']} {metadata['artists'][0]}"
-                try:
-                    info = search.extract_info(retry, download=False) or {}
-                except Exception as error:
-                    raise SourceAccessError(
-                        failure_reason(str(error)) or options["logger"].reason or "source_failed"
-                    ) from error
-                entries = [entry for entry in (info.get("entries") or [info]) if entry]
-            diagnostics["search_results"] = len(entries)
+            return [entry for entry in (info.get("entries") or [info]) if entry]
+
+        started = perf_counter()
+        query = f"ytsearch10:{metadata['title']} {' '.join(metadata['artists'][:2])} audio"
+        entries = flat_search(query)
+        diagnostics["search_seconds"] = round(perf_counter() - started, 3)
+        if not _shortlist(entries, metadata):
+            # Some queries return junk with the audio hint; retry plainly before giving up.
+            entries = flat_search(f"ytsearch10:{metadata['title']} {metadata['artists'][0]}")
+        diagnostics["search_results"] = len(entries)
         return entries
 
     @staticmethod
@@ -1385,14 +1382,7 @@ class SpotifyPlaylistSorter:
                     if video:
                         full[video["id"]] = video
                         ranked.extend(_rank_recordings([video], metadata))
-                        ranked.sort(
-                            key=lambda item: (
-                                -item["evidence"]["music_metadata"],
-                                -item["score"],
-                                -item["evidence"]["verified_channel"],
-                                item["id"],
-                            )
-                        )
+                        ranked.sort(key=_rank_key)
                 return bool(_select_recording(ranked))
 
             while hydrate():
@@ -1541,9 +1531,6 @@ class SpotifyPlaylistSorter:
         entry["fixed_reason"] = None
         entry.update(BPM=features.get("tempo"), Energy=features.get("energy"), Camelot=features.get("camelot"))
         entry["Recording"] = features.get("recording")
-        self.tracks_data = pd.DataFrame(self.original_items)
-        if not self.tracks_data.empty:
-            self.tracks_data = self.tracks_data.set_index("occurrence", drop=False)
         self.arrangement_data = None
         self.arrangement_stamp = None
         self.arrangement_results.clear()
@@ -1557,7 +1544,7 @@ class SpotifyPlaylistSorter:
         progress_callback: Callable[[int, int], None] | None = None,
         entries_callback: Callable[[list[dict[str, Any]]], None] | None = None,
         record_callback: Callable[[str, dict[str, Any]], None] | None = None,
-    ) -> pd.DataFrame | None:
+    ) -> list[dict[str, Any]]:
         """Load playlist name and track data using Spotify API + local audio analysis.
 
         Args:
@@ -1602,10 +1589,7 @@ class SpotifyPlaylistSorter:
             )
             if entry["fixed_reason"] is None and features.get("status") != "ready":
                 entry["fixed_reason"] = features.get("message", "Couldn't analyze this song")
-        self.tracks_data = pd.DataFrame(self.original_items)
-        if not self.tracks_data.empty:
-            self.tracks_data = self.tracks_data.set_index("occurrence", drop=False)
-        return self.tracks_data
+        return self.original_items
 
     def _required_slot(self, entry: dict[str, Any]) -> int:
         """Return the slot a fixed entry must occupy in every valid order."""
@@ -1693,11 +1677,12 @@ class SpotifyPlaylistSorter:
         }
         return list(order)
 
-    def compare_playlists(self, order: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """Return complete original and proposed sequences without changing identities."""
-        if self.tracks_data is None or not self.valid_order(order):
-            return pd.DataFrame(), pd.DataFrame()
-        return self.tracks_data.copy(), self.tracks_data.reindex(order)
+    def proposed_tracks(self, order: list[str]) -> list[dict[str, Any]]:
+        """Return the proposed sequence as complete entries, without changing identities."""
+        if not self.valid_order(order):
+            return []
+        entries = {entry["occurrence"]: entry for entry in self.original_items}
+        return [entries[occurrence] for occurrence in order]
 
     def get_transition_analysis(self, order: list[str]) -> list[dict[str, Any]]:
         """Expose actual outro/intro evidence, leaving unmeasured edges explicitly unassessed."""

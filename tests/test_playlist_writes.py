@@ -124,7 +124,7 @@ class PlaylistWritesTest(unittest.TestCase):
                 JobView(
                     playlist_id=PLAYLIST,
                     status="ready",
-                    sorted_tracks=_tracks(self.sorter.compare_playlists(self.target)[1]),
+                    sorted_tracks=_tracks(self.sorter.proposed_tracks(self.target)),
                 ),
                 self.target,
             )
@@ -227,7 +227,7 @@ class PlaylistWritesTest(unittest.TestCase):
                         JobView(
                             playlist_id=PLAYLIST,
                             status="ready",
-                            sorted_tracks=_tracks(self.sorter.compare_playlists(self.target)[1]),
+                            sorted_tracks=_tracks(self.sorter.proposed_tracks(self.target)),
                         ),
                         self.target,
                     )

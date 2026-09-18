@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from itertools import pairwise
@@ -362,7 +363,7 @@ class MigrationTest(unittest.TestCase):
         ):
             with self.subTest(invalid=invalid):
                 assert not sorter.valid_order(invalid)
-                assert all(frame.empty for frame in sorter.compare_playlists(invalid))
+                assert sorter.proposed_tracks(invalid) == []
                 assert sorter.get_transition_analysis(invalid) == []
                 assert not sorter.update_spotify_playlist(invalid)[0]
         sp.playlist_reorder_items.assert_not_called()
@@ -395,8 +396,7 @@ class MigrationTest(unittest.TestCase):
             assert original["options"]["preset"] == "steady"
             assert original["first_occurrence"] is None
             assert original["last_occurrence"] is None
-            assert original["arrangement"]["unchanged"]
-            assert original["arrangement"]["assessed_edges"] == 0
+            assert original["arrangement"] == {"unchanged": True, "limited": False}
             assert (
                 client.post("/api/job/save", headers=headers, json={"revision": original["revision"]}).status_code
                 == 409
@@ -432,7 +432,7 @@ class MigrationTest(unittest.TestCase):
             assert mixed["last_occurrence"] == first
             assert [entry["id"] for entry in mixed["sorted_tracks"]] == [SECOND, None, FIRST]
             assert not mixed["arrangement"]["unchanged"]
-            assert mixed["arrangement"]["cost"] <= mixed["arrangement"]["baseline_cost"]
+            assert mixed["arrangement"] == {"unchanged": False, "limited": False}
             fixed = mixed["tracks"][1]["occurrence"]
             assert (
                 client.post(
@@ -655,8 +655,8 @@ class MigrationTest(unittest.TestCase):
             )
         sp.playlist_reorder_items.assert_not_called()
 
-    def test_rematch_times_out_and_ignores_late_results(self) -> None:
-        """A stuck reanalysis is cancelled by the deadline and late completions lose the race."""
+    def test_rematch_deadline_reports_a_timeout(self) -> None:
+        """A reanalysis that overruns its deadline reports the timeout instead of updating."""
         sp = Mock()
         sp.playlist.return_value = {"name": "Check", "snapshot_id": "snapshot", "owner": {"id": "listener"}}
         sp.playlist_items.return_value = {
@@ -664,8 +664,6 @@ class MigrationTest(unittest.TestCase):
             "next": None,
         }
         features = {key: {"status": "ready", "tempo": 120.0, "camelot": None, "energy": 0.5} for key in (FIRST, SECOND)}
-        release_worker = Event()
-        worker_done = Event()
         app = create_app()
         with (
             tempfile.TemporaryDirectory() as directory,
@@ -673,7 +671,6 @@ class MigrationTest(unittest.TestCase):
             patch("api.app.get_spotify_client", return_value=sp),
             patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features),
             patch("api.app.REANALYZE_SECONDS", 0.1),
-            patch("api.app.REANALYZE_MARGIN_SECONDS", 0.1),
             TestClient(app) as client,
         ):
             session = Session(auth=Mock(), state="", user={"id": "listener"})
@@ -684,38 +681,26 @@ class MigrationTest(unittest.TestCase):
             loaded = client.get("/api/job").json()
             occurrence = loaded["tracks"][0]["occurrence"]
 
-            def stuck_reanalyze(
-                _entry: dict[str, Any],
-                _video_id: str,
-                _notify: Callable[[str, dict[str, Any]], None],
-                *,
-                deadline: float | None = None,  # noqa: ARG001 - signature mirrors reanalyze_track
-            ) -> tuple[bool, str]:
-                assert release_worker.wait(5), "test never released the stuck reanalysis"
-                worker_done.set()
-                return True, "Recording updated."
+            def slow_hydrate(candidate: dict[str, Any]) -> dict[str, Any]:
+                time.sleep(0.3)
+                return {"id": candidate["id"]}
 
-            with patch.object(SpotifyPlaylistSorter, "reanalyze_track", side_effect=stuck_reanalyze):
+            with patch.object(SpotifyPlaylistSorter, "_hydrate_candidate", side_effect=slow_hydrate):
                 assert (
                     client.post(
                         f"/api/job/matches/{occurrence}", headers=headers, json={"video_id": "d" * 11}
                     ).status_code
                     == 202
                 )
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    if client.get("/api/job").json()["status"] == "error":
+                        break
+                    time.sleep(0.05)
                 timed_out = client.get("/api/job").json()
                 assert timed_out["status"] == "error"
                 assert "took too long" in timed_out["error"]
-                assert timed_out["tracks"][0]["analysis_status"] == "matching"
-                # The deadline also blocks further attempts while the worker runs.
-                assert (
-                    client.post(
-                        f"/api/job/matches/{occurrence}", headers=headers, json={"video_id": "e" * 11}
-                    ).status_code
-                    == 409
-                )
-                release_worker.set()
-                assert worker_done.wait(5)
-                assert client.get("/api/job").json()["status"] == "error"
+                assert timed_out["tracks"][0]["analysis_status"] == "error"
         sp.playlist_reorder_items.assert_not_called()
 
     def test_revoked_login_clears_the_browser_session(self) -> None:

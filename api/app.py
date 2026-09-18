@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import secrets
 import time
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,7 +13,6 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 from urllib.parse import urlsplit
 
-import pandas as pd
 import spotipy
 from dotenv import load_dotenv
 from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response, status
@@ -39,7 +36,6 @@ SESSION_SECONDS = 24 * 60 * 60
 LOGIN_SECONDS = 10 * 60
 MAX_SESSIONS = 200
 REANALYZE_SECONDS = 150.0
-REANALYZE_MARGIN_SECONDS = 5.0
 COOKIE = "playlist_session"
 SpotifyId = Annotated[str, Field(pattern=r"^[A-Za-z0-9]{22}$")]
 
@@ -91,10 +87,6 @@ class ListeningOptions(BaseModel):
     energy: float = Field(default=0.5, ge=0, le=1)
     variety: float = Field(default=0.5, ge=0, le=1)
 
-    def normalized(self) -> dict[str, Any]:
-        """Return the option values the sorter consumes."""
-        return self.model_dump()
-
 
 class JobView(BaseModel):
     """Public job state; tokens and sorter objects never enter responses."""
@@ -107,8 +99,6 @@ class JobView(BaseModel):
     completed: int = 0
     total: int = 0
     kept_count: int = 0
-    cached_count: int = 0
-    recording_count: int = 0
     metadata_loaded: bool = False
     analyzed_count: int = 0
     options: ListeningOptions = Field(default_factory=ListeningOptions)
@@ -130,7 +120,6 @@ class Job:
     sorter: SpotifyPlaylistSorter
     view: JobView
     sorted_order: list[str] = field(default_factory=list)
-    rematch_cancelled: bool = False
 
 
 @dataclass
@@ -220,18 +209,20 @@ def _set_cookie(response: Response, session_id: str) -> None:
     )
 
 
-def _tracks(frame: pd.DataFrame) -> list[Track]:
+_TRACK_COLUMNS = {
+    "Track": "name",
+    "Artist": "artist",
+    "Camelot": "key",
+    "BPM": "bpm",
+    "Energy": "energy",
+    "Recording": "recording",
+}
+
+
+def _tracks(entries: list[dict[str, Any]]) -> list[Track]:
     """Serialize the entry identities assigned when the source playlist was loaded."""
-    columns = {
-        "Track": "name",
-        "Artist": "artist",
-        "Camelot": "key",
-        "BPM": "bpm",
-        "Energy": "energy",
-        "Recording": "recording",
-    }
     return [
-        Track.model_validate(row) for row in json.loads(frame.rename(columns=columns).to_json(orient="records") or "[]")
+        Track.model_validate({_TRACK_COLUMNS.get(key, key): value for key, value in entry.items()}) for entry in entries
     ]
 
 
@@ -253,7 +244,7 @@ def _rematch_job(job: Job, occurrence: str, video_id: str, deadline: float) -> N
     progress_lock = Lock()
 
     def record_progress(recording_id: str, result: dict[str, Any]) -> None:
-        if job.rematch_cancelled or recording_id != entry["id"]:
+        if recording_id != entry["id"]:
             return
         stage = result.get("status")
         phase = {"matching": "matching", "downloading": "downloading", "analyzing": "analyzing"}.get(
@@ -268,11 +259,9 @@ def _rematch_job(job: Job, occurrence: str, video_id: str, deadline: float) -> N
 
     success, message = job.sorter.reanalyze_track(entry, video_id, record_progress, deadline=deadline)
     with progress_lock:
-        if job.rematch_cancelled:
-            return
         if success:
             tracks = [
-                _tracks(pd.DataFrame([item]))[0] if item["occurrence"] == occurrence else track
+                _tracks([item])[0] if item["occurrence"] == occurrence else track
                 for item, track in zip(job.sorter.original_items, job.view.tracks, strict=True)
             ]
             job.view = job.view.model_copy(
@@ -309,7 +298,7 @@ def _analyze_job(job: Job) -> None:
     progress_lock = Lock()
 
     def entries_loaded(entries: list[dict[str, Any]]) -> None:
-        tracks = _tracks(pd.DataFrame(entries))
+        tracks = _tracks(entries)
         with progress_lock:
             job.view = job.view.model_copy(
                 update={
@@ -353,22 +342,12 @@ def _analyze_job(job: Job) -> None:
     def progress(done: int, total: int) -> None:
         with progress_lock:
             job.view = job.view.model_copy(
-                update={
-                    "completed": done,
-                    "total": total,
-                    "cached_count": job.sorter.cached_count,
-                    "recording_count": job.sorter.recording_count,
-                }
+                update={"completed": done, "total": total},
             )
 
     tracks = job.sorter.load_playlist(
         progress_callback=progress, entries_callback=entries_loaded, record_callback=record_progress
     )
-    if tracks is None:
-        job.view = job.view.model_copy(
-            update={"status": "error", "error": "We couldn't analyze these songs. Please try again."}
-        )
-        return
     job.view = job.view.model_copy(
         update={
             "name": job.sorter.playlist_name or "Your playlist",
@@ -377,8 +356,6 @@ def _analyze_job(job: Job) -> None:
             "completed": job.view.total,
             "analyzed_count": sum(entry["analysis_status"] == "ready" for entry in job.sorter.original_items),
             "kept_count": sum(entry["fixed_reason"] is not None for entry in job.sorter.original_items),
-            "cached_count": job.sorter.cached_count,
-            "recording_count": job.sorter.recording_count,
             "status": "ready",
         }
     )
@@ -391,7 +368,7 @@ def _run_job(job: Job, action: str, release: Callable[[], None]) -> None:
             _analyze_job(job)
         elif action == "sort":
             job.sorted_order = job.sorter.sort_playlist(
-                job.view.options.normalized(),
+                job.view.options.model_dump(),
                 job.view.first_occurrence,
                 job.view.last_occurrence,
                 job.view.placements,
@@ -401,31 +378,25 @@ def _run_job(job: Job, action: str, release: Callable[[], None]) -> None:
                     update={"status": "error", "error": "Review your song choices and try again."}
                 )
                 return
-            _, sorted_frame = job.sorter.compare_playlists(job.sorted_order)
             transitions = job.sorter.get_transition_analysis(job.sorted_order)
             job.view = job.view.model_copy(
                 update={
-                    "sorted_tracks": _tracks(sorted_frame),
-                    "transitions": json.loads(pd.DataFrame(transitions).to_json(orient="records") or "[]"),
+                    "sorted_tracks": _tracks(job.sorter.proposed_tracks(job.sorted_order)),
+                    "transitions": transitions,
                     "review": job.sorter.review_summary(job.sorted_order, transitions),
-                    "arrangement": {
-                        key: value
-                        for key, value in job.sorter.arrangement_result.items()
-                        if key not in {"order", "options", "first_occurrence", "last_occurrence", "placements"}
-                    },
+                    "arrangement": {key: job.sorter.arrangement_result[key] for key in ("unchanged", "limited")},
                     "status": "ready",
                 }
             )
         elif action == "restore":
             success, message = job.sorter.restore_spotify_playlist()
             job.sorted_order = job.sorter.current_order.copy() if success else []
-            _, restored_frame = job.sorter.compare_playlists(job.sorted_order)
             job.view = job.view.model_copy(
                 update={
                     "status": "restored" if success else "error",
                     "error": None if success else message,
                     "can_restore": False,
-                    "sorted_tracks": _tracks(restored_frame),
+                    "sorted_tracks": _tracks(job.sorter.proposed_tracks(job.sorted_order)),
                     "transitions": [],
                     "review": None,
                     "arrangement": None,
@@ -636,7 +607,7 @@ def begin_action(
             if options is None or len(movable) < 2:  # noqa: PLR2004
                 raise HTTPException(422, "At least two movable songs are needed to arrange this playlist.")
             error = job.sorter.choice_error(
-                options.options.normalized(), options.first_occurrence, options.last_occurrence, options.placements
+                options.options.model_dump(), options.first_occurrence, options.last_occurrence, options.placements
             )
             if error:
                 raise HTTPException(422, error)
@@ -708,7 +679,7 @@ def _match_entry(job: Job, occurrence: str) -> dict[str, Any]:
 def match_candidates(occurrence: str, session: CurrentSession) -> list[Candidate]:
     """Search YouTube so a listener can review or replace this song's recording."""
     job = session.job
-    if not job or job.view.status not in {"ready", "saved", "restored"}:
+    if not job:
         raise HTTPException(409, "Analyze the playlist before checking recordings.")
     entry = _match_entry(job, occurrence)
     try:
@@ -730,7 +701,7 @@ def apply_match(
         job = session.job
         if not job or job.view.status not in {"ready", "saved", "restored"}:
             raise HTTPException(409, "Analyze the playlist before changing recordings.")
-        if job.view.status != "ready" and job.sorted_order and job.view.status == "saved":
+        if job.view.status == "saved" and job.sorted_order:
             raise HTTPException(409, "Analyze the playlist again before changing recordings.")
         if request.app.state.analysis_lock.locked():
             raise HTTPException(409, "We're busy with another playlist. Please try again shortly.")
@@ -773,28 +744,15 @@ def apply_match(
 def _run_rematch(job: Job, occurrence: str, video_id: str, release: Callable[[], None]) -> None:
     """Run the single-recording reanalysis in the background and release the analysis lock."""
     deadline = perf_counter() + REANALYZE_SECONDS
-    executor = ThreadPoolExecutor(max_workers=1)
     try:
-        future = executor.submit(_rematch_job, job, occurrence, video_id, deadline)
-        try:
-            future.result(timeout=REANALYZE_SECONDS + REANALYZE_MARGIN_SECONDS)
-        except TimeoutError:
-            # The worker keeps running until its own stages finish; its late
-            # updates are ignored once the rematch is marked cancelled.
-            job.rematch_cancelled = True
-            job.view = job.view.model_copy(
-                update={
-                    "status": "error",
-                    "error": "This took too long. Try again shortly or choose another recording.",
-                }
-            )
+        # Stage deadlines inside the rematch (expired() checks and source timeouts) bound the wait.
+        _rematch_job(job, occurrence, video_id, deadline)
     except Exception:
         logger.exception("Playlist %s failed during rematch", job.view.playlist_id)
         job.view = job.view.model_copy(
             update={"status": "error", "error": "Something went wrong. Please analyze the playlist again."}
         )
     finally:
-        executor.shutdown(wait=False, cancel_futures=True)
         release()
 
 

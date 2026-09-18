@@ -31,7 +31,7 @@ SETTINGS = {
     "mono": True,
     "fft_size": FFT_SIZE,
     "hop": HOP,
-    "boundary_seconds": 15,
+    "boundary_seconds": BOUNDARY_SECONDS,
     "section_seconds": SECTION_SECONDS,
     "full_track_seconds": FULL_TRACK_SECONDS,
     "max_seconds": MAX_SECONDS,
