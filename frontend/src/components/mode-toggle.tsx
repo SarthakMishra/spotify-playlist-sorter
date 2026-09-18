@@ -1,6 +1,8 @@
 import { Monitor, Moon, Sun } from "lucide-react"
 import { useTheme } from "@/components/theme-provider"
 import { Button } from "@/components/ui/button"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { cn } from "cn"
 
 const modes = {
   light: { icon: Sun, label: "Light", next: "dark" },
@@ -8,20 +10,42 @@ const modes = {
   system: { icon: Monitor, label: "System", next: "light" },
 } as const
 
+const iconTransition = "absolute inset-0 transition-[opacity,filter,scale] duration-300 ease-swift"
+
 export function ModeToggle() {
   const { theme, setTheme } = useTheme()
-  const { icon: Icon, label, next } = modes[theme]
+  const { label, next } = modes[theme]
 
   return (
-    <Button
-      variant="ghost"
-      size="sm"
-      className="w-24 gap-2 text-muted-foreground focus-visible:text-foreground max-sm:flex-1"
-      aria-label={`Theme: ${label}. Switch to ${modes[next].label}`}
-      onClick={() => setTheme(next)}
-    >
-      <Icon aria-hidden="true" />
-      {label}
-    </Button>
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={`Theme: ${label}. Switch to ${modes[next].label}`}
+            onClick={() => setTheme(next)}
+          />
+        }
+      >
+        <span className="relative size-4">
+          {Object.entries(modes).map(([key, mode]) => {
+            const Icon = mode.icon
+            const active = key === theme
+            return (
+              <Icon
+                key={key}
+                aria-hidden="true"
+                className={cn(
+                  iconTransition,
+                  active ? "scale-100 opacity-100 blur-none" : "scale-25 opacity-0 blur-xs",
+                )}
+              />
+            )
+          })}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>Theme: {label}</TooltipContent>
+    </Tooltip>
   )
 }

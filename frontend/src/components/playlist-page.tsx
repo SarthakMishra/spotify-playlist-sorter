@@ -1,6 +1,19 @@
-import { lazy, Suspense, useEffect, useEffectEvent, useRef, useState } from "react"
+import { Fragment, Suspense, lazy, useEffect, useEffectEvent, useRef, useState } from "react"
 import { Link, useLoaderData, useParams, useRouteLoaderData } from "react-router"
-import { ArrowLeft, ArrowRight, ExternalLink, LoaderCircle, Music2 } from "lucide-react"
+import {
+  ArrowDownWideNarrow,
+  ArrowLeft,
+  ArrowRight,
+  CircleAlert,
+  CircleCheck,
+  CircleX,
+  Clock,
+  ExternalLink,
+  LoaderCircle,
+  Music2,
+  type LucideIcon,
+} from "lucide-react"
+import { cn } from "cn"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button, buttonVariants } from "@/components/ui/button"
 import {
@@ -12,13 +25,20 @@ import {
   ComboboxEmpty,
 } from "@/components/ui/combobox"
 import { Progress, ProgressLabel, ProgressValue } from "@/components/ui/progress"
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { toast } from "@/components/ui/toast"
 import {
   Table,
   TableHeader,
   TableHead,
   TableRow,
+  TableMarkerRow,
   TableBody,
   TableCell,
   TableCaption,
@@ -30,11 +50,94 @@ import {
   type Job,
   type Playlist,
   type Profile,
+  type ReviewHighlight,
   type Session,
   type Track,
 } from "@/lib/api"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
+import { measuredIntensity, intensityLabel } from "@/lib/review"
 
 const SongDetails = lazy(() => import("@/components/song-details"))
+const SlopeGraph = lazy(() => import("@/components/slope-graph"))
+
+// Warm the recharts-heavy details chunk before the details section is opened.
+const preloadSongDetails = () => {
+  void import("@/components/song-details")
+}
+const preloadSlopeGraph = () => {
+  void import("@/components/slope-graph")
+}
+
+type PlacementChoice = "keep" | "top" | "bottom" | "custom"
+
+const placementItems: { value: PlacementChoice; label: string }[] = [
+  { value: "keep", label: "Keep in place" },
+  { value: "top", label: "Move to top" },
+  { value: "bottom", label: "Move to bottom" },
+  { value: "custom", label: "Custom position" },
+]
+
+const groupPlacementItems: { value: "keep" | "top" | "bottom"; label: string }[] = [
+  { value: "keep", label: "Keep in place" },
+  { value: "top", label: "Move to top" },
+  { value: "bottom", label: "Move to bottom" },
+]
+
+type StatusTone = "success" | "warning" | "failed" | "analyzing"
+
+const toneClass: Record<StatusTone, string> = {
+  success: "bg-success/15 text-success",
+  warning: "bg-warning/15 text-warning",
+  failed: "bg-destructive/15 text-destructive",
+  analyzing: "bg-foreground/10 text-muted-foreground",
+}
+
+const statusMeta: Record<
+  Track["analysis_status"],
+  { label: string; tone: StatusTone; icon: LucideIcon }
+> = {
+  pending: { label: "Waiting to analyze", tone: "warning", icon: Clock },
+  matching: { label: "Finding recording", tone: "analyzing", icon: LoaderCircle },
+  downloading: { label: "Downloading audio", tone: "analyzing", icon: LoaderCircle },
+  analyzing: { label: "Measuring audio", tone: "analyzing", icon: LoaderCircle },
+  ready: { label: "Analyzed", tone: "success", icon: CircleCheck },
+  uncertain: { label: "Recording uncertain", tone: "failed", icon: CircleAlert },
+  error: { label: "Analysis failed", tone: "failed", icon: CircleX },
+  fixed: { label: "Can't analyze", tone: "failed", icon: CircleX },
+}
+
+function StatusBadge({
+  status,
+  reason,
+}: {
+  status: Track["analysis_status"]
+  reason: string | null
+}) {
+  const meta = statusMeta[status]
+  const label = reason ? `${meta.label} · ${reason}` : meta.label
+  const Icon = meta.icon
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <span
+            aria-label={label}
+            className={cn(
+              "inline-flex size-7 items-center justify-center rounded-full",
+              toneClass[meta.tone],
+            )}
+          />
+        }
+      >
+        <Icon
+          className={cn("size-4", meta.tone === "analyzing" && "motion-safe:animate-spin")}
+          aria-hidden="true"
+        />
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  )
+}
 
 export function PlaylistRoute() {
   const { playlistId } = useParams()
@@ -53,24 +156,96 @@ export function PlaylistRoute() {
   return <PlaylistPage key={playlistId} playlist={playlist} initialJob={initialJob} />
 }
 
+function VerdictLine({ job }: { job: Job }) {
+  const moved = job.sorted_tracks.filter(
+    (track, index) => track.original_position + 1 !== index + 1,
+  ).length
+  const review = job.review
+  const highlightCount = review?.highlights.length ?? 0
+  const assessed = review?.suggested_assessed
+  const parts: string[] = [
+    moved === 0
+      ? "No songs moved."
+      : `${moved} of ${job.sorted_tracks.length} ${moved === 1 ? "song" : "songs"} moved.`,
+  ]
+  if (assessed != null && assessed > 0)
+    parts.push(
+      highlightCount > 0
+        ? `${highlightCount} ${highlightCount === 1 ? "transition" : "transitions"} worth checking.`
+        : "No rough transitions found.",
+    )
+  return <p className="mt-2 text-sm text-muted-foreground tabular-nums">{parts.join(" ")}</p>
+}
+
+function IntensityCell({ track }: { track: Track }) {
+  const intensity = measuredIntensity(track)
+  const label = intensityLabel(intensity)
+  if (intensity === null)
+    return (
+      <span className="text-xs text-muted-foreground/40" aria-label="Intensity unavailable">
+        —
+      </span>
+    )
+  return (
+    <span className="flex items-center gap-1.5" aria-label={`Intensity: ${label}`}>
+      <span
+        aria-hidden="true"
+        className={cn(
+          "inline-block size-2 rounded-full",
+          intensity < 1 / 3
+            ? "bg-foreground/30"
+            : intensity < 2 / 3
+              ? "bg-foreground/60"
+              : "bg-foreground",
+        )}
+      />
+      <span className="text-xs text-muted-foreground">{label}</span>
+    </span>
+  )
+}
+
+function TransitionMarker({ note }: { note: ReviewHighlight }) {
+  return (
+    <TableMarkerRow>
+      <TableCell
+        colSpan={5}
+        aria-label={`Transition note between ${note.track1_name} and ${note.track2_name}: ${note.text}`}
+        className="py-2 pr-3 pl-9"
+      >
+        <p className="flex items-start gap-2.5 text-xs leading-5 text-muted-foreground">
+          <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-warning" aria-hidden="true" />
+          <span className="min-w-0">
+            <span className="font-medium text-foreground">
+              {note.track1_name} → {note.track2_name}
+            </span>
+            <span className="mx-1.5 text-muted-foreground/60" aria-hidden="true">
+              ·
+            </span>
+            {note.text}
+          </span>
+        </p>
+      </TableCell>
+    </TableMarkerRow>
+  )
+}
+
 function SongList({
   tracks,
   label,
-  checking = false,
+  highlights,
 }: {
   tracks: Track[]
   label: string
-  checking?: boolean
+  highlights: ReviewHighlight[]
 }) {
-  const states = {
-    pending: "Waiting to check",
-    matching: "Finding recording",
-    downloading: "Downloading audio",
-    analyzing: "Measuring audio",
-    ready: "Checked",
-    uncertain: "Recording uncertain",
-    error: "Check failed",
-    fixed: "Kept in place",
+  const notesBefore = new Map<string, ReviewHighlight[]>()
+  const endNotes: ReviewHighlight[] = []
+  for (const note of highlights) {
+    const existing = notesBefore.get(note.track2_occurrence)
+    if (existing) existing.push(note)
+    else if (tracks.some((track) => track.occurrence === note.track2_occurrence))
+      notesBefore.set(note.track2_occurrence, [note])
+    else endNotes.push(note)
   }
   return (
     <Table className="table-fixed" scrollLabel={label}>
@@ -79,96 +254,56 @@ function SongList({
         <TableRow>
           <TableHead className="w-12">#</TableHead>
           <TableHead>Song</TableHead>
+          <TableHead className="w-20">
+            <span className="sr-only">Intensity</span>
+          </TableHead>
+          <TableHead className="w-20 text-right">Was</TableHead>
+          <TableHead className="w-14">
+            <span className="sr-only">Analysis status</span>
+          </TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
-        {tracks.map((track, index) => (
-          <TableRow key={track.occurrence}>
-            <TableCell className="py-2.5 align-top text-muted-foreground tabular-nums">
-              {index + 1}
-            </TableCell>
-            <TableCell className="py-2.5 whitespace-normal">
-              <p className="wrap-break-words font-medium">{track.name}</p>
-              <p className="wrap-break-words mt-0.5 text-muted-foreground">{track.artist}</p>
-              {checking && !track.fixed_reason && (
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {states[track.analysis_status]}
-                </p>
-              )}
-              {track.fixed_reason && (
-                <p className="mt-1 text-xs text-muted-foreground">
-                  Kept in place · {track.fixed_reason}
-                </p>
-              )}
-            </TableCell>
-          </TableRow>
+        {tracks.map((track, index) => {
+          const position = index + 1
+          const was = track.original_position + 1
+          const moved = was !== position
+          const before = notesBefore.get(track.occurrence) ?? []
+          return (
+            <Fragment key={track.occurrence}>
+              {before.map((note) => (
+                <TransitionMarker key={note.track1_occurrence} note={note} />
+              ))}
+              <TableRow>
+                <TableCell className="py-2.5 align-top text-muted-foreground tabular-nums">
+                  {position}
+                </TableCell>
+                <TableCell className="py-2.5 whitespace-normal">
+                  <p className="font-medium wrap-break-word">{track.name}</p>
+                  <p className="mt-0.5 wrap-break-word text-muted-foreground">{track.artist}</p>
+                </TableCell>
+                <TableCell className="py-2.5 align-top">
+                  <IntensityCell track={track} />
+                </TableCell>
+                <TableCell className="py-2.5 text-right align-top tabular-nums">
+                  {moved ? (
+                    <span className="text-xs text-muted-foreground">#{was}</span>
+                  ) : (
+                    <span className="text-xs text-muted-foreground/40">—</span>
+                  )}
+                </TableCell>
+                <TableCell className="py-2.5 text-right align-top">
+                  <StatusBadge status={track.analysis_status} reason={track.fixed_reason} />
+                </TableCell>
+              </TableRow>
+            </Fragment>
+          )
+        })}
+        {endNotes.map((note) => (
+          <TransitionMarker key={note.track1_occurrence} note={note} />
         ))}
       </TableBody>
     </Table>
-  )
-}
-
-function ReviewSummary({ job }: { job: Job }) {
-  const review = job.review
-  if (!review) return null
-  return (
-    <section aria-label="Review summary" className="mt-4 space-y-3">
-      {review.original_assessed !== null && review.suggested_assessed !== null ? (
-        <>
-          <dl className="grid grid-cols-2 gap-4 text-sm">
-            <div>
-              <dt className="text-muted-foreground">Original transitions</dt>
-              <dd className="mt-1 font-medium">
-                {review.original_assessed} of {review.total_edges} assessed
-              </dd>
-            </div>
-            <div>
-              <dt className="text-muted-foreground">Suggested transitions</dt>
-              <dd className="mt-1 font-medium">
-                {review.suggested_assessed} of {review.total_edges} assessed
-              </dd>
-            </div>
-          </dl>
-          <p className="text-xs leading-5 text-muted-foreground">
-            These counts show where boundary measurements are available.
-          </p>
-        </>
-      ) : (
-        <p className="text-sm text-muted-foreground">
-          Transition estimates are unavailable for this arrangement.
-        </p>
-      )}
-      {review.highlights.length > 0 ? (
-        <details className="rounded-xl border p-4">
-          <summary className="cursor-pointer rounded-sm text-sm font-medium focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring">
-            {review.highlights.length}{" "}
-            {review.highlights.length === 1 ? "transition" : "transitions"} worth checking
-          </summary>
-          <p className="mt-3 text-xs leading-5 text-muted-foreground">
-            These notes describe measured changes and nearby artist repeats. Use your listening
-            preference to judge them.
-          </p>
-          <ol className="mt-3 divide-y">
-            {review.highlights.map((note) => (
-              <li key={note.track1_occurrence} className="py-3 text-sm first:pt-0 last:pb-0">
-                <p className="wrap-break-words font-medium">
-                  {note.index}. {note.track1_name} → {note.index + 1}. {note.track2_name}
-                </p>
-                <p className="mt-1 leading-6 text-muted-foreground">{note.text}</p>
-              </li>
-            ))}
-          </ol>
-        </details>
-      ) : (
-        review.suggested_assessed !== null && (
-          <p className="text-sm text-muted-foreground">
-            {review.suggested_assessed === 0
-              ? "There is not enough boundary evidence for listening notes."
-              : "No standout changes were found in the assessed boundaries."}
-          </p>
-        )
-      )}
-    </section>
   )
 }
 
@@ -238,22 +373,28 @@ function SongPicker({
 
 function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob: Job | null }) {
   const session = useRouteLoaderData<Session>("root")
-  const [job, setJob] = useState(initialJob?.playlist_id === playlist.id ? initialJob : null)
+  // The session holds a single job slot, whichever playlist it owns. Polling keeps it
+  // fresh so blocked states clear as soon as the working job finishes.
+  const [sessionJob, setSessionJob] = useState<Job | null>(initialJob)
+  const job = sessionJob?.playlist_id === playlist.id ? sessionJob : null
   const [error, setError] = useState("")
   const [pending, setPending] = useState<"analyze" | "sort" | "save" | "restore" | null>(null)
-  const [profile, setProfile] = useState<Profile>(initialJob?.profile ?? "smooth")
+  const [profile, setProfile] = useState<Profile>(job?.profile ?? "smooth")
   const [firstOccurrence, setFirstOccurrence] = useState<string | null>(
-    initialJob?.first_occurrence ?? null,
+    job?.first_occurrence ?? null,
   )
-  const [lastOccurrence, setLastOccurrence] = useState<string | null>(
-    initialJob?.last_occurrence ?? null,
-  )
+  const [lastOccurrence, setLastOccurrence] = useState<string | null>(job?.last_occurrence ?? null)
+  const [placementChoice, setPlacementChoice] = useState<Record<string, PlacementChoice>>({})
+  const [customPositions, setCustomPositions] = useState<Record<string, number>>({})
+  const [placementMode, setPlacementMode] = useState<"all" | "individual">("all")
+  const [defaultPlacement, setDefaultPlacement] = useState<"keep" | "top" | "bottom">("keep")
   const actionController = useRef<AbortController | null>(null)
   const progressToast = useRef<string | null>(null)
   const reviewHeading = useRef<HTMLHeadingElement>(null)
   const errorRegion = useRef<HTMLDivElement>(null)
   const actionFocus = useRef<{ element: Element | null; failed: boolean } | null>(null)
   const jobStatus = job?.status
+  const sessionJobStatus = sessionJob?.status
   const busy = pending !== null || isWorking(job)
   const activity =
     pending === "sort"
@@ -264,31 +405,76 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
           ? "restoring"
           : jobStatus
   const otherJob =
-    initialJob?.playlist_id !== playlist.id && isWorking(initialJob) ? initialJob : null
-  const checking =
-    pending === "analyze" ||
-    jobStatus === "analyzing" ||
-    (!job && !otherJob && playlist.total > 0 && !error)
+    sessionJob && sessionJob.playlist_id !== playlist.id && isWorking(sessionJob)
+      ? sessionJob
+      : null
+  const analyzing = pending === "analyze" || jobStatus === "analyzing"
   const tracks = job?.tracks ?? []
   const choices = tracks.filter(
     (track) => track.analysis_status === "ready" && track.fixed_reason === null,
   )
   const canSort = choices.length >= 2
-  const opening = tracks[0]
-  const closing = tracks.at(-1)
-  const fixedFirst = opening?.fixed_reason ? opening : null
-  const fixedLast = closing?.fixed_reason ? closing : null
+  const total = tracks.length
+  const fixedTracks = tracks.filter((track) => track.fixed_reason)
+  const showSetup = !!job && !!tracks.length && !analyzing && job.status !== "error"
+  const placementTargets = new Map<string, number>()
+  if (placementMode === "all") {
+    fixedTracks.forEach((track, index) => {
+      if (defaultPlacement === "top") placementTargets.set(track.occurrence, index)
+      else if (defaultPlacement === "bottom")
+        placementTargets.set(track.occurrence, total - fixedTracks.length + index)
+      else placementTargets.set(track.occurrence, track.original_position)
+    })
+  } else {
+    for (const track of fixedTracks) {
+      const choice = placementChoice[track.occurrence] ?? defaultPlacement
+      if (choice === "top") placementTargets.set(track.occurrence, 0)
+      else if (choice === "bottom") placementTargets.set(track.occurrence, total - 1)
+      else if (choice === "custom") {
+        const position = customPositions[track.occurrence] ?? track.original_position + 1
+        placementTargets.set(
+          track.occurrence,
+          Math.min(Math.max(position, 1), Math.max(total, 1)) - 1,
+        )
+      } else placementTargets.set(track.occurrence, track.original_position)
+    }
+  }
+  function targetFor(track: Track): number {
+    return placementTargets.get(track.occurrence) ?? track.original_position
+  }
+  const slotTaken = (slot: number, except: Track) =>
+    fixedTracks.some((item) => item.occurrence !== except.occurrence && targetFor(item) === slot)
+  const fixedFirst = fixedTracks.find((track) => targetFor(track) === 0) ?? null
+  const fixedLast = fixedTracks.find((track) => targetFor(track) === total - 1) ?? null
   const pinConflict = firstOccurrence !== null && firstOccurrence === lastOccurrence
+  const duplicatePlacement = fixedTracks.find((track, index) =>
+    fixedTracks.some(
+      (other, otherIndex) => otherIndex !== index && targetFor(other) === targetFor(track),
+    ),
+  )
+  const placementConflict = duplicatePlacement
+    ? `Position ${targetFor(duplicatePlacement) + 1} is used by more than one item. Choose different positions.`
+    : null
   const hasPreview = !!job?.sorted_tracks.length && job.status !== "error"
+  const placementsChanged =
+    hasPreview &&
+    fixedTracks.some(
+      (track) => targetFor(track) !== (job.placements[track.occurrence] ?? track.original_position),
+    )
   const choicesChanged =
     hasPreview &&
     (profile !== job?.profile ||
       firstOccurrence !== job.first_occurrence ||
-      lastOccurrence !== job.last_occurrence)
+      lastOccurrence !== job.last_occurrence ||
+      placementsChanged)
+  const movedCount =
+    hasPreview && job
+      ? job.sorted_tracks.filter((track, index) => track.original_position !== index).length
+      : 0
 
-  const statusMessage = checking
+  const statusMessage = analyzing
     ? job?.metadata_loaded
-      ? `${job.completed} of ${job.total} checks finished. ${job.analyzed_count} checked successfully.`
+      ? `${job.completed} of ${job.total} analyzed. ${job.analyzed_count} analyzed successfully.`
       : "Loading playlist."
     : activity === "sorting"
       ? "Arranging the playlist."
@@ -307,7 +493,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
                     ? "Your order is unchanged."
                     : "Suggested order ready."
                   : jobStatus === "ready"
-                    ? `${job?.analyzed_count ?? 0} checked successfully. ${job?.kept_count ?? 0} kept in place.`
+                    ? `${job?.analyzed_count ?? 0} analyzed successfully. ${job?.kept_count ?? 0} can't be analyzed.`
                     : ""
 
   useEffect(() => {
@@ -322,16 +508,6 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
     } else if (jobStatus === "error") errorRegion.current?.focus()
     else if (hasPreview) reviewHeading.current?.focus()
   }, [busy, hasPreview, jobStatus])
-
-  const startChecking = useEffectEvent(() => {
-    if (!job && !otherJob && playlist.total > 0) void run("analyze")
-  })
-
-  useEffect(() => {
-    // Let Strict Mode's setup/cleanup pass finish before starting a server job.
-    const timer = setTimeout(() => startChecking(), 0)
-    return () => clearTimeout(timer)
-  }, [playlist.id])
 
   useEffect(
     () => () => {
@@ -388,7 +564,11 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
   }, [activity, error, job?.error, job?.arrangement?.unchanged, playlist.id, playlist.name])
 
   useEffect(() => {
-    if (error || !jobStatus || !["analyzing", "sorting", "saving", "restoring"].includes(jobStatus))
+    if (
+      error ||
+      !sessionJobStatus ||
+      !["analyzing", "sorting", "saving", "restoring"].includes(sessionJobStatus)
+    )
       return undefined
     const controller = new AbortController()
     let timer: ReturnType<typeof setTimeout>
@@ -396,10 +576,10 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
       try {
         const next = await api<Job | null>("/job", { signal: controller.signal })
         if (controller.signal.aborted) return
-        if (!next || next.playlist_id !== playlist.id)
-          throw new Error("This playlist changed in another tab. Reload the page to continue.")
-        setJob(next)
-        if (isWorking(next)) timer = setTimeout(poll, 1000)
+        // Follow the single session job even when another playlist takes it over,
+        // so this page adapts instead of surfacing a stale state or error.
+        setSessionJob(next)
+        if (next && isWorking(next)) timer = setTimeout(poll, 1000)
       } catch (err) {
         if (controller.signal.aborted) return
         if (err instanceof ApiError && err.status === 401) {
@@ -407,16 +587,16 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
           return
         }
         const message =
-          err instanceof Error ? err.message : "We couldn't check progress. Please try again."
+          err instanceof Error ? err.message : "We couldn't load progress. Please try again."
         setError(message)
         toast.add({
           id: `playlist-error-${playlist.id}`,
-          title: "Couldn't check progress",
+          title: "Couldn't load progress",
           description: message,
           type: "error",
           priority: "high",
           timeout: 0,
-          actionProps: { children: "Check progress", onClick: () => setError("") },
+          actionProps: { children: "Try again", onClick: () => setError("") },
         })
       }
     }
@@ -426,7 +606,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
       clearTimeout(timer)
     }
     // Status controls the polling lifetime. Each request schedules the next one after it finishes.
-  }, [jobStatus, playlist.id, error])
+  }, [sessionJobStatus, playlist.id, error])
 
   async function run(action: "analyze" | "sort" | "save" | "restore") {
     if (busy) return
@@ -448,7 +628,16 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
             : JSON.stringify({
                 revision: job?.revision,
                 ...(action === "sort"
-                  ? { profile, first_occurrence: firstOccurrence, last_occurrence: lastOccurrence }
+                  ? {
+                      profile,
+                      first_occurrence: firstOccurrence,
+                      last_occurrence: lastOccurrence,
+                      placements: Object.fromEntries(
+                        fixedTracks
+                          .filter((track) => targetFor(track) !== track.original_position)
+                          .map((track) => [track.occurrence, targetFor(track)]),
+                      ),
+                    }
                   : {}),
               }),
       })
@@ -456,8 +645,12 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
       if (action === "analyze" || action === "restore") {
         setFirstOccurrence(null)
         setLastOccurrence(null)
+        setPlacementChoice({})
+        setCustomPositions({})
+        setPlacementMode("all")
+        setDefaultPlacement("keep")
       }
-      setJob(next)
+      setSessionJob(next)
     } catch (err) {
       if (controller.signal.aborted) return
       if (err instanceof ApiError && err.status === 401) {
@@ -472,14 +665,14 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
           action === "analyze"
             ? `playlist-error-${playlist.id}`
             : (progressToast.current ?? undefined),
-        title: action === "analyze" ? "Couldn't check songs" : "Couldn't start the request",
+        title: action === "analyze" ? "Couldn't analyze songs" : "Couldn't start the request",
         description: message,
         type: "error",
         priority: "high",
         timeout: action === "analyze" ? 0 : 8000,
         actionProps:
           action === "analyze"
-            ? { children: "Check again", onClick: () => void run("analyze") }
+            ? { children: "Analyze again", onClick: () => void run("analyze") }
             : undefined,
       })
       progressToast.current = null
@@ -488,6 +681,20 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
     }
   }
 
+  const startAnalyzing = useEffectEvent(() => {
+    if (!job && !otherJob && playlist.total > 0) void run("analyze")
+  })
+
+  const shouldAutoAnalyze = !job && !otherJob && !error && playlist.total > 0
+  // PlaylistRoute keys this component by playlist, so this starts once on mount and
+  // resumes by itself if another playlist's job was blocking and then finishes.
+  useEffect(() => {
+    if (!shouldAutoAnalyze) return undefined
+    // Let Strict Mode's setup/cleanup pass finish before starting a server job.
+    const timer = setTimeout(() => startAnalyzing(), 0)
+    return () => clearTimeout(timer)
+  }, [shouldAutoAnalyze])
+
   return (
     <section className="mx-auto max-w-2xl">
       <output className="sr-only">{statusMessage}</output>
@@ -495,7 +702,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
         to="/playlists"
         className="mb-5 inline-flex min-h-8 items-center gap-2 rounded-md text-sm text-muted-foreground hover:text-foreground"
       >
-        <ArrowLeft className="size-4" aria-hidden="true" />
+        <ArrowLeft className="size-4" strokeWidth={1.5} aria-hidden="true" />
         Your playlists
       </Link>
       <div className="flex items-center gap-4">
@@ -505,7 +712,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
             alt=""
             width={64}
             height={64}
-            className="size-16 shrink-0 rounded-xl object-cover"
+            className="size-16 shrink-0 rounded-xl object-cover outline outline-black/10 dark:outline-white/10"
           />
         ) : (
           <div className="flex size-16 shrink-0 items-center justify-center rounded-xl bg-muted">
@@ -513,7 +720,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
           </div>
         )}
         <div className="min-w-0">
-          <h1 className="wrap-break-words text-2xl font-semibold tracking-tight sm:text-3xl">
+          <h1 className="text-2xl font-semibold tracking-tight wrap-break-word sm:text-3xl">
             {playlist.name}
           </h1>
           <p className="mt-2 text-sm text-muted-foreground">
@@ -536,15 +743,15 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
 
       {error && isWorking(job) && (
         <Button className="mt-5" size="sm" variant="outline" onClick={() => setError("")}>
-          Check progress
+          Try again
         </Button>
       )}
 
       {otherJob && !job && (
         <Alert className="mt-8">
           <AlertDescription>
-            Another playlist is still being checked.
-            <Link to={`/playlists/${otherJob.playlist_id}`} className="underline">
+            Another playlist is still being analyzed.
+            <Link to={`/playlists/${otherJob.playlist_id}`} className="ml-2 underline">
               See progress
             </Link>
           </AlertDescription>
@@ -558,18 +765,18 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
         </p>
       )}
 
-      {!checking && !otherJob && (jobStatus === "error" || (!job && error)) && (
+      {!analyzing && !otherJob && (jobStatus === "error" || (!job && error)) && (
         <Button
           className="mt-5"
           onClick={() => void run("analyze")}
           disabled={busy || playlist.total === 0}
         >
-          Check again
+          Analyze again
           <ArrowRight aria-hidden="true" />
         </Button>
       )}
 
-      {checking && (
+      {analyzing && (
         <div className="my-8 rounded-xl border bg-muted/20 p-5 sm:p-6">
           <Progress
             className="items-center gap-y-4"
@@ -579,279 +786,409 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
             <h2>
               <ProgressLabel className="flex items-center gap-2 text-base font-semibold">
                 <LoaderCircle className="size-4 motion-safe:animate-spin" aria-hidden="true" />
-                {job?.metadata_loaded ? "Checking songs" : "Loading playlist"}
+                {job?.metadata_loaded ? "Analyzing songs" : "Loading playlist"}
               </ProgressLabel>
             </h2>
             <ProgressValue className="text-xs">
               {() =>
                 jobStatus === "analyzing" && job?.total
-                  ? `${job.completed} of ${job.total} checks finished`
+                  ? `${job.completed} of ${job.total} analyzed`
                   : "Getting the song list"
               }
             </ProgressValue>
           </Progress>
-          {job?.metadata_loaded && (
-            <p className="mt-3 text-sm text-muted-foreground">
-              {job.analyzed_count} songs checked successfully. {job.kept_count} items kept in place
-              so far.
-            </p>
-          )}
-          <p className="mt-4 text-sm leading-6 text-muted-foreground">
-            You can leave this page and come back. Your playlist stays as it is until you save.
-          </p>
         </div>
       )}
 
-      {!!tracks.length && job && (
-        <>
-          {!checking && job.status !== "error" && (
-            <div className="mt-6 border-t pt-5">
-              {canSort ? (
-                <div className="space-y-5">
-                  <fieldset disabled={busy}>
-                    <legend className="text-base font-semibold">Listening style</legend>
-                    <div className="mt-3 flex flex-col gap-3 sm:flex-row">
-                      {(["smooth", "variety"] as const).map((value) => (
-                        <label
-                          key={value}
-                          htmlFor={`profile-${value}`}
-                          aria-label={value === "smooth" ? "Smooth" : "More variety"}
-                          className="flex flex-1 cursor-pointer items-start gap-3 rounded-xl border p-3 text-sm has-checked:border-foreground/40 has-checked:bg-muted/40"
-                        >
-                          <input
-                            id={`profile-${value}`}
-                            type="radio"
-                            name="listening-profile"
-                            value={value}
-                            checked={profile === value}
-                            onChange={() => setProfile(value)}
-                            className="mt-1 accent-foreground"
-                          />
-                          <span>
-                            <span className="block font-medium">
-                              {value === "smooth" ? "Smooth" : "More variety"}
-                            </span>
-                            <span className="mt-1 block text-muted-foreground">
-                              {value === "smooth"
-                                ? "Gentler changes between songs."
-                                : "More space between repeated artists and similar sounds."}
-                            </span>
-                          </span>
-                        </label>
-                      ))}
-                    </div>
-                  </fieldset>
-                  <div>
-                    <p className="mb-3 text-sm text-muted-foreground">
-                      Choose a first or last song, or leave them for us to arrange.
-                    </p>
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      <div>
-                        <SongPicker
-                          id="first-song"
-                          label="First song"
-                          tracks={fixedFirst ? [fixedFirst] : choices}
-                          value={fixedFirst?.occurrence ?? firstOccurrence}
-                          onChange={setFirstOccurrence}
-                          disabled={busy || !!fixedFirst}
-                        />
-                        {fixedFirst && (
-                          <p className="mt-2 text-xs text-muted-foreground">
-                            This item stays first. {fixedFirst.fixed_reason}.
-                          </p>
-                        )}
-                      </div>
-                      <div>
-                        <SongPicker
-                          id="last-song"
-                          label="Last song"
-                          tracks={fixedLast ? [fixedLast] : choices}
-                          value={fixedLast?.occurrence ?? lastOccurrence}
-                          onChange={setLastOccurrence}
-                          disabled={busy || !!fixedLast}
-                        />
-                        {fixedLast && (
-                          <p className="mt-2 text-xs text-muted-foreground">
-                            This item stays last. {fixedLast.fixed_reason}.
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                  {job.kept_count > 0 && (
-                    <div className="flex flex-wrap items-center gap-3 text-sm">
-                      <Button variant="outline" disabled={busy} onClick={() => void run("analyze")}>
-                        Check songs again
-                      </Button>
-                      <Link to="/youtube" className="underline underline-offset-4">
-                        YouTube access
-                      </Link>
-                    </div>
-                  )}
-                  {pinConflict && (
-                    <p role="alert" className="text-sm text-destructive">
-                      Choose different entries for the first and last songs.
-                    </p>
-                  )}
-                  <Button
-                    variant={hasPreview ? "outline" : "default"}
-                    onClick={() => void run("sort")}
-                    disabled={busy || pinConflict}
-                  >
-                    {hasPreview ? "Arrange again" : "Arrange playlist"}
-                    <ArrowRight aria-hidden="true" />
-                  </Button>
+      {showSetup && (
+        <div className="mt-8 border-t pt-6">
+          {canSort ? (
+            <div className="space-y-6">
+              <fieldset disabled={busy}>
+                <legend className="text-sm font-medium">Listening style</legend>
+                <div className="mt-3 flex flex-col gap-3 sm:flex-row">
+                  {(["smooth", "variety"] as const).map((value) => (
+                    <label
+                      key={value}
+                      htmlFor={`profile-${value}`}
+                      aria-label={value === "smooth" ? "Smooth" : "More variety"}
+                      className="flex flex-1 cursor-pointer items-start gap-3 rounded-xl border p-3 text-sm has-checked:border-foreground/40 has-checked:bg-muted/40"
+                    >
+                      <input
+                        id={`profile-${value}`}
+                        type="radio"
+                        name="listening-profile"
+                        value={value}
+                        checked={profile === value}
+                        onChange={() => setProfile(value)}
+                        className="mt-1 accent-foreground"
+                      />
+                      <span>
+                        <span className="block font-medium">
+                          {value === "smooth" ? "Smooth" : "More variety"}
+                        </span>
+                        <span className="mt-1 block text-muted-foreground">
+                          {value === "smooth"
+                            ? "Gentler changes between songs."
+                            : "More space between repeated artists and similar sounds."}
+                        </span>
+                      </span>
+                    </label>
+                  ))}
                 </div>
-              ) : (
-                <div className="space-y-3">
-                  <p className="text-sm text-muted-foreground">
-                    {choices.length === 0
-                      ? "None of these songs could be checked. Your playlist stays in its original order."
-                      : "Only one song can move. At least two checked songs are needed to rearrange this playlist."}
+              </fieldset>
+              <div>
+                <SongPicker
+                  id="first-song"
+                  label="First song"
+                  tracks={fixedFirst ? [fixedFirst] : choices}
+                  value={fixedFirst?.occurrence ?? firstOccurrence}
+                  onChange={setFirstOccurrence}
+                  disabled={busy || !!fixedFirst}
+                />
+                {fixedFirst && (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    This item is placed first. {fixedFirst.fixed_reason}.
                   </p>
-                  <Button variant="outline" onClick={() => void run("analyze")} disabled={busy}>
-                    Check again
-                  </Button>
-                </div>
+                )}
+              </div>
+              <div>
+                <SongPicker
+                  id="last-song"
+                  label="Last song"
+                  tracks={fixedLast ? [fixedLast] : choices}
+                  value={fixedLast?.occurrence ?? lastOccurrence}
+                  onChange={setLastOccurrence}
+                  disabled={busy || !!fixedLast}
+                />
+                {fixedLast && (
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    This item is placed last. {fixedLast.fixed_reason}.
+                  </p>
+                )}
+              </div>
+              {fixedTracks.length > 0 && (
+                <fieldset disabled={busy}>
+                  <legend className="flex items-center gap-2 text-sm font-medium">
+                    Items that can't be analyzed
+                    <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-muted px-1.5 py-0.5 text-xs font-normal text-muted-foreground tabular-nums">
+                      {fixedTracks.length}
+                    </span>
+                  </legend>
+                  {placementMode === "all" ? (
+                    <div className="mt-3 flex animate-in flex-wrap items-center gap-x-3 gap-y-2 duration-150 ease-out fade-in-0">
+                      <Select
+                        items={groupPlacementItems}
+                        value={defaultPlacement}
+                        onValueChange={(value) => {
+                          if (value === null) return
+                          setDefaultPlacement(value)
+                        }}
+                      >
+                        <SelectTrigger
+                          size="sm"
+                          className="min-w-40 flex-1"
+                          aria-label="Placement for items that can't be analyzed"
+                        >
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="keep">Keep in place</SelectItem>
+                          <SelectItem value="top">Move to top</SelectItem>
+                          <SelectItem value="bottom">Move to bottom</SelectItem>
+                        </SelectContent>
+                      </Select>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setPlacementMode("individual")}
+                      >
+                        Choose individually
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="mt-3 animate-in duration-150 ease-out fade-in-0">
+                      <ul className="divide-y">
+                        {fixedTracks.map((track) => {
+                          const choice = placementChoice[track.occurrence] ?? defaultPlacement
+                          const custom =
+                            customPositions[track.occurrence] ?? track.original_position + 1
+                          return (
+                            <li
+                              key={track.occurrence}
+                              className="flex flex-wrap items-center gap-3 py-3.5"
+                            >
+                              <div className="min-w-0 flex-1 basis-40">
+                                <p className="truncate text-sm font-medium">{track.name}</p>
+                                <p className="truncate text-xs text-muted-foreground">
+                                  {track.fixed_reason} · Currently #{track.original_position + 1}
+                                </p>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <Select
+                                  items={placementItems}
+                                  value={choice}
+                                  onValueChange={(value) => {
+                                    if (value === null) return
+                                    setPlacementChoice((current) => ({
+                                      ...current,
+                                      [track.occurrence]: value,
+                                    }))
+                                    if (value === "top" || (value === "custom" && custom === 1))
+                                      setFirstOccurrence(null)
+                                    if (
+                                      value === "bottom" ||
+                                      (value === "custom" && custom === total)
+                                    )
+                                      setLastOccurrence(null)
+                                  }}
+                                >
+                                  <SelectTrigger
+                                    size="sm"
+                                    className="min-w-40"
+                                    aria-label={`Position for ${track.name}`}
+                                  >
+                                    <SelectValue />
+                                  </SelectTrigger>
+                                  <SelectContent>
+                                    <SelectItem value="keep">Keep in place</SelectItem>
+                                    <SelectItem value="top" disabled={slotTaken(0, track)}>
+                                      Move to top
+                                    </SelectItem>
+                                    <SelectItem
+                                      value="bottom"
+                                      disabled={slotTaken(total - 1, track)}
+                                    >
+                                      Move to bottom
+                                    </SelectItem>
+                                    <SelectItem value="custom">Custom position</SelectItem>
+                                  </SelectContent>
+                                </Select>
+                                {choice === "custom" && (
+                                  <input
+                                    type="number"
+                                    className="w-16 animate-in rounded-lg border bg-background px-2 py-1 text-sm tabular-nums duration-150 ease-out fade-in-0 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/30 focus-visible:outline-none disabled:opacity-50"
+                                    min={1}
+                                    max={total}
+                                    value={custom}
+                                    aria-label={`Custom position for ${track.name}`}
+                                    onChange={(event) => {
+                                      const position = Number.parseInt(event.target.value, 10)
+                                      if (Number.isNaN(position)) return
+                                      const bounded = Math.min(Math.max(position, 1), total)
+                                      setCustomPositions((current) => ({
+                                        ...current,
+                                        [track.occurrence]: bounded,
+                                      }))
+                                      if (bounded === 1) setFirstOccurrence(null)
+                                      if (bounded === total) setLastOccurrence(null)
+                                    }}
+                                  />
+                                )}
+                              </div>
+                            </li>
+                          )
+                        })}
+                      </ul>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="mt-3"
+                        onClick={() => {
+                          setPlacementMode("all")
+                          setPlacementChoice({})
+                          setCustomPositions({})
+                        }}
+                      >
+                        Use the same position for all
+                      </Button>
+                    </div>
+                  )}
+                </fieldset>
               )}
+              {(pinConflict || placementConflict) && (
+                <p role="alert" className="text-sm text-destructive">
+                  {placementConflict ?? "Choose different entries for the first and last songs."}
+                </p>
+              )}
+              <div className="pt-2">
+                <Button
+                  variant={hasPreview ? "outline" : "default"}
+                  onClick={() => void run("sort")}
+                  disabled={busy || pinConflict || placementConflict !== null}
+                >
+                  <ArrowDownWideNarrow aria-hidden="true" />
+                  {hasPreview ? "Arrange again" : "Arrange playlist"}
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <p className="text-sm text-muted-foreground">
+                {choices.length === 0
+                  ? "None of these songs could be analyzed. Your playlist stays in its original order."
+                  : "Only one song can move. At least two analyzed songs are needed to rearrange this playlist."}
+              </p>
+              <Button variant="outline" onClick={() => void run("analyze")} disabled={busy}>
+                Analyze again
+              </Button>
             </div>
           )}
-          {!checking && job.status !== "error" && (
-            <p id="review-coverage" className="mt-5 text-sm text-muted-foreground">
-              {job.analyzed_count} {job.analyzed_count === 1 ? "song checked" : "songs checked"}.{" "}
-              {job.kept_count} {job.kept_count === 1 ? "item stays" : "items stay"} in place.
-              {job.cached_count > 0 &&
-                ` ${job.cached_count} checked ${job.cached_count === 1 ? "song reused" : "songs reused"} earlier analysis.`}
-            </p>
-          )}
-          {job.status === "error" && (
-            <p className="mt-5 text-sm text-muted-foreground">
-              This is the order last loaded. Check again to see the current Spotify playlist.
-            </p>
-          )}
-          {hasPreview && (
-            <div className="mt-6 flex flex-col gap-3 border-t pt-5 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <h2
-                  ref={reviewHeading}
-                  tabIndex={-1}
-                  aria-describedby="review-coverage"
-                  className="rounded-sm text-base font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        </div>
+      )}
+      {job?.status === "error" && !!tracks.length && (
+        <p className="mt-5 text-sm text-muted-foreground">
+          This is the order last loaded. Analyze again to see the current Spotify playlist.
+        </p>
+      )}
+      {hasPreview && job && (
+        <>
+          <div className="mt-8 border-t pt-6" aria-hidden="true" />
+          <div className="space-y-4">
+            <div className="min-w-0">
+              <h2
+                ref={reviewHeading}
+                tabIndex={-1}
+                className="rounded-sm text-base font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {job.status === "restored" ? "Restored order" : "Playlist preview"}
+              </h2>
+              <p aria-live="polite" className="mt-1 text-sm text-muted-foreground">
+                {job.status === "restored"
+                  ? "Previous order restored and verified on Spotify."
+                  : job.status === "saved"
+                    ? "Saved and verified on Spotify."
+                    : choicesChanged
+                      ? "Arrange again to apply your choices."
+                      : job.arrangement?.unchanged
+                        ? "This is already your saved order."
+                        : "Review the song order below."}
+              </p>
+              {job.status !== "restored" && !choicesChanged && !job.arrangement?.unchanged && (
+                <VerdictLine job={job} />
+              )}
+            </div>
+            {job.can_restore && (
+              <div className="space-y-2">
+                <Button
+                  variant="outline"
+                  onClick={() => void run("restore")}
+                  disabled={busy}
+                  aria-describedby="restore-limit"
                 >
-                  {job.status === "restored" ? "Restored order" : "Playlist preview"}
-                </h2>
-                <p aria-live="polite" className="mt-1 text-sm text-muted-foreground">
-                  {job.status === "restored"
-                    ? "Previous order restored and verified on Spotify."
-                    : job.status === "saved"
-                      ? "Saved and verified on Spotify."
-                      : choicesChanged
-                        ? "Arrange again to apply your choices."
-                        : job.arrangement?.unchanged
-                          ? "This is already your saved order."
-                          : "Review the song order below."}
+                  Restore previous order
+                </Button>
+                <p id="restore-limit" className="text-xs leading-5 text-muted-foreground">
+                  Undoes your most recent save in this session, if Spotify is still unchanged.
+                  Analyzing a playlist again, signing out, session expiry or a server restart
+                  removes this option.
                 </p>
               </div>
-              {job.status === "saved" || job.status === "restored" || job.arrangement?.unchanged ? (
-                <a
-                  className={buttonVariants({ variant: "outline" })}
-                  aria-label="Open Spotify"
-                  href={`https://open.spotify.com/playlist/${playlist.id}`}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  Open Spotify
-                  <ExternalLink aria-hidden="true" />
-                </a>
-              ) : (
-                <Button
-                  onClick={() => void run("save")}
-                  disabled={busy || choicesChanged || pinConflict}
-                >
-                  Save to Spotify
-                </Button>
-              )}
-            </div>
-          )}
-          {job.can_restore && job.status !== "error" && (
-            <div className="mt-4 space-y-2">
+            )}
+            {hasPreview && !choicesChanged && job.arrangement?.limited && (
+              <p className="text-sm text-muted-foreground">
+                This playlist is too large for a full search. Your first and last song choices were
+                applied; the other songs keep their original relative order.
+              </p>
+            )}
+            <SongList
+              tracks={job.sorted_tracks}
+              label={job.status === "restored" ? "Restored song order" : "Suggested song order"}
+              highlights={
+                job.status !== "restored" && !choicesChanged ? (job.review?.highlights ?? []) : []
+              }
+            />
+            {job.status !== "restored" && !choicesChanged && (
+              <div className="space-y-3">
+                {job.arrangement?.same_as_other_profile && (
+                  <p className="text-sm text-muted-foreground">
+                    Both styles found the same order with these song choices.
+                  </p>
+                )}
+                {movedCount > 0 && (
+                  <details className="rounded-xl border p-4">
+                    <summary
+                      onMouseEnter={preloadSlopeGraph}
+                      onFocus={preloadSlopeGraph}
+                      className="cursor-pointer rounded-sm text-sm font-medium focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring"
+                    >
+                      What moved
+                    </summary>
+                    <div className="mt-4 space-y-6">
+                      <Suspense
+                        fallback={
+                          <output className="block py-5 text-sm text-muted-foreground">
+                            Loading chart...
+                          </output>
+                        }
+                      >
+                        <SlopeGraph tracks={job.sorted_tracks} />
+                      </Suspense>
+                    </div>
+                  </details>
+                )}
+                <details className="rounded-xl border p-4">
+                  <summary
+                    onMouseEnter={preloadSongDetails}
+                    onFocus={preloadSongDetails}
+                    className="cursor-pointer rounded-sm text-sm font-medium focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-ring"
+                  >
+                    Details
+                  </summary>
+                  <div className="mt-4 space-y-6">
+                    <Suspense
+                      fallback={
+                        <output className="block py-5 text-sm text-muted-foreground">
+                          Loading details...
+                        </output>
+                      }
+                    >
+                      <SongDetails
+                        original={tracks}
+                        tracks={job.sorted_tracks}
+                        transitions={job.transitions}
+                      />
+                    </Suspense>
+                  </div>
+                </details>
+              </div>
+            )}
+          </div>
+          <div className="mt-6 space-y-3">
+            {job.status === "saved" || job.status === "restored" || job.arrangement?.unchanged ? (
+              <a
+                className={buttonVariants({
+                  variant: "outline",
+                  size: "lg",
+                  className: "w-full",
+                })}
+                aria-label="Open Spotify"
+                href={`https://open.spotify.com/playlist/${playlist.id}`}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Open Spotify
+                <ExternalLink aria-hidden="true" />
+              </a>
+            ) : (
+              <Button
+                size="lg"
+                className="w-full"
+                onClick={() => void run("save")}
+                disabled={busy || choicesChanged || pinConflict}
+              >
+                Save to Spotify
+              </Button>
+            )}
+            {job.kept_count > 0 && (
               <Button
                 variant="outline"
-                onClick={() => void run("restore")}
+                className="w-full"
                 disabled={busy}
-                aria-describedby="restore-limit"
+                onClick={() => void run("analyze")}
               >
-                Restore previous order
+                Analyze songs again
               </Button>
-              <p id="restore-limit" className="text-xs leading-5 text-muted-foreground">
-                Undoes your most recent save in this session, if Spotify is still unchanged.
-                Checking a playlist again, signing out, session expiry or a server restart removes
-                this option.
-              </p>
-            </div>
-          )}
-          {hasPreview && !choicesChanged && <ReviewSummary job={job} />}
-          {hasPreview && !choicesChanged && job.arrangement?.same_as_other_profile && (
-            <p className="mt-3 text-sm text-muted-foreground">
-              Both styles found the same order with these song choices.
-            </p>
-          )}
-          {hasPreview && !choicesChanged && job.arrangement?.limited && (
-            <p className="mt-3 text-sm text-muted-foreground">
-              This playlist is too large for a full search. Your first and last song choices were
-              applied; the other songs keep their original relative order.
-            </p>
-          )}
-          <div className="mt-5">
-            {hasPreview ? (
-              <Tabs
-                className="gap-4"
-                defaultValue="new"
-                key={job.sorted_tracks.map((track) => track.occurrence).join(",")}
-              >
-                <TabsList
-                  aria-label="Playlist preview"
-                  className="w-full bg-muted/70 sm:w-fit dark:bg-muted/50"
-                >
-                  <TabsTrigger value="new">
-                    {job.status === "restored" ? "Restored" : "Suggested"}
-                  </TabsTrigger>
-                  <TabsTrigger value="original">Original</TabsTrigger>
-                  {job.status !== "restored" && <TabsTrigger value="details">Compare</TabsTrigger>}
-                </TabsList>
-                <TabsContent value="new">
-                  <SongList
-                    tracks={job.sorted_tracks}
-                    label={
-                      job.status === "restored" ? "Restored song order" : "Suggested song order"
-                    }
-                  />
-                </TabsContent>
-                <TabsContent value="original">
-                  <SongList tracks={tracks} label="Original song order" />
-                </TabsContent>
-                <TabsContent value="details">
-                  <Suspense
-                    fallback={
-                      <output className="block py-5 text-sm text-muted-foreground">
-                        Loading details...
-                      </output>
-                    }
-                  >
-                    <SongDetails
-                      original={tracks}
-                      tracks={job.sorted_tracks}
-                      transitions={job.transitions}
-                    />
-                  </Suspense>
-                </TabsContent>
-              </Tabs>
-            ) : (
-              <SongList
-                tracks={tracks}
-                label={job.status === "error" ? "Order last loaded" : "Songs in your playlist"}
-                checking={checking}
-              />
             )}
           </div>
         </>

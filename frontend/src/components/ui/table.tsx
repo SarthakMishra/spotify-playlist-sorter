@@ -68,6 +68,19 @@ function TableRow({ className, ...props }: React.ComponentProps<"tr">) {
   )
 }
 
+function TableMarkerRow({
+  className,
+  ...props
+}: React.ComponentProps<"tr"> & { "data-slot"?: string }) {
+  return (
+    <tr
+      data-slot="table-marker-row"
+      className={cn("border-b bg-warning/5", className)}
+      {...props}
+    />
+  )
+}
+
 function TableHead({ className, ...props }: React.ComponentProps<"th">) {
   return (
     <th
@@ -101,4 +114,14 @@ function TableCaption({ className, ...props }: React.ComponentProps<"caption">) 
   )
 }
 
-export { Table, TableHeader, TableBody, TableFooter, TableHead, TableRow, TableCell, TableCaption }
+export {
+  Table,
+  TableHeader,
+  TableBody,
+  TableFooter,
+  TableHead,
+  TableRow,
+  TableMarkerRow,
+  TableCell,
+  TableCaption,
+}

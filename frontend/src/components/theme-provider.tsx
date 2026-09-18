@@ -1,11 +1,4 @@
-import {
-  createContext,
-  useContext,
-  useLayoutEffect,
-  useMemo,
-  useState,
-  type ReactNode,
-} from "react"
+import { createContext, use, useLayoutEffect, useMemo, useState, type ReactNode } from "react"
 
 type Theme = "light" | "dark" | "system"
 
@@ -27,10 +20,19 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   useLayoutEffect(() => {
     const system = window.matchMedia("(prefers-color-scheme: dark)")
     const applyTheme = () => {
-      document.documentElement.classList.toggle(
-        "dark",
-        theme === "dark" || (theme === "system" && system.matches),
-      )
+      const dark = theme === "dark" || (theme === "system" && system.matches)
+      const root = document.documentElement
+      if (root.classList.contains("dark") === dark) return
+      // Disable transitions for the swap so every color change commits at once,
+      // force a reflow, then restore transitions after the paint.
+      const style = document.createElement("style")
+      style.append(document.createTextNode("*,*::before,*::after{transition:none !important}"))
+      document.head.append(style)
+      root.classList.toggle("dark", dark)
+      void document.body.offsetHeight
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => style.remove())
+      })
     }
     applyTheme()
     system.addEventListener("change", applyTheme)
@@ -47,7 +49,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 }
 
 export function useTheme() {
-  const context = useContext(ThemeContext)
+  const context = use(ThemeContext)
   if (!context) throw new Error("useTheme must be used within a ThemeProvider")
   return context
 }

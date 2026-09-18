@@ -40,6 +40,7 @@ export type Transition = {
   components: Record<"tempo" | "intensity" | "texture" | "chroma", number | null>
   evidence: Record<"tempo" | "intensity" | "texture" | "chroma", number>
 }
+export type ReviewHighlight = NonNullable<Job["review"]>["highlights"][number]
 export type Job = {
   playlist_id: string
   revision: string
@@ -64,6 +65,7 @@ export type Job = {
   profile: Profile
   first_occurrence: string | null
   last_occurrence: string | null
+  placements: Record<string, number>
   arrangement: {
     version: number
     cost: number | null

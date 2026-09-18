@@ -1,6 +1,7 @@
 {
   "$schema": "./node_modules/oxlint/configuration_schema.json",
   "plugins": ["typescript", "unicorn", "oxc", "react", "jsx-a11y", "import"],
+  "jsPlugins": ["@shadcn/lint"],
   "categories": { "correctness": "error", "suspicious": "error", "perf": "error" },
   "options": { "typeAware": true, "maxWarnings": 0, "reportUnusedDisableDirectives": "error" },
   "rules": {
@@ -14,7 +15,34 @@
     "typescript/no-unsafe-call": "error",
     "typescript/no-unsafe-member-access": "error",
     "typescript/no-unsafe-return": "error",
-    "typescript/switch-exhaustiveness-check": "error"
+    "typescript/switch-exhaustiveness-check": "error",
+    "shadcn/no-restyle": [
+      "error",
+      {
+        "allow": ["layout"],
+        "contracts": [
+          { "pattern": "^TableCell$", "allow": ["layout", "spacing", "typography", "color"] },
+          { "pattern": "^Progress", "allow": ["layout", "spacing", "typography"] },
+          { "pattern": "^Tabs$", "allow": ["layout", "spacing"] },
+          { "pattern": "^TabsList$", "allow": ["layout", "color"] }
+        ]
+      }
+    ],
+    "shadcn/no-raw-colors": "error",
+    "shadcn/no-arbitrary-values": ["error", { "allow": ["transition-[opacity,filter,scale]"] }],
+    "shadcn/no-inline-styles": "error",
+    "shadcn/no-unknown-classes": "error",
+    "shadcn/require-static-classes": "error"
   },
+  "overrides": [
+    {
+      "files": ["src/components/ui/**"],
+      "rules": {
+        "shadcn/no-restyle": "off",
+        "shadcn/no-arbitrary-values": "off",
+        "shadcn/require-static-classes": "off"
+      }
+    }
+  ],
   "ignorePatterns": ["dist"]
 }

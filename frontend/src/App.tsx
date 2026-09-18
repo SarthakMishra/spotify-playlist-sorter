@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useDeferredValue, useEffect, useState } from "react"
 import {
   Link,
   Navigate,
@@ -26,10 +26,19 @@ import {
 } from "lucide-react"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { ModeToggle } from "@/components/mode-toggle"
-import { Input } from "@/components/ui/input"
+import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { toast } from "@/components/ui/toast"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { api, ApiError, type Job, type Playlist, type Session, type YouTubeAccess } from "@/lib/api"
+
+// Warm the lazy route chunks on hover/focus so navigation feels instant.
+const preloadPlaylistPage = () => {
+  void import("@/components/playlist-page")
+}
+const preloadYouTubeAccess = () => {
+  void import("@/components/youtube-access")
+}
 
 function Loading({ className = "min-h-dvh" }: { className?: string }) {
   return (
@@ -37,7 +46,11 @@ function Loading({ className = "min-h-dvh" }: { className?: string }) {
       aria-live="polite"
       className={`flex items-center justify-center gap-2 text-sm text-muted-foreground ${className}`}
     >
-      <LoaderCircle className="size-4 motion-safe:animate-spin" aria-hidden="true" />
+      <LoaderCircle
+        className="size-4 motion-safe:animate-spin"
+        strokeWidth={1.5}
+        aria-hidden="true"
+      />
       Loading...
     </p>
   )
@@ -46,7 +59,6 @@ function Loading({ className = "min-h-dvh" }: { className?: string }) {
 function Shell() {
   const session = useLoaderData<Session>()
   const navigation = useNavigation()
-  const revalidator = useRevalidator()
   const [leaving, setLeaving] = useState(false)
   async function logout() {
     setLeaving(true)
@@ -73,7 +85,7 @@ function Shell() {
         Skip to content
       </a>
       <header className="relative px-5 after:absolute after:inset-x-0 after:bottom-0 after:h-px after:bg-linear-to-r after:from-background after:via-border after:to-background sm:px-8">
-        <div className="mx-auto flex min-h-12 max-w-2xl flex-wrap items-center justify-between gap-3 py-2">
+        <div className="mx-auto flex min-h-12 max-w-2xl flex-wrap items-center justify-between gap-3 py-3">
           <Link
             to={session.user ? "/playlists" : "/"}
             className="flex items-center gap-2 rounded-md text-sm font-semibold tracking-tight"
@@ -81,49 +93,43 @@ function Shell() {
             <ListMusic className="size-5" aria-hidden="true" />
             Playlist sorter
           </Link>
-          <div className="flex flex-wrap items-center gap-2 max-sm:w-full">
+          <div className="flex items-center gap-1 max-sm:w-full max-sm:justify-end">
             {session.user && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="gap-2 text-muted-foreground focus-visible:text-foreground max-sm:flex-1"
-                aria-label="Refresh playlists"
-                onClick={() => void revalidator.revalidate()}
-                disabled={revalidator.state !== "idle"}
-              >
-                <RefreshCw
-                  className={revalidator.state !== "idle" ? "motion-safe:animate-spin" : ""}
-                  aria-hidden="true"
-                />
-                Refresh
-              </Button>
-            )}
-            {session.user && (
-              <Link
-                to="/youtube"
-                className={buttonVariants({
-                  variant: "ghost",
-                  size: "sm",
-                  className:
-                    "gap-2 text-muted-foreground focus-visible:text-foreground max-sm:flex-1",
-                })}
-              >
-                <Settings aria-hidden="true" />
-                Settings
-              </Link>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Link
+                      to="/youtube"
+                      onMouseEnter={preloadYouTubeAccess}
+                      onFocus={preloadYouTubeAccess}
+                      className={buttonVariants({ variant: "ghost", size: "icon-sm" })}
+                      aria-label="Settings"
+                    />
+                  }
+                >
+                  <Settings aria-hidden="true" />
+                </TooltipTrigger>
+                <TooltipContent>Settings</TooltipContent>
+              </Tooltip>
             )}
             <ModeToggle />
             {session.user && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="gap-2 text-muted-foreground focus-visible:text-foreground max-sm:flex-1"
-                onClick={() => void logout()}
-                disabled={leaving}
-              >
-                <LogOut aria-hidden="true" />
-                Sign out
-              </Button>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Sign out"
+                      onClick={() => void logout()}
+                      disabled={leaving}
+                    />
+                  }
+                >
+                  <LogOut aria-hidden="true" />
+                </TooltipTrigger>
+                <TooltipContent>Sign out</TooltipContent>
+              </Tooltip>
             )}
           </div>
         </div>
@@ -170,7 +176,7 @@ function Welcome() {
       <div className="mb-8 flex size-14 items-center justify-center rounded-2xl bg-muted">
         <Music2 className="size-7" aria-hidden="true" />
       </div>
-      <h1 className="text-4xl leading-[1.12] font-semibold tracking-tight sm:text-5xl">
+      <h1 className="text-4xl leading-heading font-semibold tracking-tight sm:text-5xl">
         Put your songs
         <br />
         in a smoother order.
@@ -192,44 +198,59 @@ function Welcome() {
           <AlertDescription>Spotify isn't set up yet. Please try again later.</AlertDescription>
         </Alert>
       )}
-      <p className="mt-4 text-sm text-muted-foreground">You can check the order before saving.</p>
+      <p className="mt-4 text-sm text-muted-foreground">You can analyze the order before saving.</p>
     </section>
   )
 }
 
 function PlaylistList() {
   const playlists = useRouteLoaderData<Playlist[]>("playlists") ?? []
+  const revalidator = useRevalidator()
   const [search, setSearch] = useState("")
-  const filtered = playlists.filter((playlist) =>
-    playlist.name.toLocaleLowerCase().includes(search.toLocaleLowerCase().trim()),
-  )
+  const deferredSearch = useDeferredValue(search)
+  const query = deferredSearch.toLocaleLowerCase().trim()
+  const filtered = playlists.filter((playlist) => playlist.name.toLocaleLowerCase().includes(query))
   return (
     <section className="mx-auto max-w-2xl">
-      <h1 className="text-3xl font-semibold tracking-tight">Your playlists</h1>
+      <div className="flex items-center justify-between gap-3">
+        <h1 className="text-3xl font-semibold tracking-tight">Your playlists</h1>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void revalidator.revalidate()}
+          disabled={revalidator.state !== "idle"}
+        >
+          <RefreshCw
+            className={revalidator.state !== "idle" ? "motion-safe:animate-spin" : ""}
+            aria-hidden="true"
+          />
+          Refresh
+        </Button>
+      </div>
       <p className="mt-2 text-muted-foreground">Choose a playlist you want to sort.</p>
       {playlists.length > 0 ? (
         <>
-          <div className="relative mt-8">
-            <Search
-              className="pointer-events-none absolute top-3 left-3 size-4 text-muted-foreground"
-              aria-hidden="true"
-            />
-            <Input
+          <InputGroup className="mt-8">
+            <InputGroupAddon align="inline-start">
+              <Search aria-hidden="true" />
+            </InputGroupAddon>
+            <InputGroupInput
               id="playlist-search"
               type="search"
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               aria-label="Search your playlists"
               placeholder="Search your playlists"
-              className="h-10 pl-10"
             />
-          </div>
+          </InputGroup>
           <ul className="mt-5 divide-y">
             {filtered.map((playlist) => (
-              <li key={playlist.id} className="py-1">
+              <li key={playlist.id} className="py-2">
                 <Link
                   to={`/playlists/${playlist.id}`}
-                  className="group flex items-center gap-4 rounded-lg p-3 transition-colors hover:bg-muted/50"
+                  onMouseEnter={preloadPlaylistPage}
+                  onFocus={preloadPlaylistPage}
+                  className="group flex items-center gap-4 rounded-2xl p-3 transition-colors hover:bg-muted/50"
                 >
                   {playlist.image ? (
                     <img
@@ -238,10 +259,10 @@ function PlaylistList() {
                       loading="lazy"
                       width={64}
                       height={64}
-                      className="size-16 shrink-0 rounded-lg object-cover"
+                      className="size-16 shrink-0 rounded-sm object-cover outline outline-black/10 dark:outline-white/10"
                     />
                   ) : (
-                    <div className="flex size-16 shrink-0 items-center justify-center rounded-lg bg-muted">
+                    <div className="flex size-16 shrink-0 items-center justify-center rounded-sm bg-muted">
                       <Music2 className="size-6 text-muted-foreground" aria-hidden="true" />
                     </div>
                   )}
@@ -274,9 +295,6 @@ function PlaylistList() {
           </p>
         </div>
       )}
-      <p className="mt-6 text-xs leading-5 text-muted-foreground">
-        Only playlists you can edit are shown.
-      </p>
     </section>
   )
 }

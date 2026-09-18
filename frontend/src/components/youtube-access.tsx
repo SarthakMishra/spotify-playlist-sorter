@@ -24,7 +24,7 @@ export function YouTubeAccessPage() {
         ? "Using the cookie file configured on the app server."
         : source === "upload"
           ? "Using your uploaded cookies for this session."
-          : "Checking public recordings without cookies."
+          : "Analyzing public recordings without cookies."
 
   async function save(mode: YouTubeAccess["mode"], cookies = "") {
     setBusy(true)
@@ -41,7 +41,7 @@ export function YouTubeAccessPage() {
       toast.add({
         id: "youtube-access",
         title: "YouTube access updated",
-        description: "Return to your playlist and check songs again.",
+        description: "Return to your playlist and analyze songs again.",
         type: "success",
       })
     } catch (err) {
@@ -84,13 +84,13 @@ export function YouTubeAccessPage() {
         to="/playlists"
         className="inline-flex items-center gap-2 rounded-md text-sm text-muted-foreground hover:text-foreground"
       >
-        <ArrowLeft className="size-4" aria-hidden="true" /> Your playlists
+        <ArrowLeft className="size-4" strokeWidth={1.5} aria-hidden="true" /> Your playlists
       </Link>
       <div>
         <h1 className="text-2xl font-semibold tracking-tight">YouTube access</h1>
         <p className="mt-3 text-sm leading-6 text-muted-foreground">
           Cookies are optional. They can help us find the correct recording when YouTube requires
-          sign-in. We use them for YouTube searches and audio downloads. Checking continues without
+          sign-in. We use them for YouTube searches and audio downloads. Analysis continues without
           them.
         </p>
       </div>
@@ -200,7 +200,7 @@ export function YouTubeAccessPage() {
         <p className="mt-3">
           For local Chrome, add these settings to the app's .env file and restart it:
         </p>
-        <pre className="wrap-break-words mt-3 rounded-md bg-muted p-3 text-xs whitespace-pre-wrap">
+        <pre className="mt-3 rounded-md bg-muted p-3 text-xs wrap-break-word whitespace-pre-wrap">
           {
             "YOUTUBE_BROWSER=chrome\n# Optional, for a specific profile:\nYOUTUBE_BROWSER_PROFILE=Default"
           }
@@ -214,7 +214,7 @@ export function YouTubeAccessPage() {
           Player support uses Node 24 and yt-dlp's bundled challenge scripts. To update them with
           the app's dependencies:
         </p>
-        <pre className="wrap-break-words mt-3 rounded-md bg-muted p-3 text-xs whitespace-pre-wrap">
+        <pre className="mt-3 rounded-md bg-muted p-3 text-xs wrap-break-word whitespace-pre-wrap">
           uv sync --locked
         </pre>
         <p className="mt-3 text-muted-foreground">
