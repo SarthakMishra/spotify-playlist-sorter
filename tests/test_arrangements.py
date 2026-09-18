@@ -174,6 +174,37 @@ class ArrangementTest(unittest.TestCase):
         assert isinstance(other.sp, Mock)
         other.sp.playlist.assert_not_called()
 
+    def test_placement_choices_move_fixed_entries(self) -> None:
+        """Unanalyzable entries occupy the chosen slot and reject conflicting choices."""
+        sorter = fixture()
+        original = sorter.current_order.copy()
+        sorter.original_items[0]["fixed_reason"] = "Unavailable"
+        sorter.original_items[2]["fixed_reason"] = "Local file"
+        order = sorter.sort_playlist(placements={original[0]: 4, original[2]: 0})
+        assert (order[0], order[4]) == (original[2], original[0])
+        assert sorter.valid_order(order)
+        assert sorter.arrangement_result["placements"] == {original[0]: 4, original[2]: 0}
+        assert not sorter.valid_order([*order[1:], order[0]])
+        assert not sorter.update_spotify_playlist([*order[1:], order[0]])[0]
+        for invalid in (
+            {original[1]: 0},
+            {original[0]: 99},
+            {original[0]: 4, original[2]: 4},
+        ):
+            with self.subTest(invalid=invalid):
+                assert sorter.sort_playlist(placements=invalid) == []
+        assert sorter.sort_playlist(original[0], None, "smooth", {original[0]: 2}) == []
+        assert sorter.sort_playlist(None, original[1], "smooth", {original[0]: 5}) == []
+        combined = sorter.sort_playlist(None, original[1], "smooth", {original[0]: 4})
+        assert (combined[4], combined[-1]) == (original[0], original[1])
+        assert sorter.valid_order(combined)
+        reset = sorter.sort_playlist(original[0])
+        assert reset[0] == original[0]
+        assert sorter.valid_order(reset)
+        again = sorter.sort_playlist(placements={original[0]: 4, original[2]: 0})
+        assert again == order
+        assert sorter.valid_order(again)
+
     def test_ties_all_one_artist_and_large_playlist_fallback(self) -> None:
         """Keep feasible originals on ties and every entry when the pair-matrix guard applies."""
         sorter = fixture()

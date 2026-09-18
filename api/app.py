@@ -75,6 +75,7 @@ class JobView(BaseModel):
     profile: Profile = "smooth"
     first_occurrence: str | None = None
     last_occurrence: str | None = None
+    placements: dict[str, int] = Field(default_factory=dict)
     arrangement: dict[str, Any] | None = None
     review: dict[str, Any] | None = None
     tracks: list[Track] = Field(default_factory=list)
@@ -130,11 +131,14 @@ class PreviewRequest(BaseModel):
 
 
 class SortRequest(PreviewRequest):
-    """Select a listening profile and optional absolute endpoint occurrences."""
+    """Select a listening profile, optional endpoint pins and unanalyzable-item placements."""
 
     profile: Profile = "smooth"
     first_occurrence: Annotated[str, Field(min_length=1, max_length=512)] | None = None
     last_occurrence: Annotated[str, Field(min_length=1, max_length=512)] | None = None
+    placements: dict[Annotated[str, Field(min_length=1, max_length=512)], Annotated[int, Field(ge=0)]] = Field(
+        default_factory=dict
+    )
 
 
 class YouTubeSettings(BaseModel):
@@ -256,7 +260,7 @@ def _analyze_job(job: Job) -> None:
     )
     if tracks is None:
         job.view = job.view.model_copy(
-            update={"status": "error", "error": "We couldn't check these songs. Please try again."}
+            update={"status": "error", "error": "We couldn't analyze these songs. Please try again."}
         )
         return
     job.view = job.view.model_copy(
@@ -281,11 +285,11 @@ def _run_job(job: Job, action: str, release: Callable[[], None]) -> None:
             _analyze_job(job)
         elif action == "sort":
             job.sorted_order = job.sorter.sort_playlist(
-                job.view.first_occurrence, job.view.last_occurrence, job.view.profile
+                job.view.first_occurrence, job.view.last_occurrence, job.view.profile, job.view.placements
             )
             if not job.sorted_order:
                 job.view = job.view.model_copy(
-                    update={"status": "error", "error": "Check your song choices and try again."}
+                    update={"status": "error", "error": "Review your song choices and try again."}
                 )
                 return
             _, sorted_frame = job.sorter.compare_playlists(job.sorted_order)
@@ -298,7 +302,7 @@ def _run_job(job: Job, action: str, release: Callable[[], None]) -> None:
                     "arrangement": {
                         key: value
                         for key, value in job.sorter.arrangement_result.items()
-                        if key not in {"order", "profile", "first_occurrence", "last_occurrence"}
+                        if key not in {"order", "profile", "first_occurrence", "last_occurrence", "placements"}
                     },
                     "status": "ready",
                 }
@@ -318,6 +322,7 @@ def _run_job(job: Job, action: str, release: Callable[[], None]) -> None:
                     "arrangement": None,
                     "first_occurrence": None,
                     "last_occurrence": None,
+                    "placements": {},
                 }
             )
         else:
@@ -331,14 +336,14 @@ def _run_job(job: Job, action: str, release: Callable[[], None]) -> None:
             )
     except Exception:
         logger.exception("Playlist %s failed during %s", job.view.playlist_id, action)
-        message = "Something went wrong. Please check the playlist again."
+        message = "Something went wrong. Please analyze the playlist again."
         if action in {"save", "restore"}:
             job.sorter.invalidate_save()
             job.view = job.view.model_copy(update={"can_restore": False})
-            message = "The change couldn't be verified. Some songs may have moved. Check the playlist again."
+            message = "The change couldn't be verified. Some songs may have moved. Analyze the playlist again."
         if action == "analyze":
             tracks = [
-                track.model_copy(update={"analysis_status": "error", "fixed_reason": "Check interrupted"})
+                track.model_copy(update={"analysis_status": "error", "fixed_reason": "Analysis interrupted"})
                 if track.analysis_status in {"pending", "matching", "downloading", "analyzing"}
                 else track
                 for track in job.view.tracks
@@ -377,7 +382,7 @@ async def private_responses(request: Request, call_next: Callable[[Request], Awa
 
 async def invalid_request(_request: Request, _exc: Exception) -> JSONResponse:
     """Return a short validation message without echoing submitted values."""
-    return JSONResponse({"detail": "Check your choice and try again."}, status_code=422)
+    return JSONResponse({"detail": "Review your choice and try again."}, status_code=422)
 
 
 async def spotify_error(request: Request, exc: Exception) -> JSONResponse:
@@ -508,12 +513,12 @@ def set_youtube_access(body: YouTubeSettings, session: CurrentSession) -> dict[s
 
 @router.post("/api/playlists/{playlist_id}/analyze", status_code=202)
 def analyze(playlist_id: SpotifyId, request: Request, session: CurrentSession, background: BackgroundTasks) -> JobView:
-    """Check an editable playlist without blocking the response."""
+    """Analyze an editable playlist without blocking the response."""
     with session.lock:
         if session.job and session.job.view.status in {"analyzing", "sorting", "saving", "restoring"}:
             raise HTTPException(409, "Please wait for this playlist to finish.")
         if not request.app.state.analysis_lock.acquire(blocking=False):
-            raise HTTPException(409, "We're checking another playlist. Please try again shortly.")
+            raise HTTPException(409, "We're analyzing another playlist. Please try again shortly.")
         try:
             sp = get_spotify_client(session.auth)
             info = sp.playlist(playlist_id, fields="owner(id),collaborative")
@@ -537,14 +542,16 @@ def begin_action(
     with session.lock:
         job = session.job
         if not job or job.view.status not in {"ready", "saved", "restored"}:
-            raise HTTPException(409, "Check the playlist before continuing.")
+            raise HTTPException(409, "Analyze the playlist before continuing.")
         if revision != job.view.revision:
             raise HTTPException(409, "This preview changed in another tab. Reload the page to continue.")
         if action == "sort":
             movable = {track.occurrence for track in job.view.tracks if track.fixed_reason is None}
             if options is None or len(movable) < 2:  # noqa: PLR2004
                 raise HTTPException(422, "At least two movable songs are needed to arrange this playlist.")
-            error = job.sorter.choice_error(options.first_occurrence, options.last_occurrence, options.profile)
+            error = job.sorter.choice_error(
+                options.first_occurrence, options.last_occurrence, options.profile, options.placements
+            )
             if error:
                 raise HTTPException(422, error)
         if action == "save" and (
@@ -552,7 +559,7 @@ def begin_action(
             or job.sorted_order != [track.occurrence for track in job.view.sorted_tracks]
             or job.sorted_order == job.sorter.current_order
         ):
-            raise HTTPException(409, "Check the playlist preview before saving.")
+            raise HTTPException(409, "Review the playlist preview before saving.")
         if action == "restore" and not job.sorter.can_restore:
             raise HTTPException(409, "There is no previous order to restore in this session.")
         job.view = job.view.model_copy(

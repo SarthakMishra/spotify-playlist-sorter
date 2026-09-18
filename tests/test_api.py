@@ -432,6 +432,27 @@ class MigrationTest(unittest.TestCase):
             assert [entry["id"] for entry in variety["sorted_tracks"]] == [SECOND, None, FIRST]
             assert not variety["arrangement"]["unchanged"]
             assert variety["arrangement"]["cost"] <= variety["arrangement"]["baseline_cost"]
+            fixed = variety["tracks"][1]["occurrence"]
+            assert (
+                client.post(
+                    "/api/job/sort",
+                    headers=headers,
+                    json={"revision": variety["revision"], "placements": {first: 0}},
+                ).status_code
+                == 422
+            )
+            assert (
+                client.post(
+                    "/api/job/sort",
+                    headers=headers,
+                    json={"revision": variety["revision"], "placements": {fixed: 0}},
+                ).status_code
+                == 202
+            )
+            placed = client.get("/api/job").json()
+            assert placed["placements"] == {fixed: 0}
+            assert placed["sorted_tracks"][0]["id"] is None
+            assert not placed["arrangement"]["unchanged"]
             assert (
                 client.post("/api/job/save", headers=headers, json={"revision": original["revision"]}).status_code
                 == 409
@@ -538,7 +559,7 @@ class MigrationTest(unittest.TestCase):
             assert failed["metadata_loaded"]
             assert [entry["id"] for entry in failed["tracks"]] == [FIRST, None]
             assert failed["tracks"][0]["analysis_status"] == "error"
-            assert failed["tracks"][0]["fixed_reason"] == "Check interrupted"
+            assert failed["tracks"][0]["fixed_reason"] == "Analysis interrupted"
             assert (
                 client.post("/api/job/save", headers=headers, json={"revision": failed["revision"]}).status_code == 409
             )
