@@ -13,6 +13,7 @@ import { MatchFixDialog } from "@/components/match-fix-dialog"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import type { Job, Track } from "@/lib/api"
+import { isRematchStage } from "@/lib/job"
 import { matchAttention } from "@/lib/preferences"
 
 type StatusTone = "success" | "warning" | "failed" | "analyzing"
@@ -72,11 +73,13 @@ export function StatusBadge({
 }
 
 function MatchRow({
+  playlistId,
   track,
   attention,
   disabled,
   onApplied,
 }: {
+  playlistId: string
   track: Track
   attention: "fix" | "check" | null
   disabled: boolean
@@ -94,12 +97,18 @@ function MatchRow({
         </p>
       </div>
       {attention && track.id && (
-        <Button variant="outline" size="sm" onClick={() => setFixing(true)} disabled={disabled}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => setFixing(true)}
+          disabled={disabled || isRematchStage(track.analysis_status)}
+        >
           {attention === "fix" ? "Fix recording" : "Check recording"}
         </Button>
       )}
       <MatchFixDialog
         key={fixing ? "open" : "closed"}
+        playlistId={playlistId}
         track={track}
         open={fixing}
         onOpenChange={setFixing}
@@ -110,11 +119,13 @@ function MatchRow({
 }
 
 export function CheckStep({
+  playlistId,
   tracks,
   busy,
   onContinue,
   onApplied,
 }: {
+  playlistId: string
   tracks: Track[]
   busy: boolean
   onContinue: () => void
@@ -169,6 +180,7 @@ export function CheckStep({
         {shown.map((track) => (
           <MatchRow
             key={track.occurrence}
+            playlistId={playlistId}
             track={track}
             attention={matchAttention(track)}
             disabled={busy}
@@ -177,7 +189,12 @@ export function CheckStep({
         ))}
       </ul>
       <div className="flex items-center gap-3">
-        <Button onClick={onContinue} disabled={busy} size="lg" className="min-w-0 flex-1">
+        <Button
+          onClick={onContinue}
+          disabled={busy || tracks.some((track) => isRematchStage(track.analysis_status))}
+          size="lg"
+          className="min-w-0 flex-1"
+        >
           {noted.some((track) => matchAttention(track) === "fix") ? "Continue anyway" : "Continue"}
         </Button>
       </div>

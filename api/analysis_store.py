@@ -1,4 +1,4 @@
-"""The named recording-analysis record and its on-disk store."""
+"""The named recording-analysis record and its SQLite store."""
 
 from __future__ import annotations
 
@@ -6,17 +6,15 @@ import hashlib
 import json
 import logging
 import math
-import tempfile
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 from pydantic import BaseModel, ValidationError
 
+from api import store
 from api.audio_analysis import ANALYSIS_VERSION, SETTINGS
 
 logger = logging.getLogger(__name__)
-_CACHE_FILE = Path(__file__).resolve().parent.parent / ".analysis_cache.json"
 _CACHE_SCHEMA = 2
 _RESOLVER_VERSION = 3
 _VIDEO_REUSE_SECONDS = 2.0
@@ -64,50 +62,30 @@ def _source_fingerprint(source: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(source, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
-def _load_cache() -> dict[str, dict[str, Any]]:
-    """Ignore unversioned, incompatible or damaged analysis caches."""
-    try:
-        data = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or any(
-            data.get(key) != value
-            for key, value in (
-                ("schema", _CACHE_SCHEMA),
-                ("analysis_version", ANALYSIS_VERSION),
-                ("settings", SETTINGS),
-            )
-        ):
-            return {}
-        # Version 2 accepted a stricter subset; its successful analyses remain valid.
-        if data.get("resolver_version") not in {2, _RESOLVER_VERSION}:
-            return {}
-        records = data.get("records")
-        return records if isinstance(records, dict) else {}
-    except (ValueError, OSError):
+def _header() -> dict[str, str]:
+    """Describe the current analysis versions so stored records can be validated."""
+    return {
+        "schema": str(_CACHE_SCHEMA),
+        "analysis_version": str(ANALYSIS_VERSION),
+        "resolver_version": str(_RESOLVER_VERSION),
+        "settings": json.dumps(SETTINGS, sort_keys=True),
+    }
+
+
+def _load_cache(track_ids: list[str] | None = None) -> dict[str, dict[str, Any]]:
+    """Load ready records for these track ids, resetting them when analysis versions change."""
+    header = _header()
+    stored = store.cache_meta()
+    if stored is not None and stored != header:
+        # Analysis versions changed: every stored record is invalid until re-measured.
+        store.reset_cache(header, {})
         return {}
+    return {key: json.loads(raw) for key, raw in store.cache_records(track_ids).items()}
 
 
 def _save_cache(records: dict[str, dict[str, Any]]) -> None:
-    """Replace the cache atomically so interruption cannot leave a partial JSON file."""
-    # ponytail: one JSON file; use SQLite if its size makes checkpoints slow.
-    path = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=_CACHE_FILE.parent, delete=False) as output:
-            path = Path(output.name)
-            json.dump(
-                {
-                    "schema": _CACHE_SCHEMA,
-                    "analysis_version": ANALYSIS_VERSION,
-                    "resolver_version": _RESOLVER_VERSION,
-                    "settings": SETTINGS,
-                    "records": records,
-                },
-                output,
-                allow_nan=False,
-            )
-        path.replace(_CACHE_FILE)
-    finally:
-        if path is not None:
-            path.unlink(missing_ok=True)
+    """Checkpoint ready measurements so no analysis work is ever repeated after a crash."""
+    store.save_cache_records({key: json.dumps(record) for key, record in records.items()})
 
 
 def _cache_matches(record: object, metadata: dict[str, Any]) -> bool:

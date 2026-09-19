@@ -18,16 +18,16 @@ type PresetMeta = {
 // choice stays adjustable without learning parameter names.
 export const PRESETS: PresetMeta[] = [
   {
-    value: "gentle",
-    label: "Gentle flow",
-    description: "Soft changes from song to song.",
-    values: { pace: 0.5, energy: 0.5, variety: 0.2 },
-  },
-  {
     value: "steady",
     label: "Steady mix",
     description: "Balanced flow with room for variety.",
     values: { pace: 0.5, energy: 0.5, variety: 0.5 },
+  },
+  {
+    value: "gentle",
+    label: "Gentle flow",
+    description: "Soft changes from song to song.",
+    values: { pace: 0.5, energy: 0.5, variety: 0.2 },
   },
   {
     value: "buildup",

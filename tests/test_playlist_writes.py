@@ -4,14 +4,17 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Event
 from typing import Any, override
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
+from api import playlist_sorter, store
 from api.app import COOKIE, Job, JobView, Session, _tracks, create_app
 from api.playlist_sorter import SpotifyPlaylistSorter
 
@@ -23,7 +26,8 @@ class PlaylistWritesTest(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        """Keep provider state independent of the sorter's expected order."""
+        """Keep durable sessions and provider state independent per test."""
+        store.configure(Path(self.enterContext(tempfile.TemporaryDirectory())) / "store.db")
         self.items: list[dict[str, Any] | None] = [
             {"item": {"id": "a", "uri": "spotify:track:a"}, "added_at": "first-copy"},
             {"item": {"id": "unchecked", "uri": "spotify:track:unchecked"}},
@@ -56,6 +60,7 @@ class PlaylistWritesTest(unittest.TestCase):
         """No test may replace a playlist or add its contents again."""
         self.sp.playlist_replace_items.assert_not_called()
         self.sp.playlist_add_items.assert_not_called()
+        store.close()
 
     def move(self, _playlist: str, source: int, destination: int, **kwargs: object) -> dict[str, str]:
         """Apply a single provider move and issue its next snapshot."""
@@ -83,6 +88,38 @@ class PlaylistWritesTest(unittest.TestCase):
         self.sp.playlist_reorder_items.reset_mock()
         assert not self.sorter.restore_spotify_playlist()[0]
         self.sp.playlist_reorder_items.assert_not_called()
+
+    def test_rematch_keeps_the_next_save_ready(self) -> None:
+        """Re-measuring one song's audio leaves Spotify's snapshot valid for the next save."""
+        record = {
+            "status": "ready",
+            "source": {"id": "d" * 11},
+            "analysis": {
+                "summary": {
+                    "tempo": 124.0,
+                    "camelot": "8A",
+                    "rms_db": -10.0,
+                    "onset": 0.3,
+                    "evidence": {"rms_db": 1.0, "onset": 1.0},
+                }
+            },
+        }
+        cached = {key: {**record} for key in ("a", "b")}
+        self.sorter.audio_features = cached
+        entry = next(item for item in self.sorter.original_items if item["id"] == "a")
+        with (
+            patch.object(playlist_sorter, "hydrate_candidate", return_value={"id": "d" * 11}),
+            patch.object(playlist_sorter, "measure_source", return_value=(record, None, ())),
+        ):
+            success, message = self.sorter.reanalyze_track(entry, "d" * 11)
+        assert success
+        assert message == "Recording updated."
+        assert self.sorter.snapshot_id == str(self.version)
+        # The arranged order saves without re-analyzing.
+        assert self.sorter.update_spotify_playlist(self.target)[0]
+        assert self.items == [self.original[i] for i in (2, 1, 0, 3, 4, 5, 6)]
+        rematched = next(item for item in self.sorter.original_items if item["id"] == "a")
+        assert rematched["BPM"] == 124.0
 
     def test_external_edit_prevents_save_or_restore(self) -> None:
         """A later provider snapshot invalidates both actions before any move."""
@@ -126,9 +163,9 @@ class PlaylistWritesTest(unittest.TestCase):
                     status="ready",
                     sorted_tracks=_tracks(self.sorter.proposed_tracks(self.target)),
                 ),
-                self.target,
+                sorted_order=self.target,
             )
-            session = Session(auth=Mock(), state="", user={"id": "listener"}, job=job)
+            session = Session(auth=Mock(), state="", user={"id": "listener"}, jobs={PLAYLIST: job})
             app.state.sessions["test"] = session
             client.cookies.set(COOKIE, "test")
             headers = {"X-CSRF-Token": session.csrf}
@@ -137,30 +174,34 @@ class PlaylistWritesTest(unittest.TestCase):
                 finish.clear()
                 starting_version = self.version
                 request = requests.submit(
-                    client.post, f"/api/job/{action}", headers=headers, json={"revision": job.view.revision}
+                    client.post, f"/api/job/{PLAYLIST}/{action}", headers=headers, json={"revision": job.view.revision}
                 )
                 try:
                     assert reading.wait(5)
-                    pending = client.get("/api/job").json()
+                    pending = client.get(f"/api/job/{PLAYLIST}").json()
                     assert pending["status"] == working
                     assert not pending["can_restore"]
                     for blocked in ("save", "sort", "restore"):
                         assert (
                             client.post(
-                                f"/api/job/{blocked}", headers=headers, json={"revision": pending["revision"]}
+                                f"/api/job/{PLAYLIST}/{blocked}",
+                                headers=headers,
+                                json={"revision": pending["revision"]},
                             ).status_code
                             == 409
                         )
-                    assert client.post(f"/api/playlists/{PLAYLIST}/analyze", headers=headers).status_code == 409
+                    assert client.post(f"/api/playlists/{PLAYLIST}/analyze", headers=headers).status_code == 202
                 finally:
                     finish.set()
                     assert request.result(timeout=5).status_code == 202
-                result = client.get("/api/job").json()
+                result = client.get(f"/api/job/{PLAYLIST}").json()
                 assert result["status"] == complete
                 assert result["can_restore"] == (action == "save")
             assert client.post("/api/auth/logout", headers=headers).status_code == 200
             assert (
-                client.post("/api/job/restore", headers=headers, json={"revision": job.view.revision}).status_code
+                client.post(
+                    f"/api/job/{PLAYLIST}/restore", headers=headers, json={"revision": job.view.revision}
+                ).status_code
                 == 401
             )
 
@@ -229,21 +270,21 @@ class PlaylistWritesTest(unittest.TestCase):
                             status="ready",
                             sorted_tracks=_tracks(self.sorter.proposed_tracks(self.target)),
                         ),
-                        self.target,
+                        sorted_order=self.target,
                     )
-                    session = Session(auth=Mock(), state="", user={"id": "listener"}, job=job)
+                    session = Session(auth=Mock(), state="", user={"id": "listener"}, jobs={PLAYLIST: job})
                     app.state.sessions["test"] = session
                     client.cookies.set(COOKIE, "test")
                     with self.assertLogs("api.playlist_sorter", level="WARNING"):
                         assert (
                             client.post(
-                                "/api/job/save",
+                                f"/api/job/{PLAYLIST}/save",
                                 json={"revision": job.view.revision},
                                 headers={"X-CSRF-Token": session.csrf},
                             ).status_code
                             == 202
                         )
-                    failed = client.get("/api/job").json()
+                    failed = client.get(f"/api/job/{PLAYLIST}").json()
                     assert failed["status"] == "error"
                     assert not failed["can_restore"]
                     assert "Some songs may have moved" in failed["error"]

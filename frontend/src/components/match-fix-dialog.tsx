@@ -23,11 +23,13 @@ import { beginRematchToast } from "@/lib/job"
 import { elapsedTime } from "@/lib/review"
 
 export function MatchFixDialog({
+  playlistId,
   track,
   open,
   onOpenChange,
   onApplied,
 }: {
+  playlistId: string
   track: Track
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -51,7 +53,7 @@ export function MatchFixDialog({
     const controller = new AbortController()
     async function load() {
       try {
-        const result = await getMatchCandidates(track.occurrence, {
+        const result = await getMatchCandidates(playlistId, track.occurrence, {
           signal: controller.signal,
         })
         if (controller.signal.aborted) return
@@ -63,7 +65,7 @@ export function MatchFixDialog({
     }
     void load()
     return () => controller.abort()
-  }, [open, track.occurrence])
+  }, [playlistId, open, track.occurrence])
 
   async function apply() {
     if (!selected || applying) return
@@ -71,7 +73,7 @@ export function MatchFixDialog({
     try {
       // The seam returns the fresh job the backend rotated to; the playlist page
       // adopts it so polling, copy and the next revision all move together.
-      const updated = await applyRecording(track.occurrence, selected.video_id)
+      const updated = await applyRecording(playlistId, track.occurrence, selected.video_id)
       beginRematchToast(track)
       onOpenChange(false)
       onApplied(track.occurrence, updated)

@@ -18,15 +18,18 @@ export function isRematchStage(status: Track["analysis_status"]): boolean {
 
 // Poll the session's job while it is working. Each request schedules the next one
 // after it finishes; cleanup aborts the in-flight request and the pending timer.
-export function watchJob(handlers: {
-  onJob: (job: Job | null) => void
-  onError: (error: unknown) => void
-}): () => void {
+export function watchJob(
+  playlistId: string,
+  handlers: {
+    onJob: (job: Job | null) => void
+    onError: (error: unknown) => void
+  },
+): () => void {
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout>
   async function poll() {
     try {
-      const next = await getJob({ signal: controller.signal })
+      const next = await getJob(playlistId, { signal: controller.signal })
       if (controller.signal.aborted) return
       handlers.onJob(next)
       if (isWorking(next)) timer = setTimeout(poll, 1000)

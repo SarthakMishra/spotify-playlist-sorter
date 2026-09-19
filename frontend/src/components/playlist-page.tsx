@@ -11,7 +11,9 @@ import { ReviewStep } from "@/components/steps/review-step"
 import {
   analyzePlaylist,
   ApiError,
+  getPreferences,
   restorePreview,
+  savePreferences,
   savePreview,
   sortPreview,
   type Job,
@@ -37,7 +39,9 @@ type StepId = "check" | "preferences" | "review"
 
 function initialStep(job: Job | null): StepId {
   if (job?.sorted_tracks?.length) return "review"
-  if (job && job.metadata_loaded) {
+  // Only skip the check step once analysis has finished; mid-analysis every track
+  // still looks clean, so deciding then would hide mismatches that appear later.
+  if (job?.status === "ready" && job.metadata_loaded) {
     const noted = job.tracks.some((track) => matchAttention(track) !== null)
     if (!noted) return "preferences"
   }
@@ -62,10 +66,8 @@ export function PlaylistRoute() {
 }
 
 function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob: Job | null }) {
-  // The session holds a single job slot, whichever playlist it owns. Polling keeps it
-  // fresh so blocked states clear as soon as the working job finishes.
-  const [sessionJob, setSessionJob] = useState<Job | null>(initialJob)
-  const job = sessionJob?.playlist_id === playlist.id ? sessionJob : null
+  // Each playlist owns its job slot; queued analyses wait in the shared worker queue.
+  const [job, setJob] = useState<Job | null>(initialJob)
   const [step, setStep] = useState<StepId>(() => initialStep(initialJob))
   const [error, setError] = useState("")
   const [pending, setPending] = useState<"analyze" | "sort" | "save" | "restore" | null>(null)
@@ -84,15 +86,25 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
   )
   const [lastOccurrence, setLastOccurrence] = useState<string | null>(job?.last_occurrence ?? null)
   const [placements, setPlacements] = useState<Record<string, number>>(job?.placements ?? {})
+  // Flow choices survive a server restart and apply to every future playlist visit.
+  const savedPreferences = useRef<Options>(
+    initialJob?.options
+      ? {
+          preset: initialJob.options.preset,
+          pace: initialJob.options.pace,
+          energy: initialJob.options.energy,
+          variety: initialJob.options.variety,
+        }
+      : DEFAULT_PREFERENCES,
+  )
   const actionController = useRef<AbortController | null>(null)
   const progressToast = useRef<string | null>(null)
   const reviewHeading = useRef<HTMLHeadingElement>(null)
   const errorRegion = useRef<HTMLDivElement>(null)
   const actionFocus = useRef<{ element: Element | null; failed: boolean } | null>(null)
   const advanceToReview = useRef(false)
-  const rematch = useRef<{ occurrence: string } | null>(null)
+  const rematches = useRef<Set<string>>(new Set())
   const jobStatus = job?.status
-  const sessionJobStatus = sessionJob?.status
   const busy = pending !== null || isWorking(job)
   const activity =
     pending === "sort"
@@ -102,11 +114,16 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
         : pending === "restore"
           ? "restoring"
           : jobStatus
-  const otherJob =
-    sessionJob && sessionJob.playlist_id !== playlist.id && isWorking(sessionJob)
-      ? sessionJob
-      : null
-  const analyzing = pending === "analyze" || jobStatus === "analyzing"
+  // Batched recording rematches stay inside the check step; only fresh analyses
+  // take over the page with the analyzing banner.
+  const analyzing = (pending === "analyze" || jobStatus === "analyzing") && !job?.rematching
+  // A queued analysis has no song list yet; its position is the queue line it waits in.
+  const queued =
+    jobStatus === "analyzing" &&
+    !job?.metadata_loaded &&
+    job?.queue_position != null &&
+    !job.stale &&
+    !job.rematching
   const tracks = job?.tracks ?? []
   const choices = tracks.filter(
     (track) => track.analysis_status === "ready" && track.fixed_reason === null,
@@ -114,6 +131,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
   const canSort = choices.length >= 2
   const total = tracks.length
   const fixedTracks = tracks.filter((track) => track.fixed_reason)
+  const attentionCount = tracks.filter((track) => matchAttention(track) !== null).length
   const fixedFirst = fixedAtSlot(fixedTracks, placements, 0)
   const fixedLast = fixedAtSlot(fixedTracks, placements, total - 1)
   const hasPreview = !!job?.sorted_tracks.length && job.status !== "error"
@@ -139,29 +157,37 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
       ? job.sorted_tracks.filter((track, index) => track.original_position !== index).length
       : 0
 
-  const statusMessage = analyzing
-    ? job?.metadata_loaded
-      ? `${job.completed} of ${job.total} analyzed. ${job.analyzed_count} analyzed successfully.`
-      : "Loading playlist."
-    : activity === "sorting"
-      ? "Arranging the playlist."
-      : activity === "saving"
-        ? "Saving to Spotify."
-        : activity === "restoring"
-          ? "Restoring the previous order on Spotify."
-          : jobStatus === "restored"
-            ? "Previous order restored on Spotify."
-            : choicesChanged
-              ? "Arrange again to apply your choices."
-              : jobStatus === "saved"
-                ? "Saved to Spotify."
-                : hasPreview
-                  ? job?.arrangement?.unchanged
-                    ? "Your order is unchanged."
-                    : "Suggested order ready."
-                  : jobStatus === "ready"
-                    ? `${job?.analyzed_count ?? 0} analyzed successfully. ${job?.kept_count ?? 0} can't be analyzed.`
-                    : ""
+  const statusMessage = queued
+    ? `Waiting in queue. Position ${job?.queue_position}.`
+    : job?.rematching
+      ? "Re-analyzing the recordings you picked. Other songs stay available."
+      : analyzing
+        ? job?.stale
+          ? "This playlist changed since its last analysis. Waiting for a fresh analysis."
+          : job?.metadata_loaded
+            ? `${job.completed} of ${job.total} analyzed. ${job.analyzed_count} analyzed successfully.`
+            : "Loading playlist."
+        : activity === "sorting"
+          ? "Arranging the playlist."
+          : activity === "saving"
+            ? "Saving to Spotify."
+            : activity === "restoring"
+              ? "Restoring the previous order on Spotify."
+              : jobStatus === "restored"
+                ? "Previous order restored on Spotify."
+                : job?.stored
+                  ? "Restored from a previous analysis. Re-analyze to make changes."
+                  : choicesChanged
+                    ? "Arrange again to apply your choices."
+                    : jobStatus === "saved"
+                      ? "Saved to Spotify."
+                      : hasPreview
+                        ? job?.arrangement?.unchanged
+                          ? "Your order is unchanged."
+                          : "Suggested order ready."
+                        : jobStatus === "ready"
+                          ? `${job?.analyzed_count ?? 0} analyzed successfully. ${job?.kept_count ?? 0} can't be analyzed.`
+                          : ""
 
   useEffect(() => {
     const requested = actionFocus.current
@@ -193,8 +219,10 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
   })
 
   const observeRematch = useEffectEvent((next: Job) => {
-    if (!rematch.current || next.playlist_id !== playlist.id) return
-    if (resolveRematchToast(next, rematch.current.occurrence)) rematch.current = null
+    if (next.playlist_id !== playlist.id) return
+    for (const occurrence of rematches.current) {
+      if (resolveRematchToast(next, occurrence)) rematches.current.delete(occurrence)
+    }
   })
 
   const focusReviewHeading = useEffectEvent((active: boolean) => {
@@ -210,8 +238,8 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
       actionController.current?.abort()
       if (progressToast.current) toast.close(progressToast.current)
       progressToast.current = null
-      if (rematch.current) cancelRematchToast(rematch.current.occurrence)
-      rematch.current = null
+      for (const occurrence of rematches.current) cancelRematchToast(occurrence)
+      rematches.current.clear()
     },
     [],
   )
@@ -220,6 +248,18 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
     if (!error) return undefined
     return () => toast.close(`playlist-error-${playlist.id}`)
   }, [error, playlist.id])
+
+  // A fresh visit prefills the choices this listener arranged with last time; a job
+  // in progress keeps the choices it was started with.
+  useEffect(() => {
+    if (initialJob?.options) return
+    getPreferences()
+      .then((saved) => {
+        savedPreferences.current = saved
+        setPreferences((current) => (current === DEFAULT_PREFERENCES ? { ...saved } : current))
+      })
+      .catch(() => undefined)
+  }, [initialJob])
 
   useEffect(() => {
     if (error) {
@@ -262,10 +302,10 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
   }, [activity, error, job?.error, job?.arrangement?.unchanged, playlist.id, playlist.name])
 
   useEffect(() => {
-    if (error || !isWorkingStatus(sessionJobStatus)) return undefined
-    return watchJob({
+    if (error || !isWorkingStatus(jobStatus)) return undefined
+    return watchJob(playlist.id, {
       onJob: (next) => {
-        setSessionJob(next)
+        setJob(next)
         if (next) skipCleanCheckStep(next)
         if (next) observeRematch(next)
       },
@@ -289,7 +329,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
       },
     })
     // Status controls the polling lifetime. Each request schedules the next one after it finishes.
-  }, [sessionJobStatus, playlist.id, error])
+  }, [jobStatus, playlist.id, error])
 
   async function run(action: "analyze" | "sort" | "save" | "restore") {
     if (busy) return
@@ -305,6 +345,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
           ? await analyzePlaylist(playlist.id, { signal: controller.signal })
           : action === "sort"
             ? await sortPreview(
+                playlist.id,
                 {
                   revision: job?.revision ?? "",
                   options: preferences,
@@ -315,18 +356,24 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
                 { signal: controller.signal },
               )
             : action === "save"
-              ? await savePreview(job?.revision ?? "", { signal: controller.signal })
-              : await restorePreview(job?.revision ?? "", { signal: controller.signal })
+              ? await savePreview(playlist.id, job?.revision ?? "", { signal: controller.signal })
+              : await restorePreview(playlist.id, job?.revision ?? "", {
+                  signal: controller.signal,
+                })
       if (controller.signal.aborted) return
       if (action === "analyze" || action === "restore") {
         setFirstOccurrence(null)
         setLastOccurrence(null)
         setPlacements({})
         setStep("check")
-        setPreferences(DEFAULT_PREFERENCES)
+        setPreferences({ ...savedPreferences.current })
       }
-      if (action === "sort") advanceToReview.current = true
-      setSessionJob(next)
+      if (action === "sort") {
+        advanceToReview.current = true
+        savedPreferences.current = preferences
+        savePreferences(preferences).catch(() => undefined)
+      }
+      setJob(next)
     } catch (err) {
       if (controller.signal.aborted) return
       if (err instanceof ApiError && err.status === 401) {
@@ -358,10 +405,10 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
   }
 
   const startAnalyzing = useEffectEvent(() => {
-    if (!job && !otherJob && playlist.total > 0) void run("analyze")
+    if (!job || job.stale) void run("analyze")
   })
 
-  const shouldAutoAnalyze = !job && !otherJob && !error && playlist.total > 0
+  const shouldAutoAnalyze = (!job || job.stale) && !error && playlist.total > 0
   // PlaylistRoute keys this component by playlist, so this starts once on mount and
   // resumes by itself if another playlist's job was blocking and then finishes.
   useEffect(() => {
@@ -375,13 +422,16 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
     setPlacements((current) => (JSON.stringify(current) === JSON.stringify(next) ? current : next))
   }
   const handleApplied = (occurrence: string, updated: Job) => {
-    // The rematch polls through the analyzing status; the toast is resolved
-    // once polling sees the song leave the working stages.
+    // Each rematch polls through the analyzing status; its toast is resolved once
+    // polling sees that song leave the working stages.
     advanceToReview.current = false
-    rematch.current = { occurrence }
-    setSessionJob(updated)
+    rematches.current.add(occurrence)
+    setJob(updated)
   }
-  const showSetup = !!job && !!tracks.length && !analyzing && jobStatus !== "error"
+  // A stored revisit serves true results but no live playlist data; every action
+  // needs a fresh analysis, so the interactive steps must not present dead buttons.
+  const showSetup =
+    !!job && !!tracks.length && !analyzing && !job.stale && !job.stored && jobStatus !== "error"
 
   return (
     <section className="mx-auto max-w-2xl">
@@ -447,25 +497,33 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
         </Button>
       )}
 
-      {otherJob && !job && (
+      {!analyzing && job?.stored && (
         <Alert className="mt-8">
           <AlertDescription>
-            Another playlist is still being analyzed.
-            <Link to={`/playlists/${otherJob.playlist_id}`} className="ml-2 underline">
-              See progress
-            </Link>
+            This analysis was restored from a previous visit. Re-analyze to check recordings and
+            make changes.
           </AlertDescription>
         </Alert>
       )}
 
-      {((!job && !otherJob && playlist.total === 0) ||
-        (jobStatus === "ready" && !tracks.length)) && (
+      {!analyzing && job?.stored && (
+        <Button
+          className="mt-5"
+          onClick={() => void run("analyze")}
+          disabled={busy || playlist.total === 0}
+        >
+          Analyze again
+          <ArrowRight aria-hidden="true" />
+        </Button>
+      )}
+
+      {(!job && playlist.total === 0) || (jobStatus === "ready" && !tracks.length) ? (
         <p className="mt-8 text-sm text-muted-foreground">
           This playlist is empty. Add some songs on Spotify first.
         </p>
-      )}
+      ) : null}
 
-      {!analyzing && !otherJob && (jobStatus === "error" || (!job && error)) && (
+      {!analyzing && (jobStatus === "error" || (!job && error)) && (
         <Button
           className="mt-5"
           onClick={() => void run("analyze")}
@@ -486,29 +544,42 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
             <h2>
               <ProgressLabel className="flex items-center gap-2 text-base font-semibold">
                 <LoaderCircle className="size-4 motion-safe:animate-spin" aria-hidden="true" />
-                {job?.metadata_loaded
-                  ? job.total === 1
-                    ? "Re-analyzing this song"
-                    : "Analyzing songs"
-                  : "Loading playlist"}
+                {queued
+                  ? "Waiting in queue"
+                  : job?.metadata_loaded
+                    ? job.total === 1
+                      ? "Re-analyzing this song"
+                      : "Analyzing songs"
+                    : "Loading playlist"}
               </ProgressLabel>
             </h2>
             <ProgressValue className="text-xs">
               {() =>
-                jobStatus === "analyzing" && job?.total
-                  ? `${job.completed} of ${job.total} analyzed`
-                  : "Getting the song list"
+                queued
+                  ? `Position ${job?.queue_position}`
+                  : jobStatus === "analyzing" && job?.total
+                    ? `${job.completed} of ${job.total} analyzed`
+                    : "Getting the song list"
               }
             </ProgressValue>
           </Progress>
+          {queued && (
+            <p className="mt-4 text-sm text-muted-foreground">
+              This playlist changed since its last analysis. New songs need a fresh analysis first.
+            </p>
+          )}
+          <Button variant="outline" size="sm" render={<Link to="/queue" />} className="mt-4">
+            See the queue
+          </Button>
         </div>
       )}
 
       {showSetup && step === "check" && (
         <div className="mt-8 border-t pt-6">
           <CheckStep
+            playlistId={playlist.id}
             tracks={tracks}
-            busy={busy}
+            busy={busy && !job?.rematching}
             onContinue={() => setStep("preferences")}
             onApplied={handleApplied}
           />
@@ -531,11 +602,13 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
             fixedLast={fixedLast}
             fixedTracks={fixedTracks}
             total={total}
+            attentionCount={attentionCount}
             placements={placements}
             onPlacementsChange={handlePlacements}
             placementConflict={conflicts}
             hasPreview={hasPreview}
             onArrange={() => void run("sort")}
+            onCheckTracks={() => setStep("check")}
           />
         </div>
       )}

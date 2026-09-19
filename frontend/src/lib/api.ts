@@ -65,6 +65,11 @@ export type Job = {
   kept_count: number
   metadata_loaded: boolean
   analyzed_count: number
+  queue_position: number | null
+  stale: boolean
+  rematching: boolean
+  /** Served from the analysis store: true results, but no live playlist data to act on. */
+  stored: boolean
   options: Options
   first_occurrence: string | null
   last_occurrence: string | null
@@ -89,6 +94,15 @@ export type Job = {
   tracks: Track[]
   sorted_tracks: Track[]
   error: string | null
+}
+export type QueueEntry = {
+  playlist_id: string
+  name: string
+  status: "queued" | "running"
+  queue_position: number | null
+  completed: number
+  total: number
+  eta_seconds: number | null
 }
 
 export class ApiError extends Error {
@@ -145,32 +159,60 @@ export function getPlaylists(options: RequestInit = {}): Promise<Playlist[]> {
   return request<Playlist[]>("/playlists", options)
 }
 
-export function getJob(options: RequestInit = {}): Promise<Job | null> {
-  return request<Job | null>("/job", options)
+export function getPreferences(options: RequestInit = {}): Promise<Options> {
+  return request<Options>("/preferences", options)
+}
+
+export function savePreferences(preferences: Options, options: RequestInit = {}): Promise<Options> {
+  return request<Options>("/preferences", {
+    ...mutating(options),
+    method: "PUT",
+    body: JSON.stringify(preferences),
+  })
+}
+
+export function getJob(playlistId: string, options: RequestInit = {}): Promise<Job | null> {
+  return request<Job | null>(`/job/${playlistId}`, options)
+}
+
+export function getQueue(options: RequestInit = {}): Promise<QueueEntry[]> {
+  return request<QueueEntry[]>("/queue", options)
 }
 
 export function analyzePlaylist(playlistId: string, options: RequestInit = {}): Promise<Job> {
   return request<Job>(`/playlists/${playlistId}/analyze`, { ...mutating(options), method: "POST" })
 }
 
-export function sortPreview(body: SortRequest, options: RequestInit = {}): Promise<Job> {
-  return request<Job>("/job/sort", {
+export function sortPreview(
+  playlistId: string,
+  body: SortRequest,
+  options: RequestInit = {},
+): Promise<Job> {
+  return request<Job>(`/job/${playlistId}/sort`, {
     ...mutating(options),
     method: "POST",
     body: JSON.stringify(body),
   })
 }
 
-export function savePreview(revision: string, options: RequestInit = {}): Promise<Job> {
-  return request<Job>("/job/save", {
+export function savePreview(
+  playlistId: string,
+  revision: string,
+  options: RequestInit = {},
+): Promise<Job> {
+  return request<Job>(`/job/${playlistId}/save`, {
     ...mutating(options),
     method: "POST",
     body: JSON.stringify({ revision }),
   })
 }
 
-export function restorePreview(revision: string, options: RequestInit = {}): Promise<Job> {
-  return request<Job>("/job/restore", {
+export function restorePreview(
+  playlistId: string,
+  revision: string,
+  options: RequestInit = {},
+): Promise<Job> {
+  return request<Job>(`/job/${playlistId}/restore`, {
     ...mutating(options),
     method: "POST",
     body: JSON.stringify({ revision }),
@@ -178,19 +220,24 @@ export function restorePreview(revision: string, options: RequestInit = {}): Pro
 }
 
 export function getMatchCandidates(
+  playlistId: string,
   occurrence: string,
   options: RequestInit = {},
 ): Promise<Candidate[]> {
   // Occurrences carry Spotify snapshot ids, which can contain slashes; encode the whole segment.
-  return request<Candidate[]>(`/job/matches/${encodeURIComponent(occurrence)}`, options)
+  return request<Candidate[]>(
+    `/job/${playlistId}/matches/${encodeURIComponent(occurrence)}`,
+    options,
+  )
 }
 
 export function applyRecording(
+  playlistId: string,
   occurrence: string,
   videoId: string,
   options: RequestInit = {},
 ): Promise<Job> {
-  return request<Job>(`/job/matches/${encodeURIComponent(occurrence)}`, {
+  return request<Job>(`/job/${playlistId}/matches/${encodeURIComponent(occurrence)}`, {
     ...mutating(options),
     method: "POST",
     body: JSON.stringify({ video_id: videoId }),

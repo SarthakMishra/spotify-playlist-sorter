@@ -12,14 +12,14 @@ from concurrent.futures import ThreadPoolExecutor
 from itertools import pairwise
 from pathlib import Path
 from threading import Event
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, override
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
 from spotipy.exceptions import SpotifyOauthError
 
-from api import playlist_sorter
+from api import playlist_sorter, store
 from api.app import COOKIE, Session, create_app
 from api.playlist_sorter import SpotifyPlaylistSorter
 from api.youtube import SourceAccessError
@@ -40,6 +40,15 @@ def spotify_item(track_id: str, name: str) -> dict[str, Any]:
 
 class MigrationTest(unittest.TestCase):
     """Exercise HTTP contracts and the real sorting code with external I/O mocked."""
+
+    @override
+    def setUp(self) -> None:
+        """Keep durable sessions in a temporary database for every test."""
+        store.configure(Path(self.enterContext(tempfile.TemporaryDirectory())) / "store.db")
+
+    @override
+    def tearDown(self) -> None:
+        store.close()
 
     def test_browser_flow_and_safe_reordering(self) -> None:  # noqa: PLR0915
         """Preview stays private and saving keeps duplicate, failed, and unavailable songs."""
@@ -126,11 +135,8 @@ class MigrationTest(unittest.TestCase):
                 assert playlists[0]["total"] == 5
                 assert client.post(f"/api/playlists/{PLAYLIST}/analyze").status_code == 403
                 assert client.post("/api/playlists/invalid/analyze", headers=headers).status_code == 422
-                app.state.analysis_lock.acquire()
-                assert client.post(f"/api/playlists/{PLAYLIST}/analyze", headers=headers).status_code == 409
-                app.state.analysis_lock.release()
                 assert client.post(f"/api/playlists/{PLAYLIST}/analyze", headers=headers).status_code == 202
-                job = client.get("/api/job").json()
+                job = client.get(f"/api/job/{PLAYLIST}").json()
                 assert job["status"] == "ready"
                 assert job["completed"] == job["total"]
                 assert job["kept_count"] == 2
@@ -143,24 +149,27 @@ class MigrationTest(unittest.TestCase):
                 sp.playlist_reorder_items.assert_not_called()
                 assert (
                     client.post(
-                        "/api/job/sort",
+                        f"/api/job/{PLAYLIST}/sort",
                         headers=headers,
                         json={"revision": job["revision"], "first_occurrence": occurrences[1]},
                     ).status_code
                     == 422
                 )
                 assert (
-                    client.post("/api/job/save", headers=headers, json={"revision": job["revision"]}).status_code == 409
+                    client.post(
+                        f"/api/job/{PLAYLIST}/save", headers=headers, json={"revision": job["revision"]}
+                    ).status_code
+                    == 409
                 )
                 assert (
                     client.post(
-                        "/api/job/sort",
+                        f"/api/job/{PLAYLIST}/sort",
                         headers=headers,
                         json={"revision": job["revision"], "first_occurrence": occurrences[2]},
                     ).status_code
                     == 202
                 )
-                preview = client.get("/api/job").json()
+                preview = client.get(f"/api/job/{PLAYLIST}").json()
                 assert [track["id"] for track in preview["sorted_tracks"]] == [SECOND, UNCHECKED, FIRST, None, FIRST]
                 assert len(preview["transitions"]) == 4
                 target = [occurrences[i] for i in (2, 1, 0, 3, 4)]
@@ -171,39 +180,46 @@ class MigrationTest(unittest.TestCase):
                 )
                 sp.playlist_reorder_items.assert_not_called()
                 assert (
-                    client.post("/api/job/save", headers=headers, json={"revision": job["revision"]}).status_code == 409
+                    client.post(
+                        f"/api/job/{PLAYLIST}/save", headers=headers, json={"revision": job["revision"]}
+                    ).status_code
+                    == 409
                 )
                 # Another browser cannot read or save this browser's job.
                 other = TestClient(app)
-                assert other.get("/api/job").status_code == 401
+                assert other.get(f"/api/job/{PLAYLIST}").status_code == 401
                 assert (
-                    other.post("/api/job/save", headers=headers, json={"revision": preview["revision"]}).status_code
+                    other.post(
+                        f"/api/job/{PLAYLIST}/save", headers=headers, json={"revision": preview["revision"]}
+                    ).status_code
                     == 401
                 )
                 other.close()
                 assert (
-                    client.post("/api/job/save", headers=headers, json={"revision": preview["revision"]}).status_code
+                    client.post(
+                        f"/api/job/{PLAYLIST}/save", headers=headers, json={"revision": preview["revision"]}
+                    ).status_code
                     == 202
                 )
-                assert client.get("/api/job").json()["status"] == "saved"
+                assert client.get(f"/api/job/{PLAYLIST}").json()["status"] == "saved"
                 assert current == [SECOND, UNCHECKED, FIRST, None, FIRST]
                 assert current_positions == [2, 1, 0, 3, 4]
                 # Pick the other copy of First, then save again from the current Spotify order.
-                saved = client.get("/api/job").json()
+                saved = client.get(f"/api/job/{PLAYLIST}").json()
                 assert (
                     client.post(
-                        "/api/job/sort",
+                        f"/api/job/{PLAYLIST}/sort",
                         headers=headers,
                         json={"revision": saved["revision"], "first_occurrence": occurrences[4]},
                     ).status_code
                     == 202
                 )
-                second_preview = client.get("/api/job").json()
+                second_preview = client.get(f"/api/job/{PLAYLIST}").json()
                 assert second_preview["sorted_tracks"][0]["occurrence"] == occurrences[4]
                 assert [track["occurrence"] for track in second_preview["tracks"]] == occurrences
                 assert (
                     client.post(
-                        "/api/job/save",
+                        f"/api/job/{PLAYLIST}/save",
                         headers=headers,
                         json={"revision": second_preview["revision"]},
                     ).status_code
@@ -211,20 +227,24 @@ class MigrationTest(unittest.TestCase):
                 )
                 assert current_positions == [4, 1, 0, 3, 2]
                 assert current == [track["id"] for track in second_preview["sorted_tracks"]]
-                saved = client.get("/api/job").json()
+                saved = client.get(f"/api/job/{PLAYLIST}").json()
                 assert saved["can_restore"]
-                assert client.post("/api/job/restore", json={"revision": saved["revision"]}).status_code == 403
+                assert (
+                    client.post(f"/api/job/{PLAYLIST}/restore", json={"revision": saved["revision"]}).status_code == 403
+                )
                 assert (
                     client.post(
-                        "/api/job/restore", headers=headers, json={"revision": second_preview["revision"]}
+                        f"/api/job/{PLAYLIST}/restore", headers=headers, json={"revision": second_preview["revision"]}
                     ).status_code
                     == 409
                 )
                 assert (
-                    client.post("/api/job/restore", headers=headers, json={"revision": saved["revision"]}).status_code
+                    client.post(
+                        f"/api/job/{PLAYLIST}/restore", headers=headers, json={"revision": saved["revision"]}
+                    ).status_code
                     == 202
                 )
-                restored = client.get("/api/job").json()
+                restored = client.get(f"/api/job/{PLAYLIST}").json()
                 assert restored["status"] == "restored"
                 assert not restored["can_restore"]
                 assert restored["first_occurrence"] is None
@@ -232,7 +252,7 @@ class MigrationTest(unittest.TestCase):
                 assert [track["occurrence"] for track in restored["sorted_tracks"]] == target
                 assert (
                     client.post(
-                        "/api/job/restore", headers=headers, json={"revision": restored["revision"]}
+                        f"/api/job/{PLAYLIST}/restore", headers=headers, json={"revision": restored["revision"]}
                     ).status_code
                     == 409
                 )
@@ -249,7 +269,7 @@ class MigrationTest(unittest.TestCase):
                 assert client.get("/api/missing").headers["content-type"] == "application/json"
                 assert client.post("/api/auth/logout", headers=headers).status_code == 200
                 assert client.cookies.get(COOKIE) is None
-                assert client.get("/api/job").status_code == 401
+                assert client.get(f"/api/job/{PLAYLIST}").status_code == 401
 
     def test_unchecked_and_sparse_playlists_remain_visible(self) -> None:
         """Retain all metadata and placeholders when zero or one song can move."""
@@ -278,7 +298,7 @@ class MigrationTest(unittest.TestCase):
                 client.cookies.set(COOKIE, "test-session")
                 headers = {"X-CSRF-Token": session.csrf}
                 assert client.post(f"/api/playlists/{PLAYLIST}/analyze", headers=headers).status_code == 202
-                job = client.get("/api/job").json()
+                job = client.get(f"/api/job/{PLAYLIST}").json()
                 assert job["status"] == "ready"
                 assert job["error"] is None
                 assert len(job["tracks"]) == 5
@@ -302,7 +322,7 @@ class MigrationTest(unittest.TestCase):
                 assert job["sorted_tracks"] == []
                 assert (
                     client.post(
-                        "/api/job/sort",
+                        f"/api/job/{PLAYLIST}/sort",
                         headers=headers,
                         json={"revision": job["revision"], "first_occurrence": job["tracks"][-1]["occurrence"]},
                     ).status_code
@@ -310,7 +330,7 @@ class MigrationTest(unittest.TestCase):
                 )
                 assert (
                     client.post(
-                        "/api/job/save",
+                        f"/api/job/{PLAYLIST}/save",
                         headers=headers,
                         json={"revision": job["revision"]},
                     ).status_code
@@ -389,17 +409,22 @@ class MigrationTest(unittest.TestCase):
             client.cookies.set(COOKIE, "test-session")
             headers = {"X-CSRF-Token": session.csrf}
             client.post(f"/api/playlists/{PLAYLIST}/analyze", headers=headers)
-            loaded = client.get("/api/job").json()
+            loaded = client.get(f"/api/job/{PLAYLIST}").json()
             assert (
-                client.post("/api/job/sort", headers=headers, json={"revision": loaded["revision"]}).status_code == 202
+                client.post(
+                    f"/api/job/{PLAYLIST}/sort", headers=headers, json={"revision": loaded["revision"]}
+                ).status_code
+                == 202
             )
-            original = client.get("/api/job").json()
+            original = client.get(f"/api/job/{PLAYLIST}").json()
             assert original["options"]["preset"] == "steady"
             assert original["first_occurrence"] is None
             assert original["last_occurrence"] is None
             assert original["arrangement"] == {"unchanged": True, "limited": False}
             assert (
-                client.post("/api/job/save", headers=headers, json={"revision": original["revision"]}).status_code
+                client.post(
+                    f"/api/job/{PLAYLIST}/save", headers=headers, json={"revision": original["revision"]}
+                ).status_code
                 == 409
             )
             first = original["tracks"][0]["occurrence"]
@@ -411,13 +436,13 @@ class MigrationTest(unittest.TestCase):
             ):
                 assert (
                     client.post(
-                        "/api/job/sort", headers=headers, json={"revision": original["revision"], **invalid}
+                        f"/api/job/{PLAYLIST}/sort", headers=headers, json={"revision": original["revision"], **invalid}
                     ).status_code
                     == 422
                 )
             assert (
                 client.post(
-                    "/api/job/sort",
+                    f"/api/job/{PLAYLIST}/sort",
                     headers=headers,
                     json={
                         "revision": original["revision"],
@@ -427,7 +452,7 @@ class MigrationTest(unittest.TestCase):
                 ).status_code
                 == 202
             )
-            mixed = client.get("/api/job").json()
+            mixed = client.get(f"/api/job/{PLAYLIST}").json()
             assert mixed["options"] == {"preset": "mixed", "pace": 0.2, "energy": 0.9, "variety": 0.6}
             assert mixed["first_occurrence"] is None
             assert mixed["last_occurrence"] == first
@@ -437,7 +462,7 @@ class MigrationTest(unittest.TestCase):
             fixed = mixed["tracks"][1]["occurrence"]
             assert (
                 client.post(
-                    "/api/job/sort",
+                    f"/api/job/{PLAYLIST}/sort",
                     headers=headers,
                     json={"revision": mixed["revision"], "placements": {first: 0}},
                 ).status_code
@@ -445,18 +470,20 @@ class MigrationTest(unittest.TestCase):
             )
             assert (
                 client.post(
-                    "/api/job/sort",
+                    f"/api/job/{PLAYLIST}/sort",
                     headers=headers,
                     json={"revision": mixed["revision"], "placements": {fixed: 0}},
                 ).status_code
                 == 202
             )
-            placed = client.get("/api/job").json()
+            placed = client.get(f"/api/job/{PLAYLIST}").json()
             assert placed["placements"] == {fixed: 0}
             assert placed["sorted_tracks"][0]["id"] is None
             assert not placed["arrangement"]["unchanged"]
             assert (
-                client.post("/api/job/save", headers=headers, json={"revision": original["revision"]}).status_code
+                client.post(
+                    f"/api/job/{PLAYLIST}/save", headers=headers, json={"revision": original["revision"]}
+                ).status_code
                 == 409
             )
             analyze_audio.assert_called_once()
@@ -498,8 +525,6 @@ class MigrationTest(unittest.TestCase):
 
         app = create_app()
         with (
-            tempfile.TemporaryDirectory() as directory,
-            patch("api.analysis_store._CACHE_FILE", Path(directory) / "cache.json"),
             patch("api.app.get_spotify_client", return_value=sp),
             patch.object(playlist_sorter, "analyze_track", side_effect=analyze),
             TestClient(app) as client,
@@ -512,7 +537,7 @@ class MigrationTest(unittest.TestCase):
             request = requests.submit(client.post, f"/api/playlists/{PLAYLIST}/analyze", headers=headers)
             try:
                 assert started.wait(5)
-                pending = client.get("/api/job").json()
+                pending = client.get(f"/api/job/{PLAYLIST}").json()
                 assert pending["metadata_loaded"]
                 assert pending["status"] == "analyzing"
                 assert [entry["id"] for entry in pending["tracks"]] == [FIRST, None, SECOND, FIRST]
@@ -521,17 +546,19 @@ class MigrationTest(unittest.TestCase):
                 assert pending["kept_count"] == 1
                 assert pending["total"] == 3
                 assert (
-                    client.post("/api/job/sort", headers=headers, json={"revision": pending["revision"]}).status_code
+                    client.post(
+                        f"/api/job/{PLAYLIST}/sort", headers=headers, json={"revision": pending["revision"]}
+                    ).status_code
                     == 409
                 )
                 allow_measure.set()
                 assert measuring.wait(5)
-                assert client.get("/api/job").json()["tracks"][0]["analysis_status"] == "analyzing"
+                assert client.get(f"/api/job/{PLAYLIST}").json()["tracks"][0]["analysis_status"] == "analyzing"
             finally:
                 allow_measure.set()
                 finish.set()
                 assert request.result(timeout=5).status_code == 202
-            result = client.get("/api/job").json()
+            result = client.get(f"/api/job/{PLAYLIST}").json()
             assert result["status"] == "ready"
             assert result["completed"] == result["total"] == 3
             assert (result["analyzed_count"], result["kept_count"]) == (2, 2)
@@ -556,14 +583,17 @@ class MigrationTest(unittest.TestCase):
             client.cookies.set(COOKIE, "test-session")
             headers = {"X-CSRF-Token": session.csrf}
             client.post(f"/api/playlists/{PLAYLIST}/analyze", headers=headers)
-            failed = client.get("/api/job").json()
+            failed = client.get(f"/api/job/{PLAYLIST}").json()
             assert failed["status"] == "error"
             assert failed["metadata_loaded"]
             assert [entry["id"] for entry in failed["tracks"]] == [FIRST, None]
             assert failed["tracks"][0]["analysis_status"] == "error"
             assert failed["tracks"][0]["fixed_reason"] == "Analysis interrupted"
             assert (
-                client.post("/api/job/save", headers=headers, json={"revision": failed["revision"]}).status_code == 409
+                client.post(
+                    f"/api/job/{PLAYLIST}/save", headers=headers, json={"revision": failed["revision"]}
+                ).status_code
+                == 409
             )
             sp.playlist_reorder_items.assert_not_called()
 
@@ -597,8 +627,6 @@ class MigrationTest(unittest.TestCase):
         ]
         app = create_app()
         with (
-            tempfile.TemporaryDirectory() as directory,
-            patch("api.analysis_store._CACHE_FILE", Path(directory) / "cache.json"),
             patch("api.app.get_spotify_client", return_value=sp),
             patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features),
             TestClient(app) as client,
@@ -608,10 +636,10 @@ class MigrationTest(unittest.TestCase):
             client.cookies.set(COOKIE, "test-session")
             headers = {"X-CSRF-Token": session.csrf}
             client.post(f"/api/playlists/{PLAYLIST}/analyze", headers=headers)
-            loaded = client.get("/api/job").json()
+            loaded = client.get(f"/api/job/{PLAYLIST}").json()
             occurrence = loaded["tracks"][0]["occurrence"]
             with patch.object(SpotifyPlaylistSorter, "search_recordings", return_value=candidates) as search:
-                listed = client.get(f"/api/job/matches/{occurrence}", headers=headers)
+                listed = client.get(f"/api/job/{PLAYLIST}/matches/{occurrence}", headers=headers)
                 assert listed.status_code == 200
                 assert [item["video_id"] for item in listed.json()] == ["d" * 11, "e" * 11]
                 search.assert_called_once()
@@ -620,10 +648,10 @@ class MigrationTest(unittest.TestCase):
                 "search_recordings",
                 side_effect=SourceAccessError("source_failed"),
             ):
-                assert client.get(f"/api/job/matches/{occurrence}", headers=headers).status_code == 502
+                assert client.get(f"/api/job/{PLAYLIST}/matches/{occurrence}", headers=headers).status_code == 502
             assert (
                 client.post(
-                    f"/api/job/matches/{occurrence}",
+                    f"/api/job/{PLAYLIST}/matches/{occurrence}",
                     headers=headers,
                     json={"video_id": "bad id"},
                 ).status_code
@@ -632,29 +660,38 @@ class MigrationTest(unittest.TestCase):
             with patch.object(
                 SpotifyPlaylistSorter,
                 "reanalyze_track",
-                side_effect=[(True, "Recording updated."), (False, "Couldn't analyze this recording.")],
+                side_effect=[
+                    (True, "Recording updated."),
+                    (False, "Couldn't analyze this recording."),
+                    (True, "Recording updated."),
+                ],
             ):
-                first = client.post(f"/api/job/matches/{occurrence}", headers=headers, json={"video_id": "d" * 11})
+                first = client.post(
+                    f"/api/job/{PLAYLIST}/matches/{occurrence}", headers=headers, json={"video_id": "d" * 11}
+                )
                 assert first.status_code == 202
-                updated = client.get("/api/job").json()
+                updated = client.get(f"/api/job/{PLAYLIST}").json()
                 assert updated["status"] == "ready"
                 assert updated["sorted_tracks"] == []
                 assert updated["arrangement"] is None
                 assert updated["revision"] != loaded["revision"]
                 assert updated["tracks"][0]["analysis_status"] == "ready"
-                second = client.post(f"/api/job/matches/{occurrence}", headers=headers, json={"video_id": "e" * 11})
+                second = client.post(
+                    f"/api/job/{PLAYLIST}/matches/{occurrence}", headers=headers, json={"video_id": "e" * 11}
+                )
                 assert second.status_code == 202
-                failed_match = client.get("/api/job").json()
-                assert failed_match["status"] == "error"
+                failed_match = client.get(f"/api/job/{PLAYLIST}").json()
+                assert failed_match["status"] == "ready"
                 assert failed_match["tracks"][0]["fixed_reason"] == "Couldn't analyze this recording."
-            assert (
-                client.post(
-                    f"/api/job/matches/{occurrence}",
-                    headers=headers,
-                    json={"video_id": "d" * 11},
-                ).status_code
-                == 409
-            )
+                assert failed_match["tracks"][1]["analysis_status"] == "ready"
+                # A failed rematch leaves the playlist usable, so the same song can be retried.
+                retry = client.post(
+                    f"/api/job/{PLAYLIST}/matches/{occurrence}", headers=headers, json={"video_id": "d" * 11}
+                )
+                assert retry.status_code == 202
+                retried = client.get(f"/api/job/{PLAYLIST}").json()
+                assert retried["status"] == "ready"
+                assert retried["tracks"][0]["analysis_status"] == "ready"
         sp.playlist_reorder_items.assert_not_called()
 
     def test_rematch_deadline_reports_a_timeout(self) -> None:
@@ -668,8 +705,6 @@ class MigrationTest(unittest.TestCase):
         features = {key: {"status": "ready", "tempo": 120.0, "camelot": None, "energy": 0.5} for key in (FIRST, SECOND)}
         app = create_app()
         with (
-            tempfile.TemporaryDirectory() as directory,
-            patch("api.analysis_store._CACHE_FILE", Path(directory) / "cache.json"),
             patch("api.app.get_spotify_client", return_value=sp),
             patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features),
             patch("api.app.REANALYZE_SECONDS", 0.1),
@@ -680,7 +715,7 @@ class MigrationTest(unittest.TestCase):
             client.cookies.set(COOKIE, "test-session")
             headers = {"X-CSRF-Token": session.csrf}
             client.post(f"/api/playlists/{PLAYLIST}/analyze", headers=headers)
-            loaded = client.get("/api/job").json()
+            loaded = client.get(f"/api/job/{PLAYLIST}").json()
             occurrence = loaded["tracks"][0]["occurrence"]
 
             def slow_hydrate(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -690,20 +725,232 @@ class MigrationTest(unittest.TestCase):
             with patch.object(playlist_sorter, "hydrate_candidate", side_effect=slow_hydrate):
                 assert (
                     client.post(
-                        f"/api/job/matches/{occurrence}", headers=headers, json={"video_id": "d" * 11}
+                        f"/api/job/{PLAYLIST}/matches/{occurrence}", headers=headers, json={"video_id": "d" * 11}
                     ).status_code
                     == 202
                 )
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
-                    if client.get("/api/job").json()["status"] == "error":
+                    view = client.get(f"/api/job/{PLAYLIST}").json()
+                    if view["status"] == "ready" and view["tracks"][0]["analysis_status"] == "error":
                         break
                     time.sleep(0.05)
-                timed_out = client.get("/api/job").json()
-                assert timed_out["status"] == "error"
-                assert "took too long" in timed_out["error"]
+                timed_out = client.get(f"/api/job/{PLAYLIST}").json()
+                assert timed_out["status"] == "ready"
+                assert "took too long" in (timed_out["tracks"][0]["fixed_reason"] or "")
                 assert timed_out["tracks"][0]["analysis_status"] == "error"
         sp.playlist_reorder_items.assert_not_called()
+
+    def test_rematches_queue_for_several_songs_at_once(self) -> None:
+        """Queue a rematch for another song while one is still re-analyzing."""
+        sp = Mock()
+        sp.playlist.return_value = {"name": "Batch", "snapshot_id": "snapshot", "owner": {"id": "listener"}}
+        sp.playlist_items.return_value = {
+            "items": [spotify_item(FIRST, "First"), spotify_item(SECOND, "Second")],
+            "next": None,
+        }
+        features = {key: {"status": "ready", "tempo": 120.0, "camelot": None, "energy": 0.5} for key in (FIRST, SECOND)}
+        started, allow = Event(), Event()
+
+        def slow_reanalyze(
+            self: SpotifyPlaylistSorter,  # noqa: ARG001 - self arrives via autospec, not used.
+            entry: dict[str, Any],
+            *_args: object,
+            **_kwargs: object,
+        ) -> tuple[bool, str]:
+            if entry["id"] == FIRST:
+                started.set()
+                assert allow.wait(5)
+            return True, "Recording updated."
+
+        app = create_app()
+        with (
+            patch("api.app.get_spotify_client", return_value=sp),
+            patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features),
+            patch.object(SpotifyPlaylistSorter, "reanalyze_track", autospec=True, side_effect=slow_reanalyze),
+            TestClient(app) as client,
+            ThreadPoolExecutor(max_workers=1) as requests,
+        ):
+            session = Session(auth=Mock(), state="", user={"id": "listener"})
+            app.state.sessions["test-session"] = session
+            client.cookies.set(COOKIE, "test-session")
+            headers = {"X-CSRF-Token": session.csrf}
+            client.post(f"/api/playlists/{PLAYLIST}/analyze", headers=headers)
+            loaded = client.get(f"/api/job/{PLAYLIST}").json()
+            first_occurrence, second_occurrence = (track["occurrence"] for track in loaded["tracks"])
+
+            request = requests.submit(
+                client.post,
+                f"/api/job/{PLAYLIST}/matches/{first_occurrence}",
+                headers=headers,
+                json={"video_id": "d" * 11},
+            )
+            try:
+                assert started.wait(5)
+                queued = client.post(
+                    f"/api/job/{PLAYLIST}/matches/{second_occurrence}", headers=headers, json={"video_id": "e" * 11}
+                )
+                assert queued.status_code == 202
+                batched = queued.json()
+                assert batched["status"] == "analyzing"
+                assert batched["rematching"] is True
+                assert [track["analysis_status"] for track in batched["tracks"]] == ["matching", "matching"]
+            finally:
+                allow.set()
+                assert request.result(timeout=10).status_code == 202
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    view = client.get(f"/api/job/{PLAYLIST}").json()
+                    if view["status"] == "ready" and view["tracks"][1]["analysis_status"] == "ready":
+                        break
+                    time.sleep(0.05)
+                finished = client.get(f"/api/job/{PLAYLIST}").json()
+                assert finished["status"] == "ready"
+                assert finished["rematching"] is False
+                assert [track["analysis_status"] for track in finished["tracks"]] == ["ready", "ready"]
+        sp.playlist_reorder_items.assert_not_called()
+
+    def test_queue_orders_playlists_and_prioritizes_manual_remaches(self) -> None:
+        """Queue several playlists, list them, and run a manual rematch before later analyses."""
+        first, second, other = "p" * 22, "q" * 22, "r" * 22
+        sp = Mock()
+        sp.playlist.side_effect = lambda playlist_id, **_: {
+            first: {"name": "First", "snapshot_id": "snapshot", "owner": {"id": "listener"}},
+            second: {"name": "Second", "snapshot_id": "snapshot", "owner": {"id": "listener"}},
+            other: {"name": "Other", "snapshot_id": "snapshot", "owner": {"id": "listener"}},
+        }[playlist_id]
+        sp.playlist_items.return_value = {
+            "items": [spotify_item(FIRST, "First"), spotify_item(SECOND, "Second")],
+            "next": None,
+        }
+        features = {key: {"status": "ready", "tempo": 120.0, "camelot": None, "energy": 0.5} for key in (FIRST, SECOND)}
+        started, allow = Event(), Event()
+
+        def analyze_audio(self: SpotifyPlaylistSorter, *_args: object, **_kwargs: object) -> dict[str, dict[str, Any]]:
+            if self.playlist_id == first:
+                started.set()
+                assert allow.wait(5)
+            return {key: features[key] for key in (FIRST, SECOND)}
+
+        app = create_app()
+        with (
+            patch("api.app.get_spotify_client", return_value=sp),
+            patch.object(
+                SpotifyPlaylistSorter, "_fetch_audio_features_local", autospec=True, side_effect=analyze_audio
+            ),
+            patch.object(SpotifyPlaylistSorter, "reanalyze_track", return_value=(True, "Recording updated.")),
+            TestClient(app) as client,
+            ThreadPoolExecutor(max_workers=1) as requests,
+        ):
+            session = Session(auth=Mock(), state="", user={"id": "listener"})
+            app.state.sessions["test-session"] = session
+            client.cookies.set(COOKIE, "test-session")
+            headers = {"X-CSRF-Token": session.csrf}
+
+            # Load `other` fully first, so a later rematch on it has a ready job.
+            assert client.post(f"/api/playlists/{other}/analyze", headers=headers).status_code == 202
+            ready = client.get(f"/api/job/{other}").json()
+            assert ready["status"] == "ready"
+            occurrence = ready["tracks"][0]["occurrence"]
+
+            request = requests.submit(client.post, f"/api/playlists/{first}/analyze", headers=headers)
+            try:
+                assert started.wait(5)
+                while client.post(f"/api/playlists/{second}/analyze", headers=headers).status_code != 202:
+                    time.sleep(0.05)
+                queued = client.get(f"/api/job/{second}").json()
+                assert queued["status"] == "analyzing"
+                assert queued["queue_position"] == 1
+                overview = client.get("/api/queue", headers=headers).json()
+                assert [(entry["playlist_id"], entry["status"], entry["queue_position"]) for entry in overview] == [
+                    (first, "running", None),
+                    (second, "queued", 1),
+                ]
+                assert (
+                    client.post(
+                        f"/api/job/{other}/matches/{occurrence}", headers=headers, json={"video_id": "d" * 11}
+                    ).status_code
+                    == 202
+                )
+                rematch_view = client.get(f"/api/job/{other}").json()
+                assert rematch_view["tracks"][0]["analysis_status"] == "matching"
+                overview = client.get("/api/queue", headers=headers).json()
+                assert [entry["playlist_id"] for entry in overview] == [first, second]
+            finally:
+                allow.set()
+                assert request.result(timeout=10).status_code == 202
+            # The rematch ran ahead of the queued playlist analysis.
+            assert client.get(f"/api/job/{other}").json()["status"] == "ready"
+            after = client.get(f"/api/job/{second}").json()
+            assert after["status"] == "ready"
+            assert client.get("/api/queue", headers=headers).json() == []
+
+    def test_revisit_serves_the_stored_analysis_until_spotify_changes(self) -> None:
+        """An unchanged playlist views its last analysis instantly; changes mark it stale."""
+        sp = Mock()
+        snapshot = {"snapshot_id": "snapshot-1"}
+        sp.playlist.side_effect = lambda *_args, **_kwargs: {
+            "name": "Evening",
+            "owner": {"id": "listener"},
+            **snapshot,
+        }
+        sp.playlist_items.return_value = {
+            "items": [spotify_item(FIRST, "First"), spotify_item(SECOND, "Second")],
+            "next": None,
+        }
+        features = {key: {"status": "ready", "tempo": 120.0, "camelot": None, "energy": 0.5} for key in (FIRST, SECOND)}
+        oauth = Mock()
+        oauth.get_authorize_url.side_effect = lambda *, state: f"https://accounts.spotify.com/authorize?state={state}"
+        oauth.get_access_token = Mock(return_value="test-token")
+        sp.current_user.return_value = {"id": "listener", "display_name": "A listener"}
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch("api.app.is_configured", return_value=True),
+            patch("api.app.get_redirect_uri", return_value="http://127.0.0.1:5178/api/auth/callback"),
+            patch("api.app.get_auth_manager", return_value=oauth),
+            patch("api.app.get_spotify_client", return_value=sp),
+            patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features),
+        ):
+            directory = Path(temp)
+            (directory / "index.html").write_text("<html>Playlist sorter</html>")
+            app = create_app(directory)
+            with TestClient(app) as client:
+                login = client.get("/api/auth/login", follow_redirects=False)
+                state = parse_qs(urlparse(login.headers["location"]).query)["state"][0]
+                client.get(f"/api/auth/callback?code=test&state={state}", follow_redirects=False)
+                session = client.get("/api/session").json()
+                headers = {"X-CSRF-Token": session["csrf"]}
+                cookie = client.cookies.get(COOKIE)
+                assert client.post(f"/api/playlists/{PLAYLIST}/analyze", headers=headers).status_code == 202
+                assert client.get(f"/api/job/{PLAYLIST}").json()["status"] == "ready"
+                assert client.get(f"/api/job/{PLAYLIST}").json()["status"] == "ready"
+
+            # A reload keeps the login and serves the stored analysis without re-running it.
+            with TestClient(app) as client:
+                assert cookie is not None
+                client.cookies.set(COOKIE, cookie)
+                viewed = client.get(f"/api/job/{PLAYLIST}").json()
+                assert viewed["status"] == "ready"
+                assert viewed["stale"] is False
+                assert viewed["stored"] is True
+                assert viewed["can_restore"] is False
+                assert [track["id"] for track in viewed["tracks"]] == [FIRST, SECOND]
+                assert (
+                    client.post(
+                        f"/api/job/{PLAYLIST}/sort", headers=headers, json={"revision": viewed["revision"]}
+                    ).status_code
+                    == 409
+                )
+                # The revisit explains itself instead of claiming no analysis exists.
+                matches = client.get(
+                    f"/api/job/{PLAYLIST}/matches/{viewed['tracks'][0]['occurrence']}", headers=headers
+                )
+                assert matches.status_code == 409
+                assert matches.json()["detail"] == "Re-analyze the playlist to check its recordings."
+                snapshot["snapshot_id"] = "snapshot-2"
+                stale = client.get(f"/api/job/{PLAYLIST}").json()
+                assert stale["status"] == "ready"
+                assert stale["stale"] is True
 
     def test_revoked_login_clears_the_browser_session(self) -> None:
         """A revoked refresh token must not leave the browser stuck in a login loop."""
@@ -715,7 +962,7 @@ class MigrationTest(unittest.TestCase):
             client.cookies.set(COOKIE, "test-session")
             assert client.get("/api/playlists").status_code == 401
             assert client.get("/api/session").json()["user"] is None
-            assert client.get("/api/job").status_code == 401
+            assert client.get(f"/api/job/{PLAYLIST}").status_code == 401
 
     def test_localhost_login_sets_the_cookie_on_the_callback_host(self) -> None:
         """Normalize the hostname before OAuth so the callback receives its session cookie."""

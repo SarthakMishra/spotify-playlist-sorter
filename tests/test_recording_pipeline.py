@@ -9,13 +9,13 @@ import unittest
 from pathlib import Path
 from threading import Barrier, Event, Thread
 from time import sleep
-from typing import Any
+from typing import Any, override
 from unittest.mock import Mock, patch
 
 import numpy as np
 import yt_dlp
 
-from api import playlist_sorter, recording_match
+from api import playlist_sorter, recording_match, store
 from api.youtube import youtube_options
 
 TRACK = {"id": "a", "Track": "Example", "Artist": "Artist", "album": "Album", "duration_ms": 180000}
@@ -42,6 +42,15 @@ def stub_analysis(rms_db: float | None = None) -> dict[str, Any]:
 
 class RecordingPipelineTest(unittest.TestCase):
     """Catch false uncertainty and excessive candidate extraction at the recording boundary."""
+
+    @override
+    def setUp(self) -> None:
+        """Keep the analysis cache in a temporary database for every test."""
+        store.configure(Path(self.enterContext(tempfile.TemporaryDirectory())) / "store.db")
+
+    @override
+    def tearDown(self) -> None:
+        store.close()
 
     def test_best_effort_accepts_official_soundtracks_with_incomplete_credits(self) -> None:
         """Replay observed official uploads with absent credits or modest duration differences."""
@@ -628,8 +637,6 @@ class RecordingPipelineTest(unittest.TestCase):
         for message, reason in (("Sign in to confirm you're not a bot", "sign_in"), ("HTTP Error 429", "rate_limit")):
             with (
                 self.subTest(reason=reason),
-                tempfile.TemporaryDirectory() as directory,
-                patch("api.analysis_store._CACHE_FILE", Path(directory) / "cache.json"),
                 patch.object(recording_match._WorkerScale, "_machine_limit", return_value=2),
                 patch.object(
                     yt_dlp.YoutubeDL, "extract_info", side_effect=yt_dlp.utils.DownloadError(message)

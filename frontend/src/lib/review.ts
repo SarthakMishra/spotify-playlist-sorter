@@ -14,8 +14,8 @@ export function measuredIntensity(track: Track): number | null {
 
 export function intensityLabel(value: number | null): string {
   if (value === null) return "Unavailable"
-  if (value < 1 / 3) return "Lower"
-  return value < 2 / 3 ? "Moderate" : "Higher"
+  if (value < 1 / 3) return "Low"
+  return value < 2 / 3 ? "Mid" : "High"
 }
 
 export function elapsedTime(milliseconds: number): string {

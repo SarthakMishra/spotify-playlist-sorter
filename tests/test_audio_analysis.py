@@ -10,14 +10,14 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 from unittest.mock import Mock, patch
 
 import numpy as np
 import soundfile as sf
 import yt_dlp
 
-from api import analysis_store, audio_analysis, playlist_sorter, recording_match
+from api import audio_analysis, playlist_sorter, recording_match, store
 from api.analysis_store import RecordingAnalysis, SectionMeasurements
 
 
@@ -71,6 +71,15 @@ def full_sections(wave: np.ndarray, sr: int = audio_analysis.SAMPLE_RATE) -> lis
 
 class AudioAnalysisTest(unittest.TestCase):
     """Check measured audio values rather than merely successful extraction."""
+
+    @override
+    def setUp(self) -> None:
+        """Keep the analysis cache in a temporary database for every test."""
+        store.configure(Path(self.enterContext(tempfile.TemporaryDirectory())) / "store.db")
+
+    @override
+    def tearDown(self) -> None:
+        store.close()
 
     def test_pitch_classes_and_resampling_amplitude(self) -> None:
         """A is pitch class nine and resampling preserves level after truncation."""
@@ -292,75 +301,65 @@ class AudioAnalysisTest(unittest.TestCase):
     def test_cache_reuse_invalidation_and_raw_measurements(self) -> None:
         """Cache a recording once, preserve raw values, and reject stale input/source versions."""
         tracks = [{"id": key, "Track": "Example", "Artist": "Artist", "duration_ms": 180000} for key in ("a", "b", "a")]
-        with (
-            tempfile.TemporaryDirectory() as directory,
-            patch.object(analysis_store, "_CACHE_FILE", Path(directory) / "cache.json"),
-        ):
-            cache_file = analysis_store._CACHE_FILE
-            cache_file.write_text('{"a": {"tempo": 120}}', encoding="utf-8")
-            assert playlist_sorter._load_cache() == {}
-            sorter = playlist_sorter.SpotifyPlaylistSorter("playlist", Mock())
-            progress = Mock()
-            with patch.object(playlist_sorter, "analyze_track", side_effect=recording) as analyze:
-                first = sorter._fetch_audio_features_local(tracks, progress)
-                assert analyze.call_count == 2
-                assert sorter.recording_count == 2
-                assert sorter.cached_count == 0
-                assert progress.call_args.args == (3, 3)
-                raw = copy.deepcopy(playlist_sorter._load_cache())
-                assert "energy" not in raw["a"]
-                analyze.reset_mock()
-                assert sorter._fetch_audio_features_local(tracks) == first
-                assert sorter.cached_count == 3
-                analyze.assert_not_called()
-                assert playlist_sorter._load_cache() == raw
-                unknown_activity = copy.deepcopy(raw)
-                unknown_activity["a"]["analysis"]["summary"]["onset"] = None
-                unknown_activity["b"]["analysis"]["summary"]["onset"] = 4.0
-                assert playlist_sorter._with_intensity(unknown_activity)["a"]["energy"] == 0.2
-                unmeasured = copy.deepcopy(raw)
-                unmeasured["a"]["analysis"]["summary"]["evidence"]["rms_db"] = 0.0
-                unmeasured["a"]["analysis"]["summary"]["evidence"]["onset"] = 0.0
-                assert playlist_sorter._with_intensity(unmeasured)["a"]["energy"] == 0.5
-                changed = [{**track, "Track": "Changed"} if track["id"] == "a" else track for track in tracks]
-                sorter._fetch_audio_features_local(changed)
-                assert analyze.call_count == 1
-                analyze.reset_mock()
-                data = json.loads(cache_file.read_text())
-                data["records"]["a"]["source"]["id"] = "changed-id1"
-                cache_file.write_text(json.dumps(data), encoding="utf-8")
-                sorter._fetch_audio_features_local(changed)
-                assert analyze.call_count == 1
-                analyze.reset_mock()
-                data = json.loads(cache_file.read_text())
-                data["analysis_version"] = "old-version"
-                cache_file.write_text(json.dumps(data), encoding="utf-8")
-                sorter._fetch_audio_features_local(changed)
-                assert analyze.call_count == 2
+        assert playlist_sorter._load_cache() == {}
+        sorter = playlist_sorter.SpotifyPlaylistSorter("playlist", Mock())
+        progress = Mock()
+        with patch.object(playlist_sorter, "analyze_track", side_effect=recording) as analyze:
+            first = sorter._fetch_audio_features_local(tracks, progress)
+            assert analyze.call_count == 2
+            assert sorter.recording_count == 2
+            assert sorter.cached_count == 0
+            assert progress.call_args.args == (3, 3)
+            raw = copy.deepcopy(playlist_sorter._load_cache())
+            assert "energy" not in raw["a"]
+            analyze.reset_mock()
+            assert sorter._fetch_audio_features_local(tracks) == first
+            assert sorter.cached_count == 3
+            analyze.assert_not_called()
+            assert playlist_sorter._load_cache() == raw
+            unknown_activity = copy.deepcopy(raw)
+            unknown_activity["a"]["analysis"]["summary"]["onset"] = None
+            unknown_activity["b"]["analysis"]["summary"]["onset"] = 4.0
+            assert playlist_sorter._with_intensity(unknown_activity)["a"]["energy"] == 0.2
+            unmeasured = copy.deepcopy(raw)
+            unmeasured["a"]["analysis"]["summary"]["evidence"]["rms_db"] = 0.0
+            unmeasured["a"]["analysis"]["summary"]["evidence"]["onset"] = 0.0
+            assert playlist_sorter._with_intensity(unmeasured)["a"]["energy"] == 0.5
+            changed = [{**track, "Track": "Changed"} if track["id"] == "a" else track for track in tracks]
+            sorter._fetch_audio_features_local(changed)
+            assert analyze.call_count == 1
+            analyze.reset_mock()
+            changed_record = json.loads(store.cache_records()["a"])
+            changed_record["source"]["id"] = "changed-id1"
+            store.save_cache_records({"a": json.dumps(changed_record)})
+            sorter._fetch_audio_features_local(changed)
+            assert analyze.call_count == 1
+            analyze.reset_mock()
+            store.reset_cache({"analysis_version": "old-version"}, {})
+            sorter._fetch_audio_features_local(changed)
+            assert analyze.call_count == 2
 
-    def test_cache_checkpoints_and_atomic_replacement(self) -> None:
-        """Keep completed analyses on interruption and the prior cache on replacement failure."""
+    def test_cache_checkpoints_keep_the_prior_records_on_failure(self) -> None:
+        """Keep completed analyses on interruption and the prior cache on a write failure."""
         tracks = [{"id": str(i), "Track": "Example", "Artist": "Artist", "duration_ms": 180000} for i in range(11)]
+        sorter = playlist_sorter.SpotifyPlaylistSorter("playlist", Mock())
+
+        def interrupt(done: int, total: int) -> None:
+            if done == total:
+                raise InterruptedError
+
         with (
-            tempfile.TemporaryDirectory() as directory,
-            patch.object(analysis_store, "_CACHE_FILE", Path(directory) / "cache.json"),
+            patch.object(playlist_sorter, "analyze_track", side_effect=recording),
+            patch.object(playlist_sorter, "_save_cache", wraps=playlist_sorter._save_cache) as save,
+            self.assertRaises(InterruptedError),
         ):
-            sorter = playlist_sorter.SpotifyPlaylistSorter("playlist", Mock())
-
-            def interrupt(done: int, total: int) -> None:
-                if done == total:
-                    raise InterruptedError
-
-            with (
-                patch.object(playlist_sorter, "analyze_track", side_effect=recording),
-                patch.object(playlist_sorter, "_save_cache", wraps=playlist_sorter._save_cache) as save,
-                self.assertRaises(InterruptedError),
-            ):
-                sorter._fetch_audio_features_local(tracks, interrupt)
-            assert save.call_count == 2
-            assert len(playlist_sorter._load_cache()) == 11
-            previous = analysis_store._CACHE_FILE.read_bytes()
-            with patch.object(Path, "replace", side_effect=OSError("Disk failure")), self.assertRaises(OSError):
-                playlist_sorter._save_cache({})
-            assert analysis_store._CACHE_FILE.read_bytes() == previous
-            assert list(Path(directory).iterdir()) == [analysis_store._CACHE_FILE]
+            sorter._fetch_audio_features_local(tracks, interrupt)
+        assert save.call_count == 2
+        assert len(playlist_sorter._load_cache()) == 11
+        previous = playlist_sorter._load_cache()
+        with (
+            patch.object(store, "save_cache_records", side_effect=OSError("Disk failure")),
+            self.assertRaises(OSError),
+        ):
+            playlist_sorter._save_cache({})
+        assert playlist_sorter._load_cache() == previous

@@ -98,6 +98,23 @@ function Shell() {
             Playlist sorter
           </Link>
           <div className="flex items-center gap-1 max-sm:w-full max-sm:justify-end">
+            {session.user && (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label="Analysis queue"
+                      render={<Link to="/queue" />}
+                    />
+                  }
+                >
+                  <ListMusic aria-hidden="true" />
+                </TooltipTrigger>
+                <TooltipContent>Analysis queue</TooltipContent>
+              </Tooltip>
+            )}
             <ModeToggle />
             {session.user && (
               <Tooltip>
@@ -331,12 +348,19 @@ export const router = createBrowserRouter([
           { index: true, Component: PlaylistList },
           {
             path: ":playlistId",
-            loader: ({ request }) => getJob({ signal: request.signal }),
+            loader: ({ request, params }) =>
+              getJob(params["playlistId"] ?? "", { signal: request.signal }),
             lazy: async () => ({
               Component: (await import("@/components/playlist-page")).PlaylistRoute,
             }),
           },
         ],
+      },
+      {
+        path: "queue",
+        lazy: async () => ({
+          Component: (await import("@/components/queue-page")).QueueRoute,
+        }),
       },
       {
         path: "*",

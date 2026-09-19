@@ -141,10 +141,10 @@ class SpotifyPlaylistSorter:
         record_callback: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Share recording work across occurrences and checkpoint successful raw analyses."""
-        cache = _load_cache()
+        unique = {track["id"]: track for track in tracks}
+        cache = _load_cache(list(unique))
         report_record = record_callback or (lambda _key, _result: None)
         report_progress = progress_callback or (lambda _done, _total: None)
-        unique = {track["id"]: track for track in tracks}
         counts = Counter(track["id"] for track in tracks)
         results = {key: cache[key] for key, track in unique.items() if _cache_matches(cache.get(key), _metadata(track))}
         completed = sum(counts[key] for key in results)
@@ -175,7 +175,7 @@ class SpotifyPlaylistSorter:
                 stopped.set()
             return result
 
-        dirty = 0
+        pending: dict[str, dict[str, Any]] = {}
         try:
             # ponytail: several sampled windows per worker stay small; measure memory before raising limits.
             with ThreadPoolExecutor(max_workers=scale.limit) as executor:
@@ -198,15 +198,15 @@ class SpotifyPlaylistSorter:
                     gate.target = scale.target
                     if result.get("status") == "ready":
                         cache[key] = result
-                        dirty += 1
-                        if dirty >= _CACHE_CHECKPOINT:
-                            _save_cache(cache)
-                            dirty = 0
+                        pending[key] = result
+                        if len(pending) >= _CACHE_CHECKPOINT:
+                            _save_cache(pending)
+                            pending.clear()
                     completed += counts[key]
                     report_progress(completed, len(tracks))
         finally:
-            if dirty:
-                _save_cache(cache)
+            if pending:
+                _save_cache(pending)
         return _with_intensity(results)
 
     def reanalyze_track(
@@ -240,9 +240,7 @@ class SpotifyPlaylistSorter:
             ) if failure else "Couldn't analyze this recording."
         if expired():
             return False, "This took too long. Try again shortly."
-        cache = _load_cache()
-        cache[entry["id"]] = record
-        _save_cache(cache)
+        _save_cache({entry["id"]: record})
         processed = _with_intensity({**self.audio_features, entry["id"]: record})
         self.audio_features = processed
         features = processed.get(entry["id"], {})
@@ -254,7 +252,8 @@ class SpotifyPlaylistSorter:
         self.arrangement_stamp = None
         self.arrangement_results.clear()
         self.arrangement_result = {}
-        self.invalidate_save()
+        # Spotify's order is untouched by a re-measurement; the save-time readback
+        # still verifies the live snapshot, so the next save needs no re-analysis.
         notify(entry["id"], {"status": "ready"})
         return True, "Recording updated."
 

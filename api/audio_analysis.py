@@ -21,8 +21,12 @@ MIN_BPM, MAX_BPM = 40, 240
 MIN_PERIODICITY = 0.25
 TEMPO_SEPARATION = 0.15
 MIN_KEY_PITCHES = 3
-MIN_CHROMA_WEIGHT, MIN_CHROMA_SPREAD = 0.1, 0.01
-MIN_KEY_CORRELATION, MIN_KEY_MARGIN = 0.6, 0.1
+# 0.085 sits just above the uniform-chroma baseline (1/12), so full mixes pass
+# while a single dominant pitch cannot; real songs rarely hold 3 bins above 0.1.
+MIN_CHROMA_WEIGHT, MIN_CHROMA_SPREAD = 0.085, 0.01
+# The runner-up is usually the relative minor/major, which correlates almost as
+# highly as the winner; margins above ~0.02 reject nearly every real song.
+MIN_KEY_CORRELATION, MIN_KEY_MARGIN = 0.55, 0.02
 SILENCE_RMS = 1e-5
 SECTION_SECONDS = 20
 FULL_TRACK_SECONDS = 60
@@ -38,7 +42,7 @@ SETTINGS = {
     "max_seconds": MAX_SECONDS,
     "decode_block_seconds": 5,
 }
-ANALYSIS_VERSION = f"librosa-{version('librosa')}-sections-6"
+ANALYSIS_VERSION = f"librosa-{version('librosa')}-sections-7"
 
 # Mapping from (pitch_class, mode) -> Camelot key
 # pitch_class: 0=C, 1=C#, 2=D, ... 11=B  |  mode: 0=minor, 1=major

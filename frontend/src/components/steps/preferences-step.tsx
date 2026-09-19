@@ -116,11 +116,13 @@ export function PreferencesStep({
   fixedLast,
   fixedTracks,
   total,
+  attentionCount,
   placements,
   onPlacementsChange,
   placementConflict,
   hasPreview,
   onArrange,
+  onCheckTracks,
 }: {
   preferences: Options
   onPreferencesChange: (preferences: Options) => void
@@ -135,11 +137,13 @@ export function PreferencesStep({
   fixedLast: Track | null
   fixedTracks: Track[]
   total: number
+  attentionCount: number
   placements: Record<string, number>
   onPlacementsChange: (placements: Record<string, number>) => void
   placementConflict: string | null
   hasPreview: boolean
   onArrange: () => void
+  onCheckTracks: () => void
 }) {
   const [placementChoice, setPlacementChoice] = useState<Record<string, PlacementChoice>>({})
   const [customPositions, setCustomPositions] = useState<Record<string, number>>({})
@@ -284,6 +288,19 @@ export function PreferencesStep({
       <Collapsible open={moreOpen} onOpenChange={setMoreOpen}>
         <CollapsibleContent>
           <div className="mb-3 animate-in space-y-5 rounded-xl border bg-muted/20 p-4 duration-150 ease-out fade-in-0">
+            {attentionCount > 0 && (
+              <div className="space-y-2">
+                <p className="text-sm font-medium">Songs needing a look</p>
+                <p className="text-xs text-muted-foreground">
+                  {attentionCount === 1
+                    ? "1 song has a recording match worth fixing before arranging."
+                    : `${attentionCount} songs have recording matches worth fixing before arranging.`}
+                </p>
+                <Button variant="outline" size="sm" onClick={onCheckTracks}>
+                  Fix matches
+                </Button>
+              </div>
+            )}
             <div className="space-y-2">
               <SongPicker
                 id="first-song"

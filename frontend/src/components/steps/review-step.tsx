@@ -11,7 +11,6 @@ import {
   TableRow,
   TableHeader,
 } from "@/components/ui/table"
-import { cn } from "cn"
 import { StatusBadge } from "@/components/steps/check-step"
 import type { Job, ReviewHighlight, Track } from "@/lib/api"
 import { measuredIntensity, intensityLabel } from "@/lib/review"
@@ -44,19 +43,8 @@ function IntensityCell({ track }: { track: Track }) {
       </span>
     )
   return (
-    <span className="flex items-center gap-1.5" aria-label={`Intensity: ${label}`}>
-      <span
-        aria-hidden="true"
-        className={cn(
-          "inline-block size-2 rounded-full",
-          intensity < 1 / 3
-            ? "bg-foreground/30"
-            : intensity < 2 / 3
-              ? "bg-foreground/60"
-              : "bg-foreground",
-        )}
-      />
-      <span className="text-xs text-muted-foreground">{label}</span>
+    <span className="text-xs text-muted-foreground" aria-label={`Intensity: ${label}`}>
+      {label}
     </span>
   )
 }
@@ -117,9 +105,7 @@ function SongList({
           <TableHead className="w-10">#</TableHead>
           <TableHead>Song</TableHead>
           <TableHead className="w-24 text-right">Key · BPM</TableHead>
-          <TableHead className="w-20">
-            <span className="sr-only">Intensity</span>
-          </TableHead>
+          <TableHead className="w-20 text-right">Intensity</TableHead>
           <TableHead className="w-14 text-right">Was</TableHead>
           <TableHead className="w-14">
             <span className="sr-only">Analysis status</span>
@@ -148,7 +134,7 @@ function SongList({
                 <TableCell className="py-2.5 text-right align-top">
                   <SoundCell track={track} />
                 </TableCell>
-                <TableCell className="py-2.5 align-top">
+                <TableCell className="py-2.5 text-right align-top">
                   <IntensityCell track={track} />
                 </TableCell>
                 <TableCell className="py-2.5 text-right align-top tabular-nums">
