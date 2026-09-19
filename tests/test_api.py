@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlparse
 from fastapi.testclient import TestClient
 from spotipy.exceptions import SpotifyOauthError
 
+from api import playlist_sorter
 from api.app import COOKIE, Session, create_app
 from api.playlist_sorter import SpotifyPlaylistSorter
 from api.youtube import SourceAccessError
@@ -498,9 +499,9 @@ class MigrationTest(unittest.TestCase):
         app = create_app()
         with (
             tempfile.TemporaryDirectory() as directory,
-            patch("api.playlist_sorter._CACHE_FILE", Path(directory) / "cache.json"),
+            patch("api.analysis_store._CACHE_FILE", Path(directory) / "cache.json"),
             patch("api.app.get_spotify_client", return_value=sp),
-            patch.object(SpotifyPlaylistSorter, "_analyze_track", side_effect=analyze),
+            patch.object(playlist_sorter, "analyze_track", side_effect=analyze),
             TestClient(app) as client,
             ThreadPoolExecutor(max_workers=1) as requests,
         ):
@@ -569,7 +570,8 @@ class MigrationTest(unittest.TestCase):
     def test_match_review_searches_and_applies_a_chosen_recording(self) -> None:
         """Expose candidates per occurrence and reanalyze one song with a listener-chosen video."""
         sp = Mock()
-        sp.playlist.return_value = {"name": "Check", "snapshot_id": "snapshot", "owner": {"id": "listener"}}
+        # Spotify snapshot ids can contain slashes; occurrences must survive the URL path.
+        sp.playlist.return_value = {"name": "Check", "snapshot_id": "snapshot/a/b", "owner": {"id": "listener"}}
         sp.playlist_items.return_value = {
             "items": [spotify_item(FIRST, "First"), spotify_item(SECOND, "Second")],
             "next": None,
@@ -596,7 +598,7 @@ class MigrationTest(unittest.TestCase):
         app = create_app()
         with (
             tempfile.TemporaryDirectory() as directory,
-            patch("api.playlist_sorter._CACHE_FILE", Path(directory) / "cache.json"),
+            patch("api.analysis_store._CACHE_FILE", Path(directory) / "cache.json"),
             patch("api.app.get_spotify_client", return_value=sp),
             patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features),
             TestClient(app) as client,
@@ -667,7 +669,7 @@ class MigrationTest(unittest.TestCase):
         app = create_app()
         with (
             tempfile.TemporaryDirectory() as directory,
-            patch("api.playlist_sorter._CACHE_FILE", Path(directory) / "cache.json"),
+            patch("api.analysis_store._CACHE_FILE", Path(directory) / "cache.json"),
             patch("api.app.get_spotify_client", return_value=sp),
             patch.object(SpotifyPlaylistSorter, "_fetch_audio_features_local", return_value=features),
             patch("api.app.REANALYZE_SECONDS", 0.1),
@@ -685,7 +687,7 @@ class MigrationTest(unittest.TestCase):
                 time.sleep(0.3)
                 return {"id": candidate["id"]}
 
-            with patch.object(SpotifyPlaylistSorter, "_hydrate_candidate", side_effect=slow_hydrate):
+            with patch.object(playlist_sorter, "hydrate_candidate", side_effect=slow_hydrate):
                 assert (
                     client.post(
                         f"/api/job/matches/{occurrence}", headers=headers, json={"video_id": "d" * 11}

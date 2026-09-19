@@ -20,6 +20,7 @@ import {
 import { Slider } from "@/components/ui/slider"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import type { Options, Preset, Track } from "@/lib/api"
+import { placementTargets, resolvePlacement, slotTaken } from "@/lib/placement"
 import { PRESETS, SLIDERS, describeSlider, luckyPreferences, presetValues } from "@/lib/preferences"
 
 type PlacementChoice = "keep" | "top" | "bottom" | "custom"
@@ -115,8 +116,7 @@ export function PreferencesStep({
   fixedLast,
   fixedTracks,
   total,
-  placementTargets,
-  slotTaken,
+  placements,
   onPlacementsChange,
   placementConflict,
   hasPreview,
@@ -135,8 +135,7 @@ export function PreferencesStep({
   fixedLast: Track | null
   fixedTracks: Track[]
   total: number
-  placementTargets: Map<string, number>
-  slotTaken: (slot: number, except: Track) => boolean
+  placements: Record<string, number>
   onPlacementsChange: (placements: Record<string, number>) => void
   placementConflict: string | null
   hasPreview: boolean
@@ -151,6 +150,8 @@ export function PreferencesStep({
   useEffect(() => {
     heading.current?.focus()
   }, [])
+  const targets = placementTargets(fixedTracks, placements, total)
+  const taken = (slot: number, except: Track) => slotTaken(targets, except.occurrence, slot)
 
   function setPreset(preset: Preset) {
     onPreferencesChange({ ...presetValues(preset), preset })
@@ -165,12 +166,12 @@ export function PreferencesStep({
     setCustomPositions(nextCustom)
     const nextPlacement: Record<string, number> = {}
     for (const track of fixedTracks) {
-      const choice = nextChoice[track.occurrence] ?? defaultPlacement
-      const custom = nextCustom[track.occurrence] ?? track.original_position + 1
-      if (choice === "top") nextPlacement[track.occurrence] = 0
-      else if (choice === "bottom") nextPlacement[track.occurrence] = total - 1
-      else if (choice === "custom")
-        nextPlacement[track.occurrence] = Math.min(Math.max(custom, 1), Math.max(total, 1)) - 1
+      const target = resolvePlacement(
+        nextChoice[track.occurrence] ?? defaultPlacement,
+        nextCustom[track.occurrence] ?? track.original_position + 1,
+        total,
+      )
+      if (target !== null) nextPlacement[track.occurrence] = target
     }
     onPlacementsChange(nextPlacement)
   }
@@ -355,7 +356,7 @@ export function PreferencesStep({
                         const choice = placementChoice[track.occurrence] ?? defaultPlacement
                         const custom =
                           customPositions[track.occurrence] ?? track.original_position + 1
-                        const current = placementTargets.get(track.occurrence)
+                        const current = targets.get(track.occurrence)
                         return (
                           <li
                             key={track.occurrence}
@@ -399,10 +400,10 @@ export function PreferencesStep({
                                 </SelectTrigger>
                                 <SelectContent>
                                   <SelectItem value="keep">Keep in place</SelectItem>
-                                  <SelectItem value="top" disabled={slotTaken(0, track)}>
+                                  <SelectItem value="top" disabled={taken(0, track)}>
                                     Move to top
                                   </SelectItem>
-                                  <SelectItem value="bottom" disabled={slotTaken(total - 1, track)}>
+                                  <SelectItem value="bottom" disabled={taken(total - 1, track)}>
                                     Move to bottom
                                   </SelectItem>
                                   <SelectItem value="custom">Custom position</SelectItem>

@@ -1,6 +1,6 @@
 """Offline arrangement checks with explicit synthetic section measurements."""
 
-# ruff: noqa: INP001, SLF001
+# ruff: noqa: INP001
 
 from __future__ import annotations
 
@@ -13,19 +13,39 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from api import playlist_sorter
+from api.analysis_store import RecordingAnalysis, SectionMeasurements
+from api.arrangement_objective import (
+    _COMPONENTS,
+    _audio_note,
+    _option_weights,
+    _order_cost,
+    _order_terms,
+    _prepare_arrangement,
+)
 
 
 def segment(tempo: float = 120.0, level: float = -20.0) -> dict[str, Any]:
     """Make one fully measured section for predictable cost comparisons."""
-    return {
-        "tempo": tempo,
-        "rms_db": level,
-        "onset": 2.0,
-        "centroid": 1000.0,
-        "contrast": [10.0] * 7,
-        "chroma": [1.0] + [0.0] * 11,
-        "evidence": dict.fromkeys(("tempo", "rms_db", "onset", "centroid", "contrast", "chroma"), 1.0),
-    }
+    return SectionMeasurements(
+        start=0.0,
+        end=20.0,
+        tempo=tempo,
+        rms_db=level,
+        onset=2.0,
+        tempo_candidates=[],
+        centroid=1000.0,
+        contrast=[10.0] * 7,
+        chroma=[1.0] + [0.0] * 11,
+        camelot=None,
+        evidence=dict.fromkeys(("tempo", "rms_db", "onset", "centroid", "contrast", "chroma"), 1.0),
+    ).model_dump()
+
+
+def measured_analysis() -> dict[str, Any]:
+    """Build the named recording-analysis record instead of transcribing its schema."""
+    return RecordingAnalysis(
+        duration=180.0, summary=segment(), intro=segment(), body=segment(), outro=segment()
+    ).model_dump()
 
 
 def fixture(count: int = 6) -> playlist_sorter.SpotifyPlaylistSorter:
@@ -43,9 +63,7 @@ def fixture(count: int = 6) -> playlist_sorter.SpotifyPlaylistSorter:
         for i in range(count)
     ]
     sorter.current_order = [entry["occurrence"] for entry in sorter.original_items]
-    sorter.audio_features = {
-        key: {"analysis": {part: segment() for part in ("intro", "outro", "body", "summary")}} for key in ("a", "b")
-    }
+    sorter.audio_features = {key: {"analysis": measured_analysis()} for key in ("a", "b")}
     return sorter
 
 
@@ -74,13 +92,13 @@ class ArrangementTest(unittest.TestCase):
             assert "Intensity drops" in note["text"]
         neutral: dict[str, Any] = {
             "energy_diff": None,
-            "components": dict.fromkeys(playlist_sorter._COMPONENTS, 0.25),
-            "evidence": dict.fromkeys(playlist_sorter._COMPONENTS, 0.5),
+            "components": dict.fromkeys(_COMPONENTS, 0.25),
+            "evidence": dict.fromkeys(_COMPONENTS, 0.5),
         }
-        assert playlist_sorter._audio_note(neutral) is None
+        assert _audio_note(neutral) is None
         neutral["energy_diff"] = 0.8
         neutral["evidence"]["intensity"] = 0.1
-        assert playlist_sorter._audio_note(neutral) is None
+        assert _audio_note(neutral) is None
         sorter.arrangement_data = None
         limited = sorter.review_summary(order, transitions)
         assert limited["original_assessed"] is None
@@ -93,21 +111,21 @@ class ArrangementTest(unittest.TestCase):
         sorter.audio_features["a"]["analysis"]["outro"] = segment(80, -50)
         sorter.audio_features["b"]["analysis"]["intro"] = segment(160, -50)
         sorter.audio_features["b"]["analysis"]["outro"] = segment(120, 0)
-        data = playlist_sorter._prepare_arrangement(sorter.original_items, sorter.audio_features)
+        data = _prepare_arrangement(sorter.original_items, sorter.audio_features)
         assert data["components"]["tempo"][0, 1] < 1e-12
         assert data["transition"][0, 1] < data["transition"][1, 0]
         assert data["components"]["texture"][0, 1] == 0
         sorter.audio_features["b"]["analysis"]["intro"] = {}
-        missing = playlist_sorter._prepare_arrangement(sorter.original_items, sorter.audio_features)
+        missing = _prepare_arrangement(sorter.original_items, sorter.audio_features)
         assert missing["transition"][0, 1] == 0.5
         assert not missing["assessed"][0, 1]
         sorter.audio_features["b"]["analysis"]["intro"] = segment(160, -50)
         sorter.audio_features["b"]["analysis"]["intro"]["evidence"]["tempo"] = 0.2
-        weak = playlist_sorter._prepare_arrangement(sorter.original_items, sorter.audio_features)
+        weak = _prepare_arrangement(sorter.original_items, sorter.audio_features)
         assert abs(weak["components"]["tempo"][0, 1] - 0.4) < 1e-12
         sorter.original_items[0]["artist_ids"].append("featured-artist")
         sorter.original_items[1]["artist_ids"].append("featured-artist")
-        credited = playlist_sorter._prepare_arrangement(sorter.original_items, sorter.audio_features)
+        credited = _prepare_arrangement(sorter.original_items, sorter.audio_features)
         assert credited["artists"][0, 1]
 
     def test_presets_preserve_occurrences_and_improve_their_baseline(self) -> None:
@@ -134,22 +152,22 @@ class ArrangementTest(unittest.TestCase):
     def test_objective_terms_have_the_specified_scale(self) -> None:
         """Check the formula against a hand-calculated AAABBB sequence."""
         sorter = fixture()
-        data = playlist_sorter._prepare_arrangement(sorter.original_items, sorter.audio_features)
+        data = _prepare_arrangement(sorter.original_items, sorter.audio_features)
         order = np.arange(6)
-        terms = playlist_sorter._order_terms(order, data)
+        terms = _order_terms(order, data)
         assert terms["transition"] == 0
         assert terms["repetition"] == 4 / 6
         assert terms["monotony"] == 1
         assert terms["pace"] == 0
         assert terms["energy"] == 0
-        steady = playlist_sorter._option_weights({"preset": "steady", "variety": 0.5, "pace": 0.5, "energy": 0.5})
-        assert abs(playlist_sorter._order_cost(order, data, steady) - (0.35 * 1.075 * 4 / 6 + 0.10)) < 1e-12
-        mixed = playlist_sorter._option_weights({"preset": "mixed", "variety": 0.5, "pace": 0.5, "energy": 0.5})
-        assert abs(playlist_sorter._order_cost(order, data, mixed) - (0.37625 * 4 / 6 + 0.15)) < 1e-12
+        steady = _option_weights({"preset": "steady", "variety": 0.5, "pace": 0.5, "energy": 0.5})
+        assert abs(_order_cost(order, data, steady) - (0.35 * 1.075 * 4 / 6 + 0.10)) < 1e-12
+        mixed = _option_weights({"preset": "mixed", "variety": 0.5, "pace": 0.5, "energy": 0.5})
+        assert abs(_order_cost(order, data, mixed) - (0.37625 * 4 / 6 + 0.15)) < 1e-12
         for record in sorter.audio_features.values():
             record["analysis"]["body"] = None
-        missing = playlist_sorter._prepare_arrangement(sorter.original_items, sorter.audio_features)
-        assert playlist_sorter._order_terms(order, missing)["monotony"] == 0
+        missing = _prepare_arrangement(sorter.original_items, sorter.audio_features)
+        assert _order_terms(order, missing)["monotony"] == 0
 
     def test_tilt_terms_rank_measured_features_by_position(self) -> None:
         """Pace and energy tilts grow toward unbalanced orders and vanish without measurements."""
@@ -158,26 +176,22 @@ class ArrangementTest(unittest.TestCase):
         sorter.audio_features["b"]["analysis"]["summary"]["rms_db"] = 0.0
         sorter.audio_features["a"]["analysis"]["summary"]["tempo"] = 90.0
         sorter.audio_features["b"]["analysis"]["summary"]["tempo"] = 150.0
-        data = playlist_sorter._prepare_arrangement(sorter.original_items, sorter.audio_features)
-        calm_first = playlist_sorter._order_terms(np.array([0, 1]), data)
+        data = _prepare_arrangement(sorter.original_items, sorter.audio_features)
+        calm_first = _order_terms(np.array([0, 1]), data)
         assert calm_first["energy"] > 0
         assert calm_first["pace"] > 0
-        fast_first = playlist_sorter._order_terms(np.array([1, 0]), data)
+        fast_first = _order_terms(np.array([1, 0]), data)
         assert fast_first["energy"] < 0
         assert fast_first["pace"] < 0
-        weights = playlist_sorter._option_weights({"preset": "steady", "energy": 0.5, "pace": 0.5, "variety": 0.5})
-        assert playlist_sorter._order_cost(np.array([0, 1]), data, weights) == playlist_sorter._order_cost(
-            np.array([1, 0]), data, weights
-        )
-        ascending = playlist_sorter._option_weights({"preset": "steady", "energy": 1.0, "pace": 1.0, "variety": 0.5})
-        assert playlist_sorter._order_cost(np.array([1, 0]), data, ascending) < playlist_sorter._order_cost(
-            np.array([0, 1]), data, ascending
-        )
+        weights = _option_weights({"preset": "steady", "energy": 0.5, "pace": 0.5, "variety": 0.5})
+        assert _order_cost(np.array([0, 1]), data, weights) == _order_cost(np.array([1, 0]), data, weights)
+        ascending = _option_weights({"preset": "steady", "energy": 1.0, "pace": 1.0, "variety": 0.5})
+        assert _order_cost(np.array([1, 0]), data, ascending) < _order_cost(np.array([0, 1]), data, ascending)
         for record in sorter.audio_features.values():
             record["analysis"]["summary"]["evidence"]["rms_db"] = 0.0
             record["analysis"]["summary"]["evidence"]["onset"] = 0.0
             record["analysis"]["summary"]["evidence"]["tempo"] = 0.0
-        unmeasured = playlist_sorter._prepare_arrangement(sorter.original_items, sorter.audio_features)
+        unmeasured = _prepare_arrangement(sorter.original_items, sorter.audio_features)
         assert unmeasured["energy_values"].sum() == 0
         assert unmeasured["pace_values"].sum() == 0
 
@@ -268,8 +282,8 @@ class ArrangementTest(unittest.TestCase):
     def test_option_weights_trade_flow_for_variety(self) -> None:
         """Different priorities may produce different orders without changing normalization."""
         sorter = fixture()
-        for section in sorter.audio_features["b"]["analysis"].values():
-            section["rms_db"] = 0.0
+        for name in ("intro", "outro", "body", "summary"):
+            sorter.audio_features["b"]["analysis"][name]["rms_db"] = 0.0
         before = copy.deepcopy(sorter.audio_features)
         steady = sorter.sort_playlist()
         data = sorter.arrangement_data
@@ -280,7 +294,7 @@ class ArrangementTest(unittest.TestCase):
         assert sorter.audio_features == before
         for options, result in sorter.arrangement_results.items():
             indices = np.array([int(occurrence.split(":")[-1]) for occurrence in result["order"]])
-            weights = playlist_sorter._option_weights(
+            weights = _option_weights(
                 {
                     "preset": options[0],
                     "pace": float(options[1]),
@@ -288,4 +302,4 @@ class ArrangementTest(unittest.TestCase):
                     "variety": float(options[3]),
                 }
             )
-            assert abs(playlist_sorter._order_cost(indices, data, weights) - result["cost"]) < 1e-12
+            assert abs(_order_cost(indices, data, weights) - result["cost"]) < 1e-12

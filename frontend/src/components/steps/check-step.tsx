@@ -12,7 +12,7 @@ import { Button } from "@/components/ui/button"
 import { MatchFixDialog } from "@/components/match-fix-dialog"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import type { Session, Track } from "@/lib/api"
+import type { Job, Track } from "@/lib/api"
 import { matchAttention } from "@/lib/preferences"
 
 type StatusTone = "success" | "warning" | "failed" | "analyzing"
@@ -74,15 +74,13 @@ export function StatusBadge({
 function MatchRow({
   track,
   attention,
-  session,
   disabled,
   onApplied,
 }: {
   track: Track
   attention: "fix" | "check" | null
-  session: Session
   disabled: boolean
-  onApplied: (occurrence: string) => void
+  onApplied: (occurrence: string, job: Job) => void
 }) {
   const [fixing, setFixing] = useState(false)
   return (
@@ -103,7 +101,6 @@ function MatchRow({
       <MatchFixDialog
         key={fixing ? "open" : "closed"}
         track={track}
-        session={session}
         open={fixing}
         onOpenChange={setFixing}
         onApplied={onApplied}
@@ -114,16 +111,14 @@ function MatchRow({
 
 export function CheckStep({
   tracks,
-  session,
   busy,
   onContinue,
   onApplied,
 }: {
   tracks: Track[]
-  session: Session
   busy: boolean
   onContinue: () => void
-  onApplied: (occurrence: string) => void
+  onApplied: (occurrence: string, job: Job) => void
 }) {
   const noted = tracks.filter((track) => matchAttention(track) !== null)
   const [issuesOnly, setIssuesOnly] = useState(noted.length > 0)
@@ -176,7 +171,6 @@ export function CheckStep({
             key={track.occurrence}
             track={track}
             attention={matchAttention(track)}
-            session={session}
             disabled={busy}
             onApplied={onApplied}
           />

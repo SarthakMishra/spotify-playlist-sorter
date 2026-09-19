@@ -29,7 +29,15 @@ import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/in
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { toast } from "@/components/ui/toast"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
-import { api, ApiError, type Job, type Playlist, type Session } from "@/lib/api"
+import {
+  ApiError,
+  getSession,
+  getJob,
+  getPlaylists,
+  logout,
+  type Playlist,
+  type Session,
+} from "@/lib/api"
 
 // Warm the lazy route chunks on hover/focus so navigation feels instant.
 const preloadPlaylistPage = () => {
@@ -56,10 +64,10 @@ function Shell() {
   const session = useLoaderData<Session>()
   const navigation = useNavigation()
   const [leaving, setLeaving] = useState(false)
-  async function logout() {
+  async function handleLogout() {
     setLeaving(true)
     try {
-      await api("/auth/logout", { method: "POST", headers: { "X-CSRF-Token": session.csrf ?? "" } })
+      await logout()
       window.location.assign("/")
     } catch (err) {
       toast.add({
@@ -99,7 +107,7 @@ function Shell() {
                       variant="ghost"
                       size="icon-sm"
                       aria-label="Sign out"
-                      onClick={() => void logout()}
+                      onClick={() => void handleLogout()}
                       disabled={leaving}
                     />
                   }
@@ -297,7 +305,7 @@ function RouteError() {
 
 async function playlistLoader({ request }: LoaderFunctionArgs) {
   try {
-    return await api<Playlist[]>("/playlists", { signal: request.signal })
+    return await getPlaylists({ signal: request.signal })
   } catch (error) {
     if (error instanceof ApiError && error.status === 401) throw redirectDocument("/")
     throw error
@@ -308,7 +316,8 @@ export const router = createBrowserRouter([
   {
     id: "root",
     path: "/",
-    loader: ({ request }) => api<Session>("/session", { signal: request.signal }),
+    // The session response also arms the client with the CSRF token for later mutations.
+    loader: ({ request }) => getSession({ signal: request.signal }),
     Component: Shell,
     ErrorBoundary: RouteError,
     HydrateFallback: Loading,
@@ -322,7 +331,7 @@ export const router = createBrowserRouter([
           { index: true, Component: PlaylistList },
           {
             path: ":playlistId",
-            loader: ({ request }) => api<Job | null>("/job", { signal: request.signal }),
+            loader: ({ request }) => getJob({ signal: request.signal }),
             lazy: async () => ({
               Component: (await import("@/components/playlist-page")).PlaylistRoute,
             }),

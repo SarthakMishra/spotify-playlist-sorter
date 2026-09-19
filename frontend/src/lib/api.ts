@@ -8,10 +8,10 @@ export type Playlist = { id: string; name: string; total: number; image: string 
 export type Preset = "gentle" | "steady" | "buildup" | "mixed"
 export type Options = { preset: Preset; pace: number; energy: number; variety: number }
 export type Recording = {
-  videoId: string
+  video_id: string
   title: string | null
   channel: string | null
-  durationSeconds: number | null
+  duration_seconds: number | null
   confident: boolean
 }
 export type Track = {
@@ -99,7 +99,11 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+// The session hands the browser one CSRF token per login; the client keeps it
+// so mutating call sites never assemble auth headers themselves.
+let csrfToken: string | null = null
+
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers)
   headers.set("Accept", "application/json")
   if (options.body) headers.set("Content-Type", "application/json")
@@ -117,10 +121,82 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
   return response.json() as Promise<T>
 }
 
-export function isWorking(job: Job | null) {
-  return !!job && ["analyzing", "sorting", "saving", "restoring"].includes(job.status)
+function mutating(options: RequestInit): RequestInit {
+  const headers = new Headers(options.headers)
+  headers.set("X-CSRF-Token", csrfToken ?? "")
+  return { ...options, headers }
 }
 
-export function isRematchStage(status: Track["analysis_status"]) {
-  return status === "matching" || status === "downloading" || status === "analyzing"
+export type SortRequest = {
+  revision: string
+  options: Options
+  first_occurrence: string | null
+  last_occurrence: string | null
+  placements: Record<string, number>
+}
+
+export async function getSession(options: RequestInit = {}): Promise<Session> {
+  const session = await request<Session>("/session", options)
+  csrfToken = session.csrf
+  return session
+}
+
+export function getPlaylists(options: RequestInit = {}): Promise<Playlist[]> {
+  return request<Playlist[]>("/playlists", options)
+}
+
+export function getJob(options: RequestInit = {}): Promise<Job | null> {
+  return request<Job | null>("/job", options)
+}
+
+export function analyzePlaylist(playlistId: string, options: RequestInit = {}): Promise<Job> {
+  return request<Job>(`/playlists/${playlistId}/analyze`, { ...mutating(options), method: "POST" })
+}
+
+export function sortPreview(body: SortRequest, options: RequestInit = {}): Promise<Job> {
+  return request<Job>("/job/sort", {
+    ...mutating(options),
+    method: "POST",
+    body: JSON.stringify(body),
+  })
+}
+
+export function savePreview(revision: string, options: RequestInit = {}): Promise<Job> {
+  return request<Job>("/job/save", {
+    ...mutating(options),
+    method: "POST",
+    body: JSON.stringify({ revision }),
+  })
+}
+
+export function restorePreview(revision: string, options: RequestInit = {}): Promise<Job> {
+  return request<Job>("/job/restore", {
+    ...mutating(options),
+    method: "POST",
+    body: JSON.stringify({ revision }),
+  })
+}
+
+export function getMatchCandidates(
+  occurrence: string,
+  options: RequestInit = {},
+): Promise<Candidate[]> {
+  // Occurrences carry Spotify snapshot ids, which can contain slashes; encode the whole segment.
+  return request<Candidate[]>(`/job/matches/${encodeURIComponent(occurrence)}`, options)
+}
+
+export function applyRecording(
+  occurrence: string,
+  videoId: string,
+  options: RequestInit = {},
+): Promise<Job> {
+  return request<Job>(`/job/matches/${encodeURIComponent(occurrence)}`, {
+    ...mutating(options),
+    method: "POST",
+    body: JSON.stringify({ video_id: videoId }),
+  })
+}
+
+export async function logout(options: RequestInit = {}): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>("/auth/logout", { ...mutating(options), method: "POST" })
 }

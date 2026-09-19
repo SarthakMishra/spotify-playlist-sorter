@@ -121,6 +121,21 @@ class Job:
     view: JobView
     sorted_order: list[str] = field(default_factory=list)
 
+    def invalidate_preview(self, **updates: Any) -> None:  # noqa: ANN401 - pydantic accepts every field value.
+        """Own the whole preview field-group: clear it, then apply the caller's overrides."""
+        self.view = self.view.model_copy(
+            update={
+                "sorted_tracks": [],
+                "transitions": [],
+                "review": None,
+                "arrangement": None,
+                "first_occurrence": None,
+                "last_occurrence": None,
+                "placements": {},
+                **updates,
+            }
+        )
+
 
 @dataclass
 class Session:
@@ -264,22 +279,13 @@ def _rematch_job(job: Job, occurrence: str, video_id: str, deadline: float) -> N
                 _tracks([item])[0] if item["occurrence"] == occurrence else track
                 for item, track in zip(job.sorter.original_items, job.view.tracks, strict=True)
             ]
-            job.view = job.view.model_copy(
-                update={
-                    "tracks": tracks,
-                    "sorted_tracks": [],
-                    "transitions": [],
-                    "review": None,
-                    "arrangement": None,
-                    "first_occurrence": None,
-                    "last_occurrence": None,
-                    "placements": {},
-                    "error": None,
-                    "status": "ready",
-                    "revision": secrets.token_urlsafe(16),
-                    "can_restore": job.sorter.can_restore,
-                    **_analysis_counts(tracks),
-                }
+            job.invalidate_preview(
+                tracks=tracks,
+                status="ready",
+                error=None,
+                revision=secrets.token_urlsafe(16),
+                can_restore=job.sorter.can_restore,
+                **_analysis_counts(tracks),
             )
         else:
             tracks = [
@@ -348,16 +354,14 @@ def _analyze_job(job: Job) -> None:
     tracks = job.sorter.load_playlist(
         progress_callback=progress, entries_callback=entries_loaded, record_callback=record_progress
     )
-    job.view = job.view.model_copy(
-        update={
-            "name": job.sorter.playlist_name or "Your playlist",
-            "tracks": _tracks(tracks),
-            "metadata_loaded": True,
-            "completed": job.view.total,
-            "analyzed_count": sum(entry["analysis_status"] == "ready" for entry in job.sorter.original_items),
-            "kept_count": sum(entry["fixed_reason"] is not None for entry in job.sorter.original_items),
-            "status": "ready",
-        }
+    tracks = _tracks(tracks)
+    job.invalidate_preview(
+        name=job.sorter.playlist_name or "Your playlist",
+        tracks=tracks,
+        metadata_loaded=True,
+        completed=job.view.total,
+        status="ready",
+        **_analysis_counts(tracks),
     )
 
 
@@ -384,26 +388,18 @@ def _run_job(job: Job, action: str, release: Callable[[], None]) -> None:
                     "sorted_tracks": _tracks(job.sorter.proposed_tracks(job.sorted_order)),
                     "transitions": transitions,
                     "review": job.sorter.review_summary(job.sorted_order, transitions),
-                    "arrangement": {key: job.sorter.arrangement_result[key] for key in ("unchanged", "limited")},
+                    "arrangement": job.sorter.arrangement_summary,
                     "status": "ready",
                 }
             )
         elif action == "restore":
             success, message = job.sorter.restore_spotify_playlist()
             job.sorted_order = job.sorter.current_order.copy() if success else []
-            job.view = job.view.model_copy(
-                update={
-                    "status": "restored" if success else "error",
-                    "error": None if success else message,
-                    "can_restore": False,
-                    "sorted_tracks": _tracks(job.sorter.proposed_tracks(job.sorted_order)),
-                    "transitions": [],
-                    "review": None,
-                    "arrangement": None,
-                    "first_occurrence": None,
-                    "last_occurrence": None,
-                    "placements": {},
-                }
+            job.invalidate_preview(
+                status="restored" if success else "error",
+                error=None if success else message,
+                can_restore=False,
+                sorted_tracks=_tracks(job.sorter.proposed_tracks(job.sorted_order)),
             )
         else:
             success, message = job.sorter.update_spotify_playlist(job.sorted_order)
@@ -603,18 +599,13 @@ def begin_action(
         if revision != job.view.revision:
             raise HTTPException(409, "This preview changed in another tab. Reload the page to continue.")
         if action == "sort":
-            movable = {track.occurrence for track in job.view.tracks if track.fixed_reason is None}
-            if options is None or len(movable) < 2:  # noqa: PLR2004
+            if options is None or job.sorter.movable_count < 2:  # noqa: PLR2004
                 raise HTTPException(422, "At least two movable songs are needed to arrange this playlist.")
-            error = job.sorter.choice_error(
-                options.options.model_dump(), options.first_occurrence, options.last_occurrence, options.placements
-            )
+            error = job.sorter.choice_error(options.first_occurrence, options.last_occurrence, options.placements)
             if error:
                 raise HTTPException(422, error)
-        if action == "save" and (
-            not job.sorter.valid_order(job.sorted_order)
-            or job.sorted_order != [track.occurrence for track in job.view.sorted_tracks]
-            or job.sorted_order == job.sorter.current_order
+        if action == "save" and job.sorter.save_problem(
+            job.sorted_order, [track.occurrence for track in job.view.sorted_tracks]
         ):
             raise HTTPException(409, "Review the playlist preview before saving.")
         if action == "restore" and not job.sorter.can_restore:
@@ -629,17 +620,11 @@ def begin_action(
         )
         if action == "sort" and options is not None:
             job.sorted_order = []
-            job.view = job.view.model_copy(
-                update={
-                    "options": options.options,
-                    "first_occurrence": options.first_occurrence,
-                    "last_occurrence": options.last_occurrence,
-                    "placements": options.model_dump(exclude={"revision", "options"})["placements"],
-                    "sorted_tracks": [],
-                    "transitions": [],
-                    "arrangement": None,
-                    "review": None,
-                }
+            job.invalidate_preview(
+                options=options.options,
+                first_occurrence=options.first_occurrence,
+                last_occurrence=options.last_occurrence,
+                placements=dict(options.placements),
             )
         background.add_task(_run_job, job, action, lambda: None)
         return job.view
@@ -675,7 +660,7 @@ def _match_entry(job: Job, occurrence: str) -> dict[str, Any]:
     return entry
 
 
-@router.get("/api/job/matches/{occurrence}")
+@router.get("/api/job/matches/{occurrence:path}")
 def match_candidates(occurrence: str, session: CurrentSession) -> list[Candidate]:
     """Search YouTube so a listener can review or replace this song's recording."""
     job = session.job
@@ -692,7 +677,7 @@ def match_candidates(occurrence: str, session: CurrentSession) -> list[Candidate
     return [Candidate.model_validate(candidate) for candidate in candidates]
 
 
-@router.post("/api/job/matches/{occurrence}", status_code=202)
+@router.post("/api/job/matches/{occurrence:path}", status_code=202)
 def apply_match(
     occurrence: str, body: MatchRequest, request: Request, session: CurrentSession, background: BackgroundTasks
 ) -> JobView:
@@ -715,23 +700,14 @@ def apply_match(
                 else track
                 for track in job.view.tracks
             ]
-            job.view = job.view.model_copy(
-                update={
-                    "status": "analyzing",
-                    "metadata_loaded": True,
-                    "completed": 0,
-                    "total": 1,
-                    "tracks": tracks,
-                    "sorted_tracks": [],
-                    "transitions": [],
-                    "review": None,
-                    "arrangement": None,
-                    "first_occurrence": None,
-                    "last_occurrence": None,
-                    "placements": {},
-                    "revision": secrets.token_urlsafe(16),
-                    **_analysis_counts(tracks),
-                }
+            job.invalidate_preview(
+                status="analyzing",
+                metadata_loaded=True,
+                completed=0,
+                total=1,
+                tracks=tracks,
+                revision=secrets.token_urlsafe(16),
+                **_analysis_counts(tracks),
             )
             background.add_task(_run_rematch, job, occurrence, body.video_id, request.app.state.analysis_lock.release)
         except Exception:

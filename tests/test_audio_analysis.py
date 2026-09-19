@@ -15,28 +15,49 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import soundfile as sf
+import yt_dlp
 
-from api import audio_analysis, playlist_sorter
+from api import analysis_store, audio_analysis, playlist_sorter, recording_match
+from api.analysis_store import RecordingAnalysis, SectionMeasurements
 
 
 def recording(track: dict[str, Any], **_kwargs: object) -> dict[str, Any]:
-    """Build a small complete cache record with invented source metadata."""
+    """Build a complete cache record through the real producer with invented source metadata."""
     source = {"id": "abcdefghijk", "title": track["Track"], "duration": 180.0}
-    return {
-        "status": "ready",
-        "metadata": playlist_sorter._metadata(track),
-        "source": source,
-        "source_fingerprint": playlist_sorter._source_fingerprint(source),
-        "analysis": {
-            "summary": {
-                "rms_db": -20.0 if track["id"] == "a" else -10.0,
-                "onset": 1.0,
-                "tempo": None,
-                "camelot": None,
-                "evidence": dict.fromkeys(("rms_db", "onset", "tempo", "centroid", "contrast", "chroma", "key"), 1.0),
-            }
-        },
+    level = -20.0 if track["id"] == "a" else -10.0
+    section = SectionMeasurements(
+        start=0.0,
+        end=20.0,
+        rms_db=level,
+        onset=1.0,
+        tempo=None,
+        tempo_candidates=[],
+        centroid=None,
+        contrast=None,
+        chroma=None,
+        camelot=None,
+        evidence=dict.fromkeys(("rms_db", "onset", "tempo", "centroid", "contrast", "chroma", "key"), 1.0),
+    )
+    analysis = RecordingAnalysis(duration=180.0, summary=section, intro=section, body=None, outro=section)
+    return recording_match.record_for(source, recording_match._metadata(track), analysis.model_dump())
+
+
+def stub_analysis(rms_db: float | None = None) -> dict[str, Any]:
+    """Make a valid minimal analysis so patched measurements still pass the record seam."""
+    section: dict[str, Any] = {
+        "start": 0.0,
+        "end": 0.0,
+        "rms_db": rms_db,
+        "onset": None,
+        "tempo": None,
+        "tempo_candidates": [],
+        "centroid": None,
+        "contrast": None,
+        "chroma": None,
+        "camelot": None,
+        "evidence": {},
     }
+    return {"duration": 0.0, "summary": section, "intro": section, "body": None, "outro": section}
 
 
 def full_sections(wave: np.ndarray, sr: int = audio_analysis.SAMPLE_RATE) -> list[tuple[str, float, float, np.ndarray]]:
@@ -187,8 +208,8 @@ class AudioAnalysisTest(unittest.TestCase):
             "duration": 180,
             "artist": "Artist",
         }
-        ranked = playlist_sorter._rank_recordings([source], metadata)
-        selected = playlist_sorter._select_recording(ranked)
+        ranked = recording_match._rank_recordings([source], metadata)
+        selected = recording_match._select_recording(ranked)
         assert selected is not None
         assert selected["id"] == source["id"]
         variants = ["Live", "Remix", "Radio edit", "Extended", "Karaoke", "Instrumental", "Cover", "Acoustic"]
@@ -206,13 +227,13 @@ class AudioAnalysisTest(unittest.TestCase):
         for candidate in invalid:
             with self.subTest(candidate=candidate):
                 assert (
-                    playlist_sorter._select_recording(playlist_sorter._rank_recordings([candidate], metadata)) is None
+                    recording_match._select_recording(recording_match._rank_recordings([candidate], metadata)) is None
                 )
         for missing in ({**metadata, "artists": []}, {**metadata, "duration_ms": None}):
-            assert playlist_sorter._rank_recordings([source], missing) == []
+            assert recording_match._rank_recordings([source], missing) == []
         assert (
-            playlist_sorter._select_recording(
-                playlist_sorter._rank_recordings(
+            recording_match._select_recording(
+                recording_match._rank_recordings(
                     [source, {**source, "id": "lmnopqrstuv", "view_count": 1000000}],
                     metadata,
                 )
@@ -221,12 +242,12 @@ class AudioAnalysisTest(unittest.TestCase):
         )
         remaster = {**metadata, "title": "Example (Remastered 2011)"}
         candidate = {**source, "title": "Artist - Example (Remastered 2011)"}
-        assert playlist_sorter._select_recording(playlist_sorter._rank_recordings([candidate], remaster)) is not None
+        assert recording_match._select_recording(recording_match._rank_recordings([candidate], remaster)) is not None
         candidate["title"] = "Artist - Example (Remastered 2012)"
-        assert playlist_sorter._rank_recordings([candidate], remaster) == []
+        assert recording_match._rank_recordings([candidate], remaster) == []
         assert (
-            playlist_sorter._select_recording(
-                playlist_sorter._rank_recordings(
+            recording_match._select_recording(
+                recording_match._rank_recordings(
                     [{**source, "title": "Live - Example", "artist": "Live"}],
                     {**metadata, "artists": ["Live"]},
                 )
@@ -241,22 +262,20 @@ class AudioAnalysisTest(unittest.TestCase):
         fallback = {**source, "id": "lmnopqrstuv", "duration": 182}
         sections = [("full", 0.0, 180.0, np.zeros(1))]
         with (
+            patch.object(yt_dlp.YoutubeDL, "extract_info", return_value={"entries": [source, fallback]}) as search,
             patch.object(
-                playlist_sorter.yt_dlp.YoutubeDL, "extract_info", return_value={"entries": [source, fallback]}
-            ) as search,
-            patch.object(
-                playlist_sorter.SpotifyPlaylistSorter,
+                recording_match,
                 "_download_sections",
                 side_effect=[OSError("Download failed"), sections],
             ) as download,
-            patch.object(playlist_sorter, "analyze_sections", return_value={"summary": {}}),
+            patch.object(recording_match, "analyze_sections", return_value=stub_analysis()),
         ):
             search.side_effect = lambda url, **_: (
                 search.return_value
                 if url.startswith("ytsearch")
                 else next(entry for entry in search.return_value["entries"] if url.endswith(entry["id"]))
             )
-            result = playlist_sorter.SpotifyPlaylistSorter._analyze_track(track)
+            result = recording_match.analyze_track(track)
             assert result["status"] == "ready"
             assert result["source"]["id"] == fallback["id"]
             assert download.call_count == 2
@@ -264,13 +283,10 @@ class AudioAnalysisTest(unittest.TestCase):
             search.return_value = {"entries": [source, {**fallback, "duration": 180}]}
             download.side_effect = None
             download.return_value = sections
-            assert playlist_sorter.SpotifyPlaylistSorter._analyze_track(track)["status"] == "ready"
+            assert recording_match.analyze_track(track)["status"] == "ready"
             download.assert_called_once()
             search.reset_mock()
-            assert (
-                playlist_sorter.SpotifyPlaylistSorter._analyze_track({**track, "duration_ms": 1201000})["status"]
-                == "unsupported"
-            )
+            assert recording_match.analyze_track({**track, "duration_ms": 1201000})["status"] == "unsupported"
             search.assert_not_called()
 
     def test_cache_reuse_invalidation_and_raw_measurements(self) -> None:
@@ -278,14 +294,14 @@ class AudioAnalysisTest(unittest.TestCase):
         tracks = [{"id": key, "Track": "Example", "Artist": "Artist", "duration_ms": 180000} for key in ("a", "b", "a")]
         with (
             tempfile.TemporaryDirectory() as directory,
-            patch.object(playlist_sorter, "_CACHE_FILE", Path(directory) / "cache.json"),
+            patch.object(analysis_store, "_CACHE_FILE", Path(directory) / "cache.json"),
         ):
-            cache_file = playlist_sorter._CACHE_FILE
+            cache_file = analysis_store._CACHE_FILE
             cache_file.write_text('{"a": {"tempo": 120}}', encoding="utf-8")
             assert playlist_sorter._load_cache() == {}
             sorter = playlist_sorter.SpotifyPlaylistSorter("playlist", Mock())
             progress = Mock()
-            with patch.object(sorter, "_analyze_track", side_effect=recording) as analyze:
+            with patch.object(playlist_sorter, "analyze_track", side_effect=recording) as analyze:
                 first = sorter._fetch_audio_features_local(tracks, progress)
                 assert analyze.call_count == 2
                 assert sorter.recording_count == 2
@@ -327,7 +343,7 @@ class AudioAnalysisTest(unittest.TestCase):
         tracks = [{"id": str(i), "Track": "Example", "Artist": "Artist", "duration_ms": 180000} for i in range(11)]
         with (
             tempfile.TemporaryDirectory() as directory,
-            patch.object(playlist_sorter, "_CACHE_FILE", Path(directory) / "cache.json"),
+            patch.object(analysis_store, "_CACHE_FILE", Path(directory) / "cache.json"),
         ):
             sorter = playlist_sorter.SpotifyPlaylistSorter("playlist", Mock())
 
@@ -336,15 +352,15 @@ class AudioAnalysisTest(unittest.TestCase):
                     raise InterruptedError
 
             with (
-                patch.object(sorter, "_analyze_track", side_effect=recording),
+                patch.object(playlist_sorter, "analyze_track", side_effect=recording),
                 patch.object(playlist_sorter, "_save_cache", wraps=playlist_sorter._save_cache) as save,
                 self.assertRaises(InterruptedError),
             ):
                 sorter._fetch_audio_features_local(tracks, interrupt)
             assert save.call_count == 2
             assert len(playlist_sorter._load_cache()) == 11
-            previous = playlist_sorter._CACHE_FILE.read_bytes()
+            previous = analysis_store._CACHE_FILE.read_bytes()
             with patch.object(Path, "replace", side_effect=OSError("Disk failure")), self.assertRaises(OSError):
                 playlist_sorter._save_cache({})
-            assert playlist_sorter._CACHE_FILE.read_bytes() == previous
-            assert list(Path(directory).iterdir()) == [playlist_sorter._CACHE_FILE]
+            assert analysis_store._CACHE_FILE.read_bytes() == previous
+            assert list(Path(directory).iterdir()) == [analysis_store._CACHE_FILE]

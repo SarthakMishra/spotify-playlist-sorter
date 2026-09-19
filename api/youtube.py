@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import yt_dlp
+
 MESSAGES = {
     "cookies": "YouTube couldn't process this request. Try again later.",
     "sign_in": "YouTube is requiring sign-in for this recording. Try again later.",
@@ -80,3 +82,47 @@ def youtube_options() -> dict[str, Any]:
         "retry_sleep_functions": {key: lambda n: min(2**n, 8) for key in ("http", "fragment", "extractor")},
         "skip_unavailable_fragments": False,
     }
+
+
+def _safe_reason(error: Exception, logger: YoutubeLogger) -> str:
+    """Classify one extractor failure without publishing its text."""
+    return failure_reason(str(error)) or logger.reason or "source_failed"
+
+
+class YoutubeSource:
+    """The one yt-dlp adapter behind the source seam; every read failure becomes a safe reason."""
+
+    def search(self, query: str) -> list[dict[str, Any]]:
+        """Return flat search entries; any failure raises a safe SourceAccessError."""
+        options: dict[str, Any] = {**youtube_options(), "extract_flat": "in_playlist", "format": "bestaudio"}
+        try:
+            with yt_dlp.YoutubeDL(options) as downloader:
+                info = downloader.extract_info(query, download=False) or {}
+        except Exception as error:
+            raise SourceAccessError(_safe_reason(error, options["logger"])) from error
+        return [entry for entry in (info.get("entries") or [info]) if entry]
+
+    def hydrate(self, video_id: str) -> dict[str, Any] | None:
+        """Return one upload's full metadata when it matches the id; failures raise safely."""
+        options: dict[str, Any] = {**youtube_options(), "extract_flat": "in_playlist", "format": "bestaudio"}
+        try:
+            with yt_dlp.YoutubeDL(options) as downloader:
+                video = downloader.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+        except Exception as error:
+            raise SourceAccessError(_safe_reason(error, options["logger"])) from error
+        return video if video and video.get("id") == video_id else None
+
+    def fresh(self, url: str) -> dict[str, Any]:
+        """Return current video details for a URL; any failure raises a safe SourceAccessError."""
+        options = youtube_options()
+        try:
+            with yt_dlp.YoutubeDL(options) as downloader:
+                video = downloader.extract_info(url, download=False)
+        except Exception as error:
+            raise SourceAccessError(_safe_reason(error, options["logger"])) from error
+        return video or {}
+
+    def download(self, video: dict[str, Any], options: dict[str, Any]) -> None:
+        """Process one video for download; failures propagate raw so retry policy stays with the caller."""
+        with yt_dlp.YoutubeDL({**youtube_options(), **options}) as downloader:
+            downloader.process_ie_result(video, download=True)

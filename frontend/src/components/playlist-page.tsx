@@ -9,16 +9,28 @@ import { CheckStep } from "@/components/steps/check-step"
 import { PreferencesStep } from "@/components/steps/preferences-step"
 import { ReviewStep } from "@/components/steps/review-step"
 import {
-  api,
+  analyzePlaylist,
   ApiError,
-  isRematchStage,
-  isWorking,
+  restorePreview,
+  savePreview,
+  sortPreview,
   type Job,
   type Options,
   type Playlist,
-  type Session,
-  type Track,
 } from "@/lib/api"
+import {
+  cancelRematchToast,
+  isWorking,
+  isWorkingStatus,
+  resolveRematchToast,
+  watchJob,
+} from "@/lib/job"
+import {
+  fixedAtSlot,
+  placementConflict as placementConflictBetween,
+  placementOverrides,
+  placementsChanged,
+} from "@/lib/placement"
 import { DEFAULT_PREFERENCES, matchAttention } from "@/lib/preferences"
 
 type StepId = "check" | "preferences" | "review"
@@ -50,7 +62,6 @@ export function PlaylistRoute() {
 }
 
 function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob: Job | null }) {
-  const session = useRouteLoaderData<Session>("root")
   // The session holds a single job slot, whichever playlist it owns. Polling keeps it
   // fresh so blocked states clear as soon as the working job finishes.
   const [sessionJob, setSessionJob] = useState<Job | null>(initialJob)
@@ -103,32 +114,16 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
   const canSort = choices.length >= 2
   const total = tracks.length
   const fixedTracks = tracks.filter((track) => track.fixed_reason)
-  const fixedFirst =
-    fixedTracks.find((track) => (placements[track.occurrence] ?? track.original_position) === 0) ??
-    null
-  const fixedLast =
-    fixedTracks.find(
-      (track) => (placements[track.occurrence] ?? track.original_position) === total - 1,
-    ) ?? null
-  const pinConflict = firstOccurrence !== null && firstOccurrence === lastOccurrence
-  const placementConflict = fixedTracks.some((track, index) =>
-    fixedTracks.some(
-      (other, otherIndex) =>
-        otherIndex !== index &&
-        (placements[other.occurrence] ?? other.original_position) ===
-          (placements[track.occurrence] ?? track.original_position),
-    ),
-  )
-    ? "Two unanalyzable items claim the same position. Choose different positions."
-    : null
+  const fixedFirst = fixedAtSlot(fixedTracks, placements, 0)
+  const fixedLast = fixedAtSlot(fixedTracks, placements, total - 1)
   const hasPreview = !!job?.sorted_tracks.length && job.status !== "error"
-  const placementsChanged =
-    hasPreview &&
-    fixedTracks.some(
-      (track) =>
-        (placements[track.occurrence] ?? track.original_position) !==
-        (job.placements[track.occurrence] ?? track.original_position),
-    )
+  const conflicts = placementConflictBetween(
+    fixedTracks,
+    placements,
+    total,
+    firstOccurrence,
+    lastOccurrence,
+  )
   const choicesChanged =
     hasPreview &&
     !!job &&
@@ -138,7 +133,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
       preferences.variety !== job.options.variety ||
       firstOccurrence !== job.first_occurrence ||
       lastOccurrence !== job.last_occurrence ||
-      placementsChanged)
+      placementsChanged(fixedTracks, placements, job.placements))
   const movedCount =
     hasPreview && job
       ? job.sorted_tracks.filter((track, index) => track.original_position !== index).length
@@ -197,31 +192,9 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
       setStep((current) => (current === "check" ? "preferences" : current))
   })
 
-  // Resolve the pending rematch toast once polling sees the song leave the working stages.
   const observeRematch = useEffectEvent((next: Job) => {
-    const active = rematch.current
-    if (!active || next.playlist_id !== playlist.id) return
-    const track = next.tracks.find((item) => item.occurrence === active.occurrence)
-    if (!track || isRematchStage(track.analysis_status)) return
-    rematch.current = null
-    toast.close(`rematch-${active.occurrence}`)
-    if (track.analysis_status === "ready" && next.status === "ready") {
-      toast.add({
-        title: "Recording updated",
-        description: track.name,
-        type: "success",
-        priority: "low",
-        timeout: 5000,
-      })
-    } else {
-      toast.add({
-        title: "Couldn't update the recording",
-        description: next.error ?? track.fixed_reason ?? "Please try again.",
-        type: "error",
-        priority: "high",
-        timeout: 8000,
-      })
-    }
+    if (!rematch.current || next.playlist_id !== playlist.id) return
+    if (resolveRematchToast(next, rematch.current.occurrence)) rematch.current = null
   })
 
   const focusReviewHeading = useEffectEvent((active: boolean) => {
@@ -237,7 +210,7 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
       actionController.current?.abort()
       if (progressToast.current) toast.close(progressToast.current)
       progressToast.current = null
-      if (rematch.current) toast.close(`rematch-${rematch.current.occurrence}`)
+      if (rematch.current) cancelRematchToast(rematch.current.occurrence)
       rematch.current = null
     },
     [],
@@ -289,26 +262,14 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
   }, [activity, error, job?.error, job?.arrangement?.unchanged, playlist.id, playlist.name])
 
   useEffect(() => {
-    if (
-      error ||
-      !sessionJobStatus ||
-      !["analyzing", "sorting", "saving", "restoring"].includes(sessionJobStatus)
-    )
-      return undefined
-    const controller = new AbortController()
-    let timer: ReturnType<typeof setTimeout>
-    async function poll() {
-      try {
-        const next = await api<Job | null>("/job", { signal: controller.signal })
-        if (controller.signal.aborted) return
-        // Follow the single session job even when another playlist takes it over,
-        // so this page adapts instead of surfacing a stale state or error.
+    if (error || !isWorkingStatus(sessionJobStatus)) return undefined
+    return watchJob({
+      onJob: (next) => {
         setSessionJob(next)
         if (next) skipCleanCheckStep(next)
         if (next) observeRematch(next)
-        if (next && isWorking(next)) timer = setTimeout(poll, 1000)
-      } catch (err) {
-        if (controller.signal.aborted) return
+      },
+      onError: (err) => {
         if (err instanceof ApiError && err.status === 401) {
           window.location.assign("/")
           return
@@ -325,13 +286,8 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
           timeout: 0,
           actionProps: { children: "Try again", onClick: () => setError("") },
         })
-      }
-    }
-    timer = setTimeout(poll, 700)
-    return () => {
-      controller.abort()
-      clearTimeout(timer)
-    }
+      },
+    })
     // Status controls the polling lifetime. Each request schedules the next one after it finishes.
   }, [sessionJobStatus, playlist.id, error])
 
@@ -343,38 +299,24 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
       actionFocus.current = { element: document.activeElement, failed: false }
     setPending(action)
     setError("")
-    const path = action === "analyze" ? `/playlists/${playlist.id}/analyze` : `/job/${action}`
     try {
-      const next = await api<Job>(path, {
-        method: "POST",
-        signal: controller.signal,
-        headers: { "X-CSRF-Token": session?.csrf ?? "" },
-        body:
-          action === "analyze"
-            ? null
-            : JSON.stringify({
-                revision: job?.revision,
-                ...(action === "sort"
-                  ? {
-                      options: preferences,
-                      first_occurrence: firstOccurrence,
-                      last_occurrence: lastOccurrence,
-                      placements: Object.fromEntries(
-                        fixedTracks
-                          .filter(
-                            (track) =>
-                              (placements[track.occurrence] ?? track.original_position) !==
-                              track.original_position,
-                          )
-                          .map((track) => [
-                            track.occurrence,
-                            placementTargets.get(track.occurrence) ?? 0,
-                          ]),
-                      ),
-                    }
-                  : {}),
-              }),
-      })
+      const next =
+        action === "analyze"
+          ? await analyzePlaylist(playlist.id, { signal: controller.signal })
+          : action === "sort"
+            ? await sortPreview(
+                {
+                  revision: job?.revision ?? "",
+                  options: preferences,
+                  first_occurrence: firstOccurrence,
+                  last_occurrence: lastOccurrence,
+                  placements: placementOverrides(fixedTracks, placements, total),
+                },
+                { signal: controller.signal },
+              )
+            : action === "save"
+              ? await savePreview(job?.revision ?? "", { signal: controller.signal })
+              : await restorePreview(job?.revision ?? "", { signal: controller.signal })
       if (controller.signal.aborted) return
       if (action === "analyze" || action === "restore") {
         setFirstOccurrence(null)
@@ -429,28 +371,15 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
     return () => clearTimeout(timer)
   }, [shouldAutoAnalyze])
 
-  const placementTargets = new Map<string, number>()
-  for (const track of fixedTracks)
-    placementTargets.set(
-      track.occurrence,
-      Math.min(
-        Math.max(placements[track.occurrence] ?? track.original_position, 0),
-        Math.max(total - 1, 0),
-      ),
-    )
-  const slotTaken = (slot: number, except: Track) =>
-    fixedTracks.some(
-      (item) =>
-        item.occurrence !== except.occurrence && placementTargets.get(item.occurrence) === slot,
-    )
   const handlePlacements = (next: Record<string, number>) => {
     setPlacements((current) => (JSON.stringify(current) === JSON.stringify(next) ? current : next))
   }
-  const handleApplied = (occurrence: string) => {
+  const handleApplied = (occurrence: string, updated: Job) => {
     // The rematch polls through the analyzing status; the toast is resolved
     // once polling sees the song leave the working stages.
     advanceToReview.current = false
     rematch.current = { occurrence }
+    setSessionJob(updated)
   }
   const showSetup = !!job && !!tracks.length && !analyzing && jobStatus !== "error"
 
@@ -579,7 +508,6 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
         <div className="mt-8 border-t pt-6">
           <CheckStep
             tracks={tracks}
-            session={session ?? { configured: true, user: null, csrf: null }}
             busy={busy}
             onContinue={() => setStep("preferences")}
             onApplied={handleApplied}
@@ -603,14 +531,9 @@ function PlaylistPage({ playlist, initialJob }: { playlist: Playlist; initialJob
             fixedLast={fixedLast}
             fixedTracks={fixedTracks}
             total={total}
-            placementTargets={placementTargets}
-            slotTaken={slotTaken}
+            placements={placements}
             onPlacementsChange={handlePlacements}
-            placementConflict={
-              pinConflict || placementConflict
-                ? (placementConflict ?? "Choose different entries for the first and last songs.")
-                : null
-            }
+            placementConflict={conflicts}
             hasPreview={hasPreview}
             onArrange={() => void run("sort")}
           />

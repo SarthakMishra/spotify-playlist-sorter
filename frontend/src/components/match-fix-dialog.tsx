@@ -18,21 +18,20 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Spinner } from "@/components/ui/spinner"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { toast } from "@/components/ui/toast"
-import { api, type Candidate, type Session, type Track } from "@/lib/api"
+import { applyRecording, getMatchCandidates, type Candidate, type Job, type Track } from "@/lib/api"
+import { beginRematchToast } from "@/lib/job"
 import { elapsedTime } from "@/lib/review"
 
 export function MatchFixDialog({
   track,
-  session,
   open,
   onOpenChange,
   onApplied,
 }: {
   track: Track
-  session: Session
   open: boolean
   onOpenChange: (open: boolean) => void
-  onApplied: (occurrence: string) => void
+  onApplied: (occurrence: string, job: Job) => void
 }) {
   const [candidates, setCandidates] = useState<Candidate[] | null>(null)
   const [error, setError] = useState("")
@@ -52,7 +51,7 @@ export function MatchFixDialog({
     const controller = new AbortController()
     async function load() {
       try {
-        const result = await api<Candidate[]>(`/job/matches/${track.occurrence}`, {
+        const result = await getMatchCandidates(track.occurrence, {
           signal: controller.signal,
         })
         if (controller.signal.aborted) return
@@ -70,22 +69,12 @@ export function MatchFixDialog({
     if (!selected || applying) return
     setApplying(true)
     try {
-      await api(`/job/matches/${track.occurrence}`, {
-        method: "POST",
-        headers: { "X-CSRF-Token": session.csrf ?? "" },
-        body: JSON.stringify({ video_id: selected.video_id }),
-      })
-      // The playlist page resolves this toast when polling sees the rematch finish.
-      toast.add({
-        id: `rematch-${track.occurrence}`,
-        title: "Re-analyzing this song",
-        description: `${track.name} · Using the recording you picked.`,
-        type: "loading",
-        priority: "low",
-        timeout: 0,
-      })
+      // The seam returns the fresh job the backend rotated to; the playlist page
+      // adopts it so polling, copy and the next revision all move together.
+      const updated = await applyRecording(track.occurrence, selected.video_id)
+      beginRematchToast(track)
       onOpenChange(false)
-      onApplied(track.occurrence)
+      onApplied(track.occurrence, updated)
     } catch (err) {
       const message = err instanceof Error ? err.message : "Please try again."
       toast.add({

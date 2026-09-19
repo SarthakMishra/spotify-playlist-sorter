@@ -15,10 +15,29 @@ from unittest.mock import Mock, patch
 import numpy as np
 import yt_dlp
 
-from api import playlist_sorter
+from api import playlist_sorter, recording_match
+from api.youtube import youtube_options
 
 TRACK = {"id": "a", "Track": "Example", "Artist": "Artist", "album": "Album", "duration_ms": 180000}
 SOURCE = {"id": "abcdefghijk", "title": "Artist - Example", "duration": 180, "artist": "Artist"}
+
+
+def stub_analysis(rms_db: float | None = None) -> dict[str, Any]:
+    """Make a valid minimal analysis so patched measurements still pass the record seam."""
+    section: dict[str, Any] = {
+        "start": 0.0,
+        "end": 0.0,
+        "rms_db": rms_db,
+        "onset": None,
+        "tempo": None,
+        "tempo_candidates": [],
+        "centroid": None,
+        "contrast": None,
+        "chroma": None,
+        "camelot": None,
+        "evidence": {},
+    }
+    return {"duration": 0.0, "summary": section, "intro": section, "body": None, "outro": section}
 
 
 class RecordingPipelineTest(unittest.TestCase):
@@ -65,9 +84,9 @@ class RecordingPipelineTest(unittest.TestCase):
                 "channel_is_verified": True,
             }
             with self.subTest(title=title):
-                assert playlist_sorter._shortlist([source], metadata)
+                assert recording_match._shortlist([source], metadata)
                 assert (
-                    playlist_sorter._select_recording(playlist_sorter._rank_recordings([source], metadata)) is not None
+                    recording_match._select_recording(recording_match._rank_recordings([source], metadata)) is not None
                 )
 
     def test_best_effort_chooses_a_close_match_instead_of_rejecting_ties(self) -> None:
@@ -77,9 +96,9 @@ class RecordingPipelineTest(unittest.TestCase):
             {"id": "abcdefghijk", "title": "50 Cent - In Da Club (Official Audio)", "duration": 193},
             {"id": "lmnopqrstuv", "title": "50 Cent - In Da Club (Lyrics)", "duration": 193},
         ]
-        ranked = playlist_sorter._rank_recordings(entries, metadata)
+        ranked = recording_match._rank_recordings(entries, metadata)
         assert len(ranked) == 2
-        assert playlist_sorter._select_recording(ranked) is not None
+        assert recording_match._select_recording(ranked) is not None
 
     def test_real_search_titles_keep_promising_audio_and_secondary_credits_are_optional(self) -> None:
         """Artist suffixes, album decoration and missing producer credits do not hide the song."""
@@ -90,8 +109,8 @@ class RecordingPipelineTest(unittest.TestCase):
             "duration": 169,
             "channel": "Diljit Dosanjh",
         }
-        assert playlist_sorter._shortlist([source], metadata)
-        assert playlist_sorter._select_recording(playlist_sorter._rank_recordings([source], metadata)) is not None
+        assert recording_match._shortlist([source], metadata)
+        assert recording_match._select_recording(recording_match._rank_recordings([source], metadata)) is not None
         metadata = {"id": "a", "title": "For A Reason", "artists": ["Karan Aujla", "Ikky"], "duration_ms": 180000}
         source = {
             "id": "abcdefghijk",
@@ -99,7 +118,7 @@ class RecordingPipelineTest(unittest.TestCase):
             "duration": 180,
             "artist": "Karan Aujla",
         }
-        assert playlist_sorter._select_recording(playlist_sorter._rank_recordings([source], metadata)) is not None
+        assert recording_match._select_recording(recording_match._rank_recordings([source], metadata)) is not None
 
     def test_album_music_metadata_resolves_duplicate_upload_ambiguity(self) -> None:
         """An exact credited album upload supplies stronger evidence than an uncredited copy."""
@@ -126,13 +145,13 @@ class RecordingPipelineTest(unittest.TestCase):
         with (
             patch.object(yt_dlp.YoutubeDL, "extract_info", side_effect=extract),
             patch.object(
-                playlist_sorter.SpotifyPlaylistSorter,
+                recording_match,
                 "_download_sections",
                 return_value=[("full", 0.0, 180.0, np.zeros(1))],
             ),
-            patch.object(playlist_sorter, "analyze_sections", return_value={"summary": {}}),
+            patch.object(recording_match, "analyze_sections", return_value=stub_analysis()),
         ):
-            result = playlist_sorter.SpotifyPlaylistSorter._analyze_track(TRACK)
+            result = recording_match.analyze_track(TRACK)
             assert result["status"] == "ready", result
 
     def test_search_does_not_extract_every_video(self) -> None:
@@ -173,13 +192,13 @@ class RecordingPipelineTest(unittest.TestCase):
         with (
             patch.object(yt_dlp.YoutubeDL, "extract_info", autospec=True, side_effect=extract),
             patch.object(
-                playlist_sorter.SpotifyPlaylistSorter,
+                recording_match,
                 "_download_sections",
                 return_value=[("full", 0.0, 180.0, np.zeros(1))],
             ) as download,
-            patch.object(playlist_sorter, "analyze_sections", return_value={"summary": {}}),
+            patch.object(recording_match, "analyze_sections", return_value=stub_analysis()),
         ):
-            result = playlist_sorter.SpotifyPlaylistSorter._analyze_track(TRACK)
+            result = recording_match.analyze_track(TRACK)
             assert result["status"] == "ready", result
             assert len(hydrated) <= 3, f"Hydrated {len(hydrated)} candidates for one recording"
             assert download.call_count == 1
@@ -194,8 +213,8 @@ class RecordingPipelineTest(unittest.TestCase):
             "duration_ms": 180000,
         }
         source = {**SOURCE, "track": "Example", "artists": ["Artist", "Guest"], "album": "Album"}
-        ranked = playlist_sorter._rank_recordings([source], metadata)
-        assert playlist_sorter._select_recording(ranked) is not None
+        ranked = recording_match._rank_recordings([source], metadata)
+        assert recording_match._select_recording(ranked) is not None
         for changed in (
             {**source, "artists": ["Someone else"]},
             {**source, "title": "Artist - Example (Live)"},
@@ -205,18 +224,18 @@ class RecordingPipelineTest(unittest.TestCase):
             {**source, "duration": 200},
         ):
             with self.subTest(changed=changed):
-                assert playlist_sorter._rank_recordings([changed], metadata) == []
+                assert recording_match._rank_recordings([changed], metadata) == []
         literal = {**metadata, "title": "Lyrics of Love"}
         literal_source = {**source, "track": "Lyrics of Love", "title": "Artist - Lyrics of Love (Official Audio)"}
         assert (
-            playlist_sorter._select_recording(playlist_sorter._rank_recordings([literal_source], literal)) is not None
+            recording_match._select_recording(recording_match._rank_recordings([literal_source], literal)) is not None
         )
-        assert playlist_sorter._rank_recordings([{**literal_source, "track": "Of Love"}], literal) == []
+        assert recording_match._rank_recordings([{**literal_source, "track": "Of Love"}], literal) == []
         # A genuine word in the structured title must not be stripped as an artist prefix.
         named = {"id": "a", "title": "Talk Talk", "artists": ["Talk Talk"], "duration_ms": 180000}
         assert (
-            playlist_sorter._select_recording(
-                playlist_sorter._rank_recordings(
+            recording_match._select_recording(
+                recording_match._rank_recordings(
                     [{**SOURCE, "title": "Talk Talk - Talk Talk", "track": "Talk Talk", "artist": "Talk Talk"}], named
                 )
             )
@@ -240,7 +259,7 @@ class RecordingPipelineTest(unittest.TestCase):
             "artists": ["Tanishk-Vayu", "Ayushmann Khurrana"],
             "duration_ms": 176000,
         }
-        assert playlist_sorter._select_recording(playlist_sorter._rank_recordings([kanha], kanha_meta)) is not None
+        assert recording_match._select_recording(recording_match._rank_recordings([kanha], kanha_meta)) is not None
         # Saudebazi (Encore): exact title and duration with no credits and no verification.
         encore = {"id": "abcdefghijk", "title": "SAUDEBAZI (ENCORE)", "duration": 354}
         encore_meta = {
@@ -249,7 +268,7 @@ class RecordingPipelineTest(unittest.TestCase):
             "artists": ["Pritam", "Javed Ali"],
             "duration_ms": 354000,
         }
-        assert playlist_sorter._select_recording(playlist_sorter._rank_recordings([encore], encore_meta)) is not None
+        assert recording_match._select_recording(recording_match._rank_recordings([encore], encore_meta)) is not None
         # In Dino Refresh: word recall finds the requested title inside a decorated upload title.
         refresh = {
             "id": "abcdefghijk",
@@ -263,7 +282,7 @@ class RecordingPipelineTest(unittest.TestCase):
             "artists": ["Mohammed Irfan"],
             "duration_ms": 256000,
         }
-        assert playlist_sorter._select_recording(playlist_sorter._rank_recordings([refresh], refresh_meta)) is not None
+        assert recording_match._select_recording(recording_match._rank_recordings([refresh], refresh_meta)) is not None
         # Mera Pehla Pehla Pyaar: K.K. versus KK is the same artist; adjacent tokens squeeze to one.
         initials = {
             "id": "abcdefghijk",
@@ -275,12 +294,12 @@ class RecordingPipelineTest(unittest.TestCase):
         }
         initials_meta = {"id": "d", "title": "Mera Pehla Pehla Pyaar", "artists": ["KK"], "duration_ms": 271025}
         assert (
-            playlist_sorter._select_recording(playlist_sorter._rank_recordings([initials], initials_meta)) is not None
+            recording_match._select_recording(recording_match._rank_recordings([initials], initials_meta)) is not None
         )
         # A labeled cover conflicts on the edition tag regardless of everything else.
         cover = {"id": "abcdefghijk", "title": "Example (Cover)", "duration": 180, "channel": "Random Covers"}
         cover_meta = {"id": "e", "title": "Example", "artists": ["Artist"], "duration_ms": 180000}
-        assert playlist_sorter._rank_recordings([cover], cover_meta) == []
+        assert recording_match._rank_recordings([cover], cover_meta) == []
 
     def test_requested_edition_words_are_required_evidence(self) -> None:
         """When the requested title declares an edition, uploads that omit it are different recordings."""
@@ -300,14 +319,14 @@ class RecordingPipelineTest(unittest.TestCase):
             "channel": "Pritam",
             "channel_is_verified": True,
         }
-        assert playlist_sorter._rank_recordings([original], reprise_meta) == []
+        assert recording_match._rank_recordings([original], reprise_meta) == []
         labeled = {
             **original,
             "track": "Zindagi Kuch Toh Bata (Reprise)",
             "artists": ["Jubin Nautiyal"],
             "title": "Zindagi Kuch Toh Bata (Reprise)",
         }
-        assert playlist_sorter._rank_recordings([labeled], reprise_meta) != []
+        assert recording_match._rank_recordings([labeled], reprise_meta) != []
         # Trailing dash groups count too, and the qualifier may appear anywhere in the upload text.
         refresh_meta = {
             "id": "b",
@@ -322,10 +341,10 @@ class RecordingPipelineTest(unittest.TestCase):
             "channel": "Sony Music India",
         }
         assert (
-            playlist_sorter._select_recording(playlist_sorter._rank_recordings([decorated], refresh_meta)) is not None
+            recording_match._select_recording(recording_match._rank_recordings([decorated], refresh_meta)) is not None
         )
         unlabeled = {**decorated, "id": "lmnopqrstuv", "title": "In Dino - Mohammed Irfan | Ajay Singha"}
-        ranked = playlist_sorter._rank_recordings([decorated, unlabeled], refresh_meta)
+        ranked = recording_match._rank_recordings([decorated, unlabeled], refresh_meta)
         assert ranked, "edition evidence must rank the decorated upload"
         assert ranked[0]["id"] == decorated["id"]  # edition evidence outranks the unlabeled copy
         assert ranked[1]["score"] < ranked[0]["score"]
@@ -337,7 +356,7 @@ class RecordingPipelineTest(unittest.TestCase):
             "duration_ms": 300000,
         }
         plain = {"id": "abcdefghijk", "title": "Dil Cheez Tujhe Dedi", "duration": 300, "artist": "Arijit Singh"}
-        assert playlist_sorter._rank_recordings([plain], from_meta) != []
+        assert recording_match._rank_recordings([plain], from_meta) != []
 
     def test_edition_omissions_accept_unlabeled_official_uploads(self) -> None:
         """Unlabeled default uploads satisfy edition requests unless credits name another singer."""
@@ -406,7 +425,7 @@ class RecordingPipelineTest(unittest.TestCase):
         for metadata, upload in cases:
             with self.subTest(title=metadata["title"]):
                 assert (
-                    playlist_sorter._select_recording(playlist_sorter._rank_recordings([upload], metadata)) is not None
+                    recording_match._select_recording(recording_match._rank_recordings([upload], metadata)) is not None
                 )
         # The default upload of a different singer stays rejected even without its edition label.
         reprise_meta = {
@@ -424,7 +443,7 @@ class RecordingPipelineTest(unittest.TestCase):
             "channel": "Pritam",
             "channel_is_verified": True,
         }
-        assert playlist_sorter._rank_recordings([original], reprise_meta) == []
+        assert recording_match._rank_recordings([original], reprise_meta) == []
         # An upload claiming an edition the request never asked for stays rejected.
         claimed = {
             "id": "abcdefghijk",
@@ -440,7 +459,7 @@ class RecordingPipelineTest(unittest.TestCase):
             "artists": ["Amit Trivedi", "Shreya Ghoshal"],
             "duration_ms": 278653,
         }
-        assert playlist_sorter._rank_recordings([claimed], plain_meta) == []
+        assert recording_match._rank_recordings([claimed], plain_meta) == []
 
     def test_fuzzy_token_recall_tolerates_spelling_variants(self) -> None:
         """Saathiyaa/Sathiya-class spelling differences no longer hide the right upload."""
@@ -451,8 +470,8 @@ class RecordingPipelineTest(unittest.TestCase):
             "duration": 310,
             "channel": "RB Lyrics Lover",
         }
-        assert playlist_sorter._shortlist([upload], metadata)
-        selected = playlist_sorter._select_recording(playlist_sorter._rank_recordings([upload], metadata))
+        assert recording_match._shortlist([upload], metadata)
+        selected = recording_match._select_recording(recording_match._rank_recordings([upload], metadata))
         assert selected is not None
 
     def test_flat_search_retry_drops_failed_hints(self) -> None:
@@ -476,14 +495,16 @@ class RecordingPipelineTest(unittest.TestCase):
             return official
 
         with patch.object(yt_dlp.YoutubeDL, "extract_info", autospec=True, side_effect=extract):
-            ranked, _full, _candidates = playlist_sorter.SpotifyPlaylistSorter._find_recordings(
-                {"id": "a", "title": "Dil Darbadar", "artists": ["Ankit Tiwari"], "duration_ms": 377045}, {}
+            ranked, _full, _candidates = recording_match._find_recordings(
+                {"id": "a", "title": "Dil Darbadar", "artists": ["Ankit Tiwari"], "duration_ms": 377045},
+                {},
+                recording_match.YoutubeSource(),
             )
         searches = [query for query in queries if query.startswith("ytsearch")]
         assert len(searches) == 2, f"expected exactly two searches, got {searches}"
         assert "audio" in searches[0]
         assert "audio" not in searches[1]
-        assert playlist_sorter._select_recording(ranked) is not None
+        assert recording_match._select_recording(ranked) is not None
 
     def test_fallback_shortlist_hydrates_other_script_titles(self) -> None:
         """Duration-compatible uploads in other scripts hydrate and reveal plain English names."""
@@ -510,20 +531,20 @@ class RecordingPipelineTest(unittest.TestCase):
             return video
 
         with patch.object(yt_dlp.YoutubeDL, "extract_info", autospec=True, side_effect=hydrated_extract):
-            candidates = playlist_sorter._shortlist([hindi, english], metadata)
+            candidates = recording_match._shortlist([hindi, english], metadata)
             assert [c["id"] for c in candidates] == [hindi["id"], english["id"]]  # both survive the shortlist
 
     def test_retry_sleep_functions_accept_keyword_counts(self) -> None:
         """yt-dlp calls retry sleep helpers with a keyword; a TypeError would crash every retry."""
-        functions = playlist_sorter.youtube_options()["retry_sleep_functions"]
+        functions = youtube_options()["retry_sleep_functions"]
         for key in ("http", "fragment", "extractor"):
             with self.subTest(key=key):
                 assert functions[key](n=2) == 4
 
     def test_worker_scale_limits_growth_by_machine_and_bandwidth(self) -> None:
         """Start conservatively, grow after fast successes to the machine cap, and back off on rate limits."""
-        with patch.object(playlist_sorter._WorkerScale, "_machine_limit", return_value=4):
-            scale = playlist_sorter._WorkerScale()
+        with patch.object(recording_match._WorkerScale, "_machine_limit", return_value=4):
+            scale = recording_match._WorkerScale()
         assert scale.target == 2  # conservative start regardless of capacity
         fast = {"status": "ready", "diagnostics": {"download_seconds": 2.0}}
         for _ in range(8):
@@ -539,14 +560,14 @@ class RecordingPipelineTest(unittest.TestCase):
         assert scale.target == 4  # already at cap; slow downloads matter below it
         scale.adjust({"status": "error", "reason": "rate_limit"})
         assert scale.target == 1
-        with patch.object(playlist_sorter._WorkerScale, "_machine_limit", return_value=2):
-            scale = playlist_sorter._WorkerScale()
+        with patch.object(recording_match._WorkerScale, "_machine_limit", return_value=2):
+            scale = recording_match._WorkerScale()
         assert scale.target == 2
         for _ in range(16):
             scale.adjust(fast)
         assert scale.target == 2  # machine cap
-        with patch.object(playlist_sorter._WorkerScale, "_machine_limit", return_value=4):
-            scale = playlist_sorter._WorkerScale()
+        with patch.object(recording_match._WorkerScale, "_machine_limit", return_value=4):
+            scale = recording_match._WorkerScale()
         for _ in range(8):
             scale.adjust(fast)
         assert scale.target == 3
@@ -555,7 +576,7 @@ class RecordingPipelineTest(unittest.TestCase):
 
     def test_dynamic_gate_tracks_target_changes(self) -> None:
         """Only the target's worth of workers proceed; the rest wait for a slot."""
-        gate = playlist_sorter._DynamicGate(1)
+        gate = recording_match._DynamicGate(1)
         entered = []
         release = Event()
 
@@ -582,22 +603,20 @@ class RecordingPipelineTest(unittest.TestCase):
         def extract(_ydl: yt_dlp.YoutubeDL, url: str, **_kwargs: object) -> dict[str, Any]:
             return {"entries": [video]} if url.startswith("ytsearch") else video
 
-        reused_analysis = {"summary": {"rms_db": -12.0}}
+        reused_analysis = stub_analysis(-12.0)
         with (
             patch.object(yt_dlp.YoutubeDL, "extract_info", autospec=True, side_effect=extract),
             patch.object(
-                playlist_sorter.SpotifyPlaylistSorter,
+                recording_match,
                 "_download_sections",
                 return_value=[("full", 0.0, 180.0, np.zeros(1))],
             ) as download,
-            patch.object(playlist_sorter, "analyze_sections", return_value=reused_analysis),
+            patch.object(recording_match, "analyze_sections", return_value=reused_analysis),
         ):
-            first = playlist_sorter.SpotifyPlaylistSorter._analyze_track(track, video_analyses={})
+            first = recording_match.analyze_track(track, video_analyses={})
             assert first["status"] == "ready"
             assert download.call_count == 1
-            second = playlist_sorter.SpotifyPlaylistSorter._analyze_track(
-                {**track, "id": "b"}, video_analyses={str(video["id"]): first}
-            )
+            second = recording_match.analyze_track({**track, "id": "b"}, video_analyses={str(video["id"]): first})
             assert second["status"] == "ready"
             assert second["analysis"] == reused_analysis
             assert download.call_count == 1
@@ -610,8 +629,8 @@ class RecordingPipelineTest(unittest.TestCase):
             with (
                 self.subTest(reason=reason),
                 tempfile.TemporaryDirectory() as directory,
-                patch.object(playlist_sorter, "_CACHE_FILE", Path(directory) / "cache.json"),
-                patch.object(playlist_sorter._WorkerScale, "_machine_limit", return_value=2),
+                patch("api.analysis_store._CACHE_FILE", Path(directory) / "cache.json"),
+                patch.object(recording_match._WorkerScale, "_machine_limit", return_value=2),
                 patch.object(
                     yt_dlp.YoutubeDL, "extract_info", side_effect=yt_dlp.utils.DownloadError(message)
                 ) as extract,
@@ -644,9 +663,9 @@ class RecordingPipelineTest(unittest.TestCase):
                 yt_dlp.YoutubeDL, "extract_info", side_effect=AssertionError("Unexpected extraction")
             ) as extract,
             patch.object(yt_dlp.YoutubeDL, "process_info", autospec=True, side_effect=process) as download,
-            patch.object(playlist_sorter, "load_audio", return_value=(np.zeros(20 * 22050), 22050)),
+            patch.object(recording_match, "load_audio", return_value=(np.zeros(20 * 22050), 22050)),
         ):
-            sections = playlist_sorter.SpotifyPlaylistSorter._download_sections(
+            sections = recording_match._download_sections(
                 {**SOURCE, "url": "https://www.youtube.com/watch?v=abcdefghijk"}, video_info=info
             )
             assert [(label, start, end) for label, start, end, _audio in sections] == [
@@ -669,8 +688,8 @@ class RecordingPipelineTest(unittest.TestCase):
             sleep(0.05 if plan_section[0] == "intro" else 0.0)
             return np.full(20 * 22050, marker[plan_section[0]], dtype=np.float32)
 
-        with patch.object(playlist_sorter.SpotifyPlaylistSorter, "_download_section", side_effect=section):
-            sections = playlist_sorter.SpotifyPlaylistSorter._download_sections(source, video_info=info)
+        with patch.object(recording_match, "_download_section", side_effect=section):
+            sections = recording_match._download_sections(source, video_info=info)
 
         assert [(label, start, end) for label, start, end, _audio in sections] == [
             ("intro", 0.0, 20.0),
@@ -692,12 +711,12 @@ class RecordingPipelineTest(unittest.TestCase):
             return np.full(20 * 22050, float(len(calls)), dtype=np.float32)
 
         with (
-            patch.object(playlist_sorter, "_DOWNLOAD_ATTEMPT_SECONDS", 0.05),
-            patch.object(playlist_sorter.SpotifyPlaylistSorter, "_download_section", side_effect=section),
+            patch.object(recording_match, "_DOWNLOAD_ATTEMPT_SECONDS", 0.05),
+            patch.object(recording_match, "_download_section", side_effect=section),
             patch.object(yt_dlp.YoutubeDL, "extract_info", return_value={**info, "fresh": True}) as extract,
-            patch.object(playlist_sorter, "sleep"),
+            patch.object(recording_match, "sleep"),
         ):
-            sections = playlist_sorter.SpotifyPlaylistSorter._download_sections(source, video_info=info)
+            sections = recording_match._download_sections(source, video_info=info)
 
         assert [(label, start, end) for label, start, end, _audio in sections] == [
             ("intro", 0.0, 20.0),
@@ -726,9 +745,9 @@ class RecordingPipelineTest(unittest.TestCase):
         with (
             patch.object(yt_dlp.YoutubeDL, "process_ie_result", autospec=True, side_effect=process),
             patch.object(yt_dlp.YoutubeDL, "extract_info", return_value={**info, "fresh": True}) as extract,
-            patch.object(playlist_sorter, "load_audio", return_value=(np.zeros(20 * 22050), 22050)),
-            patch.object(playlist_sorter, "sleep"),
+            patch.object(recording_match, "load_audio", return_value=(np.zeros(20 * 22050), 22050)),
+            patch.object(recording_match, "sleep"),
         ):
-            assert playlist_sorter.SpotifyPlaylistSorter._download_sections(source, video_info=info)
+            assert recording_match._download_sections(source, video_info=info)
             extract.assert_called_once_with(source["url"], download=False)
             assert calls[-1]["fresh"]
