@@ -473,6 +473,16 @@ def _with_intensity(records: dict[str, dict[str, Any]]) -> dict[str, dict[str, A
             [[r["analysis"]["summary"]["rms_db"], r["analysis"]["summary"]["onset"]] for r in ready.values()],
             dtype=float,
         )
+        quality = np.array(
+            [
+                [
+                    r["analysis"]["summary"].get("evidence", {}).get("rms_db", 0.0),
+                    r["analysis"]["summary"].get("evidence", {}).get("onset", 0.0),
+                ]
+                for r in ready.values()
+            ],
+            dtype=float,
+        )
         normalized = np.full_like(values, 0.5)
         for column in range(values.shape[1]):
             valid = np.isfinite(values[:, column])
@@ -480,13 +490,15 @@ def _with_intensity(records: dict[str, dict[str, Any]]) -> dict[str, dict[str, A
                 low, high = np.percentile(values[valid, column], [5, 95])
                 if high > low:
                     normalized[valid, column] = np.clip((values[valid, column] - low) / (high - low), 0, 1)
-        for (key, record), components in zip(ready.items(), normalized, strict=True):
+        # Treat unmeasured components as neutral, matching the arrangement's definition.
+        energy = np.where(quality > 0, normalized, 0.5) @ np.array([0.6, 0.4])
+        for (key, record), value in zip(ready.items(), energy, strict=True):
             summary = record["analysis"]["summary"]
             result[key] = {
                 **record,
                 "tempo": summary["tempo"],
                 "camelot": summary["camelot"],
-                "energy": float(components @ np.array([0.6, 0.4])),
+                "energy": float(value),
             }
     return result
 

@@ -28,7 +28,13 @@ def recording(track: dict[str, Any], **_kwargs: object) -> dict[str, Any]:
         "source": source,
         "source_fingerprint": playlist_sorter._source_fingerprint(source),
         "analysis": {
-            "summary": {"rms_db": -20.0 if track["id"] == "a" else -10.0, "onset": 1.0, "tempo": None, "camelot": None}
+            "summary": {
+                "rms_db": -20.0 if track["id"] == "a" else -10.0,
+                "onset": 1.0,
+                "tempo": None,
+                "camelot": None,
+                "evidence": dict.fromkeys(("rms_db", "onset", "tempo", "centroid", "contrast", "chroma", "key"), 1.0),
+            }
         },
     }
 
@@ -134,6 +140,43 @@ class AudioAnalysisTest(unittest.TestCase):
         assert merged["summary"]["evidence"]["rms_db"] == 1.0
         assert merged["summary"]["camelot"] is None  # pure tones never name a key
         json.dumps(merged, allow_nan=False)
+
+    def test_merge_reconciles_octave_and_merges_duplicate_peaks(self) -> None:
+        """The summary beat follows the windows' half/double decisions, not the strongest raw peak."""
+
+        def window(tempo: float | None, candidates: list[dict[str, float]]) -> dict[str, Any]:
+            return {
+                "start": 0.0,
+                "end": 20.0,
+                "rms_db": -10.0,
+                "onset": 1.0,
+                "tempo": tempo,
+                "tempo_candidates": candidates,
+                "centroid": None,
+                "contrast": None,
+                "chroma": None,
+                "camelot": None,
+                "evidence": dict.fromkeys(("rms_db", "onset", "tempo", "centroid", "contrast", "chroma", "key"), 0.8),
+            }
+
+        # Sparse sections raise a stronger half-tempo peak, but each window's estimate chose 140.
+        parts = [
+            window(140.0, [{"bpm": 70.0, "strength": 0.8}, {"bpm": 140.0, "strength": 0.62}]),
+            window(140.0, [{"bpm": 70.0, "strength": 0.72}, {"bpm": 140.0, "strength": 0.58}]),
+        ]
+        merged = audio_analysis._merge_windows(parts)
+        assert merged["tempo"] == 140.0
+        assert abs(merged["tempo_candidates"][0]["bpm"] - 70.0) < 1.0
+        assert 0 < merged["evidence"]["tempo"] <= 0.8
+
+        split = [window(120.0, [{"bpm": 119.96, "strength": 0.6}]), window(120.0, [{"bpm": 120.04, "strength": 0.6}])]
+        merged = audio_analysis._merge_windows(split)
+        assert abs(merged["tempo"] - 120.0) < 0.1
+        assert len(merged["tempo_candidates"]) == 1  # near-identical estimates merge instead of splitting
+
+        unchosen = [window(None, [{"bpm": 90.0, "strength": 0.5}]), window(None, [])]
+        merged = audio_analysis._merge_windows(unchosen)
+        assert merged["tempo"] == 90.0  # falls back to the strongest candidate without window choices
 
     def test_recording_match_rejects_wrong_sources_and_accepts_best_effort_ties(self) -> None:
         """Single results and popular wrong versions face the same eligibility rules."""
@@ -259,6 +302,10 @@ class AudioAnalysisTest(unittest.TestCase):
                 unknown_activity["a"]["analysis"]["summary"]["onset"] = None
                 unknown_activity["b"]["analysis"]["summary"]["onset"] = 4.0
                 assert playlist_sorter._with_intensity(unknown_activity)["a"]["energy"] == 0.2
+                unmeasured = copy.deepcopy(raw)
+                unmeasured["a"]["analysis"]["summary"]["evidence"]["rms_db"] = 0.0
+                unmeasured["a"]["analysis"]["summary"]["evidence"]["onset"] = 0.0
+                assert playlist_sorter._with_intensity(unmeasured)["a"]["energy"] == 0.5
                 changed = [{**track, "Track": "Changed"} if track["id"] == "a" else track for track in tracks]
                 sorter._fetch_audio_features_local(changed)
                 assert analyze.call_count == 1

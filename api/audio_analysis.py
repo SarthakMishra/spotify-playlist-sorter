@@ -26,6 +26,7 @@ MIN_KEY_CORRELATION, MIN_KEY_MARGIN = 0.6, 0.1
 SILENCE_RMS = 1e-5
 SECTION_SECONDS = 20
 FULL_TRACK_SECONDS = 60
+_TEMPO_MERGE_BPM = 1.0
 SETTINGS = {
     "sample_rate": SAMPLE_RATE,
     "mono": True,
@@ -37,7 +38,7 @@ SETTINGS = {
     "max_seconds": MAX_SECONDS,
     "decode_block_seconds": 5,
 }
-ANALYSIS_VERSION = f"librosa-{version('librosa')}-sections-4"
+ANALYSIS_VERSION = f"librosa-{version('librosa')}-sections-6"
 
 # Mapping from (pitch_class, mode) -> Camelot key
 # pitch_class: 0=C, 1=C#, 2=D, ... 11=B  |  mode: 0=minor, 1=major
@@ -127,7 +128,7 @@ def _frame_features(audio: np.ndarray, sr: int) -> dict[str, np.ndarray]:
         parts["rms"].append(librosa.feature.rms(y=block, frame_length=FFT_SIZE, hop_length=HOP, center=False))
         parts["centroid"].append(librosa.feature.spectral_centroid(S=magnitude, sr=sr))
         parts["contrast"].append(librosa.feature.spectral_contrast(S=magnitude, sr=sr))
-        parts["chroma"].append(librosa.feature.chroma_stft(S=power, sr=sr, tuning=0, norm=2))
+        parts["chroma"].append(librosa.feature.chroma_stft(S=power, sr=sr, tuning=None, norm=2))
     return {key: np.concatenate(values, axis=1) for key, values in parts.items()}
 
 
@@ -249,6 +250,35 @@ def _weighted(pairs: list[tuple[float, float]]) -> float | None:
     return sum(value * weight for value, weight in pairs) / total if total > 0 and pairs else None
 
 
+def _reconciled_tempo(parts: list[dict[str, Any]]) -> float | None:
+    """Pick the summary beat from the windows' own half/double decisions.
+
+    Each window already arbitrated competing peaks against its tempo estimate, so
+    their choices are the authority; the tilt compares log2 tempos across tracks
+    and an octave slip would move a song to the wrong end of the playlist.
+    """
+    chosen = [
+        (float(part["tempo"]), float(part["evidence"]["tempo"]))
+        for part in parts
+        if part["tempo"] is not None and part["evidence"]["tempo"] > 0
+    ]
+    if not chosen:
+        return None
+    families: list[list[tuple[float, float]]] = []
+    for tempo, weight in chosen:
+        for family in families:
+            ratio = np.log2(tempo / family[0][0])
+            if abs(ratio - round(ratio)) <= TEMPO_SEPARATION:
+                family.append((tempo, weight))
+                break
+        else:
+            families.append([(tempo, weight)])
+    best = max(families, key=lambda family: sum(weight for _, weight in family))
+    tempos, weights = zip(*best, strict=True)
+    log_weights = np.asarray(weights) / max(sum(weights), 1e-9)
+    return float(2 ** np.average(np.log2(tempos), weights=log_weights))
+
+
 def _merge_windows(parts: list[dict[str, Any]]) -> dict[str, Any]:
     """Merge sampled window summaries with energy weighting and honest evidence."""
     weights = [max(0.0, part["end"] - part["start"]) for part in parts]
@@ -288,19 +318,23 @@ def _merge_windows(parts: list[dict[str, Any]]) -> dict[str, Any]:
         merged["chroma"] = chroma.tolist()
         merged["camelot"], key_strength = _key(chroma)
         merged["evidence"]["key"] = merged["evidence"]["chroma"] * key_strength
-    candidates: dict[float, dict[str, float]] = {}
+    candidates: list[dict[str, float]] = []
     for part in parts:
-        for candidate in part["tempo_candidates"]:
-            key = round(candidate["bpm"], 1)
-            known = candidates.get(key)
-            if known is None or candidate["strength"] > known["strength"]:
-                candidates[key] = {**candidate, "bpm": key}
-    merged["tempo_candidates"] = sorted(candidates.values(), key=lambda candidate: -candidate["strength"])
-    if merged["tempo_candidates"]:
-        best = merged["tempo_candidates"][0]
-        if best["strength"] >= MIN_PERIODICITY:
-            merged["tempo"] = best["bpm"]
-            merged["evidence"]["tempo"] = max(merged["evidence"]["tempo"], min(0.8, best["strength"]))
+        for candidate in sorted(part["tempo_candidates"], key=lambda item: -item["strength"]):
+            for known in candidates:
+                if abs(known["bpm"] - candidate["bpm"]) <= _TEMPO_MERGE_BPM:
+                    if candidate["strength"] > known["strength"]:
+                        known["bpm"] = candidate["bpm"]
+                    known["strength"] = max(known["strength"], candidate["strength"])
+                    break
+            else:
+                candidates.append({**candidate})
+    merged["tempo_candidates"] = sorted(candidates, key=lambda candidate: -candidate["strength"])
+    strength = merged["tempo_candidates"][0]["strength"] if merged["tempo_candidates"] else 0.0
+    if strength >= MIN_PERIODICITY:
+        reconciled = _reconciled_tempo(parts)
+        merged["tempo"] = reconciled if reconciled is not None else merged["tempo_candidates"][0]["bpm"]
+        merged["evidence"]["tempo"] = max(merged["evidence"]["tempo"], min(0.8, strength))
     return merged
 
 
